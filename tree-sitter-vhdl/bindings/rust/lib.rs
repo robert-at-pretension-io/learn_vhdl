@@ -1,11 +1,7 @@
-use tree_sitter_language::LanguageFn;
-
 extern "C" {
-    fn tree_sitter_vhdl() -> *const ();
+    fn tree_sitter_vhdl() -> tree_sitter::Language;
 }
 
-pub const LANGUAGE: LanguageFn = unsafe { LanguageFn::from_raw(tree_sitter_vhdl) };
-
 pub fn language() -> tree_sitter::Language {
-    LANGUAGE.into()
+    unsafe { tree_sitter_vhdl() }
 }
