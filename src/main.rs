@@ -1,6 +1,8 @@
 use std::env;
 use std::fs;
 
+const MAX_ERRORS: usize = 10;
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     
@@ -22,54 +24,55 @@ fn main() {
     let tree = parser.parse(&source_code, None).expect("Failed to parse");
     let root = tree.root_node();
 
-    // Print the S-expression (shows ERROR nodes clearly)
-    println!("=== Parse Tree ===");
-    println!("{}", root.to_sexp());
-    println!();
-
-    // Walk and report any errors
-    let mut has_errors = false;
+    // Walk and report any errors (up to MAX_ERRORS)
+    let mut error_count: usize = 0;
     let mut cursor = root.walk();
-    walk_errors(&mut cursor, &source_code, &mut has_errors);
+    walk_errors(&mut cursor, &source_code, &mut error_count);
 
-    if has_errors {
-        println!();
+    if error_count > 0 {
+        if error_count > MAX_ERRORS {
+            println!("... and {} more errors", error_count - MAX_ERRORS);
+        }
+        println!("\n✗ {} parse error(s) found", error_count);
         std::process::exit(1);
     } else {
         println!("✓ No parse errors!");
     }
 }
 
-fn walk_errors(cursor: &mut tree_sitter::TreeCursor, source: &str, has_errors: &mut bool) {
+fn walk_errors(cursor: &mut tree_sitter::TreeCursor, source: &str, error_count: &mut usize) {
     loop {
         let node = cursor.node();
         
         if node.is_error() || node.is_missing() {
-            *has_errors = true;
-            let start = node.start_position();
-            let end = node.end_position();
-            let text = node.utf8_text(source.as_bytes()).unwrap_or("<invalid utf8>");
+            *error_count += 1;
             
-            if node.is_missing() {
-                println!(
-                    "MISSING at {}:{}-{}:{}: expected {}",
-                    start.row + 1, start.column + 1,
-                    end.row + 1, end.column + 1,
-                    node.kind()
-                );
-            } else {
-                println!(
-                    "ERROR at {}:{}-{}:{}: \"{}\"",
-                    start.row + 1, start.column + 1,
-                    end.row + 1, end.column + 1,
-                    text.chars().take(40).collect::<String>()
-                );
+            if *error_count <= MAX_ERRORS {
+                let start = node.start_position();
+                let end = node.end_position();
+                let text = node.utf8_text(source.as_bytes()).unwrap_or("<invalid utf8>");
+                
+                if node.is_missing() {
+                    println!(
+                        "MISSING at {}:{}-{}:{}: expected {}",
+                        start.row + 1, start.column + 1,
+                        end.row + 1, end.column + 1,
+                        node.kind()
+                    );
+                } else {
+                    println!(
+                        "ERROR at {}:{}-{}:{}: \"{}\"",
+                        start.row + 1, start.column + 1,
+                        end.row + 1, end.column + 1,
+                        text.chars().take(40).collect::<String>()
+                    );
+                }
             }
         }
 
         // Recurse into children
         if cursor.goto_first_child() {
-            walk_errors(cursor, source, has_errors);
+            walk_errors(cursor, source, error_count);
             cursor.goto_parent();
         }
 
