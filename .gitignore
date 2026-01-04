@@ -3,3 +3,4 @@
 /tree-sitter-vhdl/src
 /tree-sitter-vhdl/build
 *.log
+.aider*
