@@ -1,0 +1,11 @@
+[package]
+name = "vhdl-compiler"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tree-sitter = "0.22"
+tree-sitter-vhdl = { path = "./tree-sitter-vhdl" }
+
+[build-dependencies]
+cc = "1.0"

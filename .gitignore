@@ -1,1 +1,5 @@
-.aider*
+/target
+/tree-sitter-vhdl/node_modules
+/tree-sitter-vhdl/src
+/tree-sitter-vhdl/build
+*.log
