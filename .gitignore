@@ -1,6 +1,26 @@
 /target
+/Cargo.lock
+
+# Tree-sitter generated files
 /tree-sitter-vhdl/node_modules
 /tree-sitter-vhdl/src
 /tree-sitter-vhdl/build
+/tree-sitter-vhdl/package-lock.json
+
+# Tree-sitter generated bindings (we only need Rust)
+/tree-sitter-vhdl/.editorconfig
+/tree-sitter-vhdl/.gitattributes
+/tree-sitter-vhdl/.gitignore
+/tree-sitter-vhdl/Makefile
+/tree-sitter-vhdl/Package.swift
+/tree-sitter-vhdl/binding.gyp
+/tree-sitter-vhdl/bindings/c
+/tree-sitter-vhdl/bindings/go
+/tree-sitter-vhdl/bindings/node
+/tree-sitter-vhdl/bindings/python
+/tree-sitter-vhdl/bindings/swift
+/tree-sitter-vhdl/pyproject.toml
+/tree-sitter-vhdl/setup.py
+
 *.log
 .aider*
