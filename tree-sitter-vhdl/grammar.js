@@ -383,6 +383,7 @@ module.exports = grammar({
 
     _package_declarative_item: $ => choice(
       $.comment,
+      $.use_clause,  // VHDL-2008: use clause in packages (for generic package parameters)
       $.constant_declaration,
       $.type_declaration,
       $.subtype_declaration,
@@ -392,6 +393,9 @@ module.exports = grammar({
       $.attribute_declaration,
       $.attribute_specification,
       $.signal_declaration,
+      $.file_declaration,  // File declarations in packages
+      $.group_template_declaration,  // Group template declarations
+      $.group_declaration,  // Group declarations
       $._package_generic_clause  // Also allowed as declarative item for flexibility
     ),
 
@@ -493,20 +497,26 @@ module.exports = grammar({
     // type_declaration
     // -------------------------------------------------------------------------
     // type identifier is type_definition;
-    type_declaration: $ => seq(
-      $._kw_type,
-      field('name', $.identifier),
-      $._kw_is,
-      field('definition', choice(
-        prec(10, $.record_type_definition),
-        prec(10, $.enumeration_type_definition),
-        prec(10, $.array_type_definition),
-        prec(10, $.physical_type_definition),
-        prec(10, $.protected_type_declaration),
-        prec(10, $.protected_type_body),
-        prec(-10, $._type_expression)    // Fallback for simple/constrained types
-      )),
-      optional(';')
+    // or: type identifier; (incomplete/forward declaration)
+    type_declaration: $ => choice(
+      // Incomplete type declaration (forward declaration): type name;
+      seq($._kw_type, field('name', $.identifier), ';'),
+      // Full type declaration
+      seq(
+        $._kw_type,
+        field('name', $.identifier),
+        $._kw_is,
+        field('definition', choice(
+          prec(10, $.record_type_definition),
+          prec(10, $.enumeration_type_definition),
+          prec(10, $.array_type_definition),
+          prec(10, $.physical_type_definition),
+          prec(10, $.protected_type_declaration),
+          prec(10, $.protected_type_body),
+          prec(-10, $._type_expression)    // Fallback for simple/constrained types
+        )),
+        optional(';')
+      )
     ),
 
     // Physical type definition with units (e.g., time, resistance)
@@ -1029,6 +1039,7 @@ module.exports = grammar({
 
     // Note: $.comment removed since comments are in extras and handled automatically
     _block_declarative_item: $ => choice(
+      $.use_clause,  // Use clauses allowed in architecture declarative region
       $.constant_declaration,
       $.type_declaration,
       $.subtype_declaration,
@@ -1128,18 +1139,22 @@ module.exports = grammar({
       $._kw_shared,
       $._kw_variable,
       field('name', $.identifier),
+      repeat(seq(',', $.identifier)),  // Multiple variable names
       ':',
       field('type', $._type_mark),
       ';'
     ),
 
     // File declaration
+    // File declaration: file name : type [open mode] [is "filename"];
     file_declaration: $ => seq(
       $._kw_file,
       field('name', $.identifier),
+      repeat(seq(',', $.identifier)),  // Multiple file names
       ':',
       field('type', $.identifier),
-      optional(seq($._kw_open, $.identifier, $._kw_is, $._expression)),  // Optional file open
+      optional(seq($._kw_open, $.identifier)),  // Optional open mode
+      optional(seq($._kw_is, $._expression)),   // Optional filename
       ';'
     ),
 
