@@ -3,67 +3,55 @@ package validator
 import (
 	"encoding/json"
 	"fmt"
-
-	"cuelang.org/go/cue"
-	"cuelang.org/go/cue/cuecontext"
-	"cuelang.org/go/cue/load"
 )
 
-// Validator validates extracted data against the CUE schema
+// Validator validates extracted data against expected schema
 type Validator struct {
-	ctx    *cue.Context
-	schema cue.Value
+	// In the future, this will use CUE for full schema validation
+	// For now, we do basic structural validation
 }
 
-// New creates a new Validator with the schema loaded from the given path
-func New(schemaPath string) (*Validator, error) {
-	ctx := cuecontext.New()
-
-	// Load the schema
-	instances := load.Instances([]string{schemaPath}, nil)
-	if len(instances) == 0 {
-		return nil, fmt.Errorf("no CUE instances found at %s", schemaPath)
-	}
-
-	inst := instances[0]
-	if inst.Err != nil {
-		return nil, fmt.Errorf("loading schema: %w", inst.Err)
-	}
-
-	schema := ctx.BuildInstance(inst)
-	if schema.Err() != nil {
-		return nil, fmt.Errorf("building schema: %w", schema.Err())
-	}
-
-	return &Validator{
-		ctx:    ctx,
-		schema: schema,
-	}, nil
+// New creates a new Validator
+func New() *Validator {
+	return &Validator{}
 }
 
-// Validate checks the given data against the schema
+// Validate checks that the input data has the expected structure
 func (v *Validator) Validate(data interface{}) error {
-	// Marshal data to JSON
+	// Marshal to JSON and back to verify structure
 	jsonBytes, err := json.Marshal(data)
 	if err != nil {
 		return fmt.Errorf("marshaling data: %w", err)
 	}
 
-	// Parse JSON into CUE value
-	val := v.ctx.CompileBytes(jsonBytes)
-	if val.Err() != nil {
-		return fmt.Errorf("parsing data: %w", val.Err())
+	// Verify it's valid JSON
+	var check map[string]interface{}
+	if err := json.Unmarshal(jsonBytes, &check); err != nil {
+		return fmt.Errorf("invalid JSON structure: %w", err)
 	}
 
-	// Unify with schema
-	unified := v.schema.LookupPath(cue.ParsePath("#IR")).Unify(val)
-	if unified.Err() != nil {
-		return fmt.Errorf("validation failed: %w", unified.Err())
+	// Check required fields exist
+	requiredFields := []string{"entities", "architectures", "packages", "symbols"}
+	for _, field := range requiredFields {
+		if _, ok := check[field]; !ok {
+			return fmt.Errorf("missing required field: %s", field)
+		}
 	}
 
-	// Validate
-	if err := unified.Validate(); err != nil {
-		return fmt.Errorf("schema validation: %w", err)
+	// Validate entities have required fields
+	if entities, ok := check["entities"].([]interface{}); ok {
+		for i, e := range entities {
+			entity, ok := e.(map[string]interface{})
+			if !ok {
+				return fmt.Errorf("entity[%d]: invalid structure", i)
+			}
+			if _, ok := entity["name"]; !ok {
+				return fmt.Errorf("entity[%d]: missing 'name' field", i)
+			}
+			if _, ok := entity["file"]; !ok {
+				return fmt.Errorf("entity[%d]: missing 'file' field", i)
+			}
+		}
 	}
 
 	return nil
@@ -71,15 +59,9 @@ func (v *Validator) Validate(data interface{}) error {
 
 // ValidateJSON validates JSON bytes directly
 func (v *Validator) ValidateJSON(jsonBytes []byte) error {
-	val := v.ctx.CompileBytes(jsonBytes)
-	if val.Err() != nil {
-		return fmt.Errorf("parsing JSON: %w", val.Err())
+	var data map[string]interface{}
+	if err := json.Unmarshal(jsonBytes, &data); err != nil {
+		return fmt.Errorf("parsing JSON: %w", err)
 	}
-
-	unified := v.schema.LookupPath(cue.ParsePath("#IR")).Unify(val)
-	if unified.Err() != nil {
-		return fmt.Errorf("validation failed: %w", unified.Err())
-	}
-
-	return unified.Validate()
+	return v.Validate(data)
 }

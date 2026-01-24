@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
 	tree_sitter_vhdl "github.com/tree-sitter/tree-sitter-vhdl"
@@ -76,6 +77,7 @@ type Port struct {
 	Direction string // in, out, inout, buffer
 	Type      string
 	Line      int
+	InEntity  string // Which entity this port belongs to
 }
 
 // New creates a new Extractor with VHDL language loaded
@@ -116,13 +118,13 @@ func (e *Extractor) Extract(filePath string) (FileFacts, error) {
 	defer tree.Close()
 
 	// Walk the tree and extract facts
-	e.walkTree(tree.RootNode(), content, &facts)
+	e.walkTree(tree.RootNode(), content, &facts, "")
 
 	return facts, nil
 }
 
 // walkTree traverses the syntax tree and extracts relevant nodes
-func (e *Extractor) walkTree(node *sitter.Node, source []byte, facts *FileFacts) {
+func (e *Extractor) walkTree(node *sitter.Node, source []byte, facts *FileFacts, context string) {
 	if node == nil {
 		return
 	}
@@ -133,27 +135,55 @@ func (e *Extractor) walkTree(node *sitter.Node, source []byte, facts *FileFacts)
 	case "entity_declaration":
 		entity := e.extractEntity(node, source)
 		facts.Entities = append(facts.Entities, entity)
+		// Extract ports from entity
+		e.extractPortsFromEntity(node, source, entity.Name, facts)
+		context = entity.Name
 
 	case "architecture_body":
 		arch := e.extractArchitecture(node, source)
 		facts.Architectures = append(facts.Architectures, arch)
+		context = arch.Name
 
 	case "package_declaration":
 		pkg := e.extractPackage(node, source)
 		facts.Packages = append(facts.Packages, pkg)
+		context = pkg.Name
 
 	case "use_clause":
-		dep := e.extractUseClause(node, source)
+		dep := e.extractUseClause(node, source, facts.File)
 		facts.Dependencies = append(facts.Dependencies, dep)
+
+	case "library_clause":
+		dep := e.extractLibraryClause(node, source, facts.File)
+		if dep.Target != "" {
+			facts.Dependencies = append(facts.Dependencies, dep)
+		}
 
 	case "component_instantiation":
 		comp := e.extractComponentInst(node, source)
+		facts.Components = append(facts.Components, comp)
+		// Add as dependency
+		if comp.EntityRef != "" {
+			facts.Dependencies = append(facts.Dependencies, Dependency{
+				Source: facts.File,
+				Target: comp.EntityRef,
+				Kind:   "instantiation",
+				Line:   comp.Line,
+			})
+		}
+
+	case "signal_declaration":
+		signals := e.extractSignals(node, source, context)
+		facts.Signals = append(facts.Signals, signals...)
+
+	case "component_declaration":
+		comp := e.extractComponentDecl(node, source)
 		facts.Components = append(facts.Components, comp)
 	}
 
 	// Recurse into children
 	for i := 0; i < int(node.ChildCount()); i++ {
-		e.walkTree(node.Child(i), source, facts)
+		e.walkTree(node.Child(i), source, facts, context)
 	}
 }
 
@@ -197,12 +227,37 @@ func (e *Extractor) extractPackage(node *sitter.Node, source []byte) Package {
 	return pkg
 }
 
-func (e *Extractor) extractUseClause(node *sitter.Node, source []byte) Dependency {
+func (e *Extractor) extractUseClause(node *sitter.Node, source []byte, file string) Dependency {
+	// Extract the library.package path from use clause
+	target := ""
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		if child.Type() == "identifier" || child.Type() == "selector_clause" {
+			target += child.Content(source)
+		}
+	}
 	return Dependency{
-		Target: node.Content(source),
+		Source: file,
+		Target: target,
 		Kind:   "use",
 		Line:   int(node.StartPoint().Row) + 1,
 	}
+}
+
+func (e *Extractor) extractLibraryClause(node *sitter.Node, source []byte, file string) Dependency {
+	// Extract library name
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		if child.Type() == "identifier" {
+			return Dependency{
+				Source: file,
+				Target: child.Content(source),
+				Kind:   "library",
+				Line:   int(node.StartPoint().Row) + 1,
+			}
+		}
+	}
+	return Dependency{}
 }
 
 func (e *Extractor) extractComponentInst(node *sitter.Node, source []byte) Component {
@@ -219,6 +274,117 @@ func (e *Extractor) extractComponentInst(node *sitter.Node, source []byte) Compo
 	}
 
 	return comp
+}
+
+func (e *Extractor) extractComponentDecl(node *sitter.Node, source []byte) Component {
+	comp := Component{
+		Line:       int(node.StartPoint().Row) + 1,
+		IsInstance: false,
+	}
+
+	if nameNode := node.ChildByFieldName("name"); nameNode != nil {
+		comp.Name = nameNode.Content(source)
+	}
+
+	return comp
+}
+
+func (e *Extractor) extractSignals(node *sitter.Node, source []byte, context string) []Signal {
+	var signals []Signal
+	line := int(node.StartPoint().Row) + 1
+
+	// Find signal names and type
+	var names []string
+	var sigType string
+
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		switch child.Type() {
+		case "identifier":
+			// Could be name or type - collect all
+			if nameNode := node.ChildByFieldName("name"); nameNode != nil && child == nameNode {
+				names = append(names, child.Content(source))
+			}
+		}
+	}
+
+	// If we didn't get names from field, try to find them
+	if len(names) == 0 {
+		if nameNode := node.ChildByFieldName("name"); nameNode != nil {
+			names = append(names, nameNode.Content(source))
+		}
+	}
+
+	// Get type
+	if typeNode := node.ChildByFieldName("type"); typeNode != nil {
+		sigType = typeNode.Content(source)
+	}
+
+	for _, name := range names {
+		signals = append(signals, Signal{
+			Name:     name,
+			Type:     sigType,
+			Line:     line,
+			InEntity: context,
+		})
+	}
+
+	return signals
+}
+
+func (e *Extractor) extractPortsFromEntity(node *sitter.Node, source []byte, entityName string, facts *FileFacts) {
+	// Walk through entity looking for parameters (ports)
+	var walkForPorts func(n *sitter.Node)
+	walkForPorts = func(n *sitter.Node) {
+		if n == nil {
+			return
+		}
+		if n.Type() == "parameter" {
+			port := e.extractPort(n, source)
+			port.InEntity = entityName
+			facts.Ports = append(facts.Ports, port)
+		}
+		for i := 0; i < int(n.ChildCount()); i++ {
+			walkForPorts(n.Child(i))
+		}
+	}
+	walkForPorts(node)
+}
+
+func (e *Extractor) extractPort(node *sitter.Node, source []byte) Port {
+	port := Port{
+		Line: int(node.StartPoint().Row) + 1,
+	}
+
+	// Extract name, direction, type from parameter node
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		content := child.Content(source)
+		childType := child.Type()
+
+		switch childType {
+		case "identifier":
+			if port.Name == "" {
+				port.Name = content
+			} else if port.Type == "" {
+				port.Type = content
+			}
+		}
+
+		// Check for direction keywords
+		switch strings.ToLower(content) {
+		case "in":
+			port.Direction = "in"
+		case "out":
+			port.Direction = "out"
+		case "inout":
+			port.Direction = "inOut"
+		case "buffer":
+			port.Direction = "buffer"
+		}
+	}
+
+	return port
 }
 
 // extractSimple is a fallback regex-based extractor when Tree-sitter isn't available

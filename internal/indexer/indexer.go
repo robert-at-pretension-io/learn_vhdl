@@ -8,6 +8,8 @@ import (
 	"sync"
 
 	"github.com/robert-at-pretension-io/vhdl-lint/internal/extractor"
+	"github.com/robert-at-pretension-io/vhdl-lint/internal/policy"
+	"github.com/robert-at-pretension-io/vhdl-lint/internal/validator"
 )
 
 // Indexer is the cross-file linker that builds the symbol table
@@ -122,30 +124,162 @@ func (idx *Indexer) Run(rootPath string) error {
 		}
 	}
 
-	// 4. Report results
-	fmt.Printf("\nSymbol Table:\n")
-	for name, sym := range idx.Symbols.All() {
-		fmt.Printf("  %s (%s) -> %s:%d\n", name, sym.Kind, sym.File, sym.Line)
+	// 4. Build OPA input
+	opaInput := idx.buildPolicyInput()
+
+	// 5. Validate data structure before policy evaluation
+	v := validator.New()
+	if err := v.Validate(opaInput); err != nil {
+		return fmt.Errorf("CRITICAL: Invalid data structure: %w", err)
 	}
 
-	if len(missing) > 0 {
-		fmt.Printf("\nMissing Dependencies:\n")
-		for _, m := range missing {
-			fmt.Printf("  %s\n", m)
+	// 6. Run policy evaluation
+	policyEngine, err := policy.New("policies")
+	if err != nil {
+		fmt.Printf("Warning: Could not load policies: %v\n", err)
+	} else {
+		result, err := policyEngine.Evaluate(opaInput)
+		if err != nil {
+			fmt.Printf("Warning: Policy evaluation failed: %v\n", err)
+		} else {
+			// Report violations
+			if len(result.Violations) > 0 {
+				fmt.Printf("\n=== Policy Violations ===\n")
+				for _, v := range result.Violations {
+					icon := "ℹ"
+					if v.Severity == "error" {
+						icon = "✗"
+					} else if v.Severity == "warning" {
+						icon = "⚠"
+					}
+					fmt.Printf("%s [%s] %s:%d - %s\n", icon, v.Rule, v.File, v.Line, v.Message)
+				}
+			}
+
+			fmt.Printf("\n=== Policy Summary ===\n")
+			fmt.Printf("  Errors:   %d\n", result.Summary.Errors)
+			fmt.Printf("  Warnings: %d\n", result.Summary.Warnings)
+			fmt.Printf("  Info:     %d\n", result.Summary.Info)
 		}
 	}
 
+	// 6. Report basic stats
+	fmt.Printf("\n=== Extraction Summary ===\n")
+	fmt.Printf("  Files:    %d\n", len(files))
+	fmt.Printf("  Symbols:  %d\n", idx.Symbols.Len())
+	fmt.Printf("  Entities: %d\n", len(opaInput.Entities))
+	fmt.Printf("  Packages: %d\n", len(opaInput.Packages))
+	fmt.Printf("  Signals:  %d\n", len(opaInput.Signals))
+	fmt.Printf("  Ports:    %d\n", len(opaInput.Ports))
+
 	if len(errs) > 0 {
-		fmt.Printf("\nParse Errors:\n")
+		fmt.Printf("\n=== Parse Errors ===\n")
 		for _, e := range errs {
 			fmt.Printf("  %v\n", e)
 		}
 	}
 
-	fmt.Printf("\nSummary: %d files, %d symbols, %d missing deps, %d errors\n",
-		len(files), idx.Symbols.Len(), len(missing), len(errs))
-
 	return nil
+}
+
+// buildPolicyInput converts extracted facts to OPA input format
+func (idx *Indexer) buildPolicyInput() policy.Input {
+	input := policy.Input{}
+
+	// Aggregate facts from all files
+	for _, facts := range idx.Facts {
+		for _, e := range facts.Entities {
+			// Find ports for this entity
+			var ports []policy.Port
+			for _, p := range facts.Ports {
+				if p.InEntity == e.Name {
+					ports = append(ports, policy.Port{
+						Name:      p.Name,
+						Direction: p.Direction,
+						Type:      p.Type,
+						Line:      p.Line,
+						InEntity:  p.InEntity,
+					})
+				}
+			}
+			input.Entities = append(input.Entities, policy.Entity{
+				Name:  e.Name,
+				File:  facts.File,
+				Line:  e.Line,
+				Ports: ports,
+			})
+		}
+
+		for _, a := range facts.Architectures {
+			input.Architectures = append(input.Architectures, policy.Architecture{
+				Name:       a.Name,
+				EntityName: a.EntityName,
+				File:       facts.File,
+				Line:       a.Line,
+			})
+		}
+
+		for _, p := range facts.Packages {
+			input.Packages = append(input.Packages, policy.Package{
+				Name: p.Name,
+				File: facts.File,
+				Line: p.Line,
+			})
+		}
+
+		for _, c := range facts.Components {
+			input.Components = append(input.Components, policy.Component{
+				Name:       c.Name,
+				EntityRef:  c.EntityRef,
+				File:       facts.File,
+				Line:       c.Line,
+				IsInstance: c.IsInstance,
+			})
+		}
+
+		for _, s := range facts.Signals {
+			input.Signals = append(input.Signals, policy.Signal{
+				Name:     s.Name,
+				Type:     s.Type,
+				File:     facts.File,
+				Line:     s.Line,
+				InEntity: s.InEntity,
+			})
+		}
+
+		for _, p := range facts.Ports {
+			input.Ports = append(input.Ports, policy.Port{
+				Name:      p.Name,
+				Direction: p.Direction,
+				Type:      p.Type,
+				Line:      p.Line,
+				InEntity:  p.InEntity,
+			})
+		}
+
+		for _, d := range facts.Dependencies {
+			resolved := idx.Symbols.Has(strings.ToLower(d.Target)) || isStandardLibrary(d.Target)
+			input.Dependencies = append(input.Dependencies, policy.Dependency{
+				Source:   d.Source,
+				Target:   d.Target,
+				Kind:     d.Kind,
+				Line:     d.Line,
+				Resolved: resolved,
+			})
+		}
+	}
+
+	// Add symbols
+	for name, sym := range idx.Symbols.All() {
+		input.Symbols = append(input.Symbols, policy.Symbol{
+			Name: name,
+			Kind: sym.Kind,
+			File: sym.File,
+			Line: sym.Line,
+		})
+	}
+
+	return input
 }
 
 func (idx *Indexer) findVHDLFiles(root string) ([]string, error) {
