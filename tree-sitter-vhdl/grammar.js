@@ -321,6 +321,8 @@ module.exports = grammar({
     // VHDL-2008: Block comments /* ... */ (can span multiple lines)
     block_comment: $ => token(seq('/*', /[^*]*\*+([^/*][^*]*\*+)*/, '/')),
     identifier: $ => /[_a-zA-Z][a-zA-Z0-9_]*/,
+    // Extended identifier (VHDL-93+): \NEXT\, \my signal\
+    extended_identifier: $ => /\\[^\\]+\\/,
     selector_clause: $=> prec.left(3, repeat1(seq('.', $.identifier))),
     library_clause: $=> seq($._kw_library, $.identifier, repeat(seq(',', $.identifier)), ';'),
     use_clause: $ => seq(
