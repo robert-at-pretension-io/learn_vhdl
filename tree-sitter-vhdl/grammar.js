@@ -112,9 +112,9 @@ module.exports = grammar({
   name: 'vhdl',
 
   // ===========================================================================
-  // WORD - DISABLED - causes issues with the grammar
+  // WORD - helps tree-sitter handle keyword boundaries
   // ===========================================================================
-  // word: $ => $.identifier,
+  word: $ => $.identifier,
 
   // ===========================================================================
   // EXTRAS
@@ -296,7 +296,7 @@ module.exports = grammar({
     // The /.*/ regex matches everything except newline (. doesn't match \n).
     // -------------------------------------------------------------------------
     comment: $ => token(seq('--', /.*/)),
-    identifier: $ => token(seq(/[_a-zA-Z]+/, /[a-zA-Z0-9_]*/)),
+    identifier: $ => /[_a-zA-Z][a-zA-Z0-9_]*/,
     selector_clause: $=> prec.left(3, repeat1(seq('.', $.identifier))),
     library_clause: $=> seq($._kw_library, $.identifier, ';'),
     use_clause: $ => seq($._kw_use, $.identifier, optional($.selector_clause), ';'),
@@ -345,6 +345,9 @@ module.exports = grammar({
       $.alias_declaration,
       $.subprogram_declaration,
       $.component_declaration,
+      $.attribute_declaration,
+      $.attribute_specification,
+      $.signal_declaration,
       $._package_generic_clause  // Also allowed as declarative item for flexibility
     ),
 
@@ -385,6 +388,7 @@ module.exports = grammar({
     // e.g., "integer", "std_logic_vector(7 downto 0)", "file of string"
     _type_expression: $ => choice(
       seq($._kw_access, $.identifier),        // Access type: access integer
+      seq($._kw_range, $._expression, choice($._kw_to, $._kw_downto), $._expression),  // Integer/float range: range 1 to 32
       seq(
         $.identifier,
         optional(choice(
@@ -397,12 +401,12 @@ module.exports = grammar({
 
     // Type mark - a type name, possibly with constraints like std_logic_vector(7 downto 0)
     // Includes closing parens for the constraints
-    // Type mark - structured to stop at keywords like $._kw_is
+    // Type mark - structured to stop at keywords
     _type_mark: $ => prec(-1, seq(
       $.identifier,
       optional(choice(
         seq('(', /[^)]+/, ')'),  // Parenthesized constraint
-        seq($._kw_range, $._expression)  // Range constraint: range 0 to 100
+        seq($._kw_range, $._expression, choice($._kw_to, $._kw_downto), $._expression)  // Range constraint
       ))
     )),
 
@@ -747,7 +751,10 @@ module.exports = grammar({
       $.type_declaration,
       $.subtype_declaration,
       $.alias_declaration,
-      $.subprogram_declaration
+      $.subprogram_declaration,
+      $.attribute_declaration,
+      $.attribute_specification,
+      $.signal_declaration
     ),
 
     // -------------------------------------------------------------------------
@@ -908,7 +915,7 @@ module.exports = grammar({
       ':',
       field('class', $.identifier),
       $._kw_is,
-      field('value', choice($._string_literal, $.identifier)),
+      field('value', $._expression),  // Can be any expression: string, number, identifier, aggregate
       ';'
     ),
 
@@ -1230,6 +1237,10 @@ module.exports = grammar({
       $._name,  // Can be identifier or indexed/sliced name
       ':=',
       $._expression,
+      optional(seq(  // Conditional assignment (VHDL-2008): x := expr when cond else expr
+        $._kw_when, $._expression,
+        repeat(seq($._kw_else, $._expression, optional(seq($._kw_when, $._expression))))
+      )),
       ';'
     ),
 
@@ -1397,9 +1408,10 @@ module.exports = grammar({
       ')'
     ),
 
-    // Procedure argument - simpler than expression to avoid conflicts
+    // Procedure argument - allows function calls and complex expressions
     _procedure_argument: $ => choice(
       $.qualified_expression,  // string'("hello")
+      $._function_call_in_expr,  // ROUND(var2), func(a, b)
       $.identifier,
       $.number,
       $._literal
