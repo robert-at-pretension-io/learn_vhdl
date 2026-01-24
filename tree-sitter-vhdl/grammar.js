@@ -379,12 +379,12 @@ module.exports = grammar({
 
     // Constant values can be various literals and expressions
     _constant_value: $ => choice(
-      $.number,
+      seq(optional(choice('+', '-')), $.number),  // Signed number: -100, +5
+      seq(optional(choice('+', '-')), $.number, $.identifier),  // Signed physical: -10 ns
       $.identifier,
       $._string_literal,
-      seq($.number, $.identifier),  // e.g., "10 ns" for time
-      seq($.identifier, $._string_literal),  // e.g., "x"AA"" - but actually parsed as single literal
-      seq('(', /[^)]+/, ')')  // Aggregate or expression in parens
+      seq($.identifier, $._string_literal),  // e.g., x"AA" based literal
+      $._parenthesized_expression  // Aggregate with nested parens supported
     ),
 
     // Simplified expression - placeholder for proper expression parsing
