@@ -147,7 +147,14 @@ module.exports = grammar({
     [$._block_declarative_item, $._concurrent_statement],
     [$._conditional_signal_assignment, $._force_release_assignment, $._name],
     [$.indexed_name, $._procedure_argument],  // identifier inside parens ambiguity
-    [$._block_configuration, $._component_configuration]  // for identifier...
+    [$._index_expression, $._procedure_argument],  // identifier in parens ambiguity
+    [$._block_configuration, $._component_configuration],  // for identifier...
+    [$.subprogram_declaration, $.subprogram_body],  // both start with procedure/function
+    [$.indexed_name, $._name_or_attribute],  // identifier followed by ( - is it index or part of attr?
+    [$.indexed_name, $._expression_term],  // selected_name followed by ( in expression
+    [$._index_expression, $._literal],  // character literal in index vs literal
+    [$._index_expression, $._name_or_attribute],  // identifier in index expression
+    [$._index_expression, $._expression_term]  // number/identifier in nested index
   ],
 
   // ===========================================================================
@@ -174,6 +181,7 @@ module.exports = grammar({
     _kw_body: _ => /[bB][oO][dD][yY]/,
     _kw_is: _ => /[iI][sS]/,
     _kw_end: _ => /[eE][nN][dD]/,
+    _kw_units: _ => /[uU][nN][iI][tT][sS]/,
     _kw_generic: _ => /[gG][eE][nN][eE][rR][iI][cC]/,
     _kw_type: _ => /[tT][yY][pP][eE]/,
     _kw_function: _ => /[fF][uU][nN][cC][tT][iI][oO][nN]/,
@@ -196,6 +204,7 @@ module.exports = grammar({
     _kw_entity: _ => /[eE][nN][tT][iI][tT][yY]/,
     _kw_architecture: _ => /[aA][rR][cC][hH][iI][tT][eE][cC][tT][uU][rR][eE]/,
     _kw_configuration: _ => /[cC][oO][nN][fF][iI][gG][uU][rR][aA][tT][iI][oO][nN]/,
+    _kw_open: _ => /[oO][pP][eE][nN]/,
     _kw_context: _ => /[cC][oO][nN][tT][eE][xX][tT]/,
     _kw_port: _ => /[pP][oO][rR][tT]/,
     _kw_map: _ => /[mM][aA][pP]/,
@@ -250,6 +259,7 @@ module.exports = grammar({
     _kw_range: _ => /[rR][aA][nN][gG][eE]/,
     _kw_to: _ => /[tT][oO]/,
     _kw_downto: _ => /[dD][oO][wW][nN][tT][oO]/,
+    _kw_after: _ => /[aA][fF][tT][eE][rR]/,
     _kw_generate: _ => /[gG][eE][nN][eE][rR][aA][tT][eE]/,
     _kw_block: _ => /[bB][lL][oO][cC][kK]/,
     _kw_all: _ => /[aA][lL][lL]/,
@@ -401,15 +411,20 @@ module.exports = grammar({
     ),
 
     // Type mark - a type name, possibly with constraints like std_logic_vector(7 downto 0)
-    // Includes closing parens for the constraints
-    // Type mark - structured to stop at keywords
+    // Type name can be simple (integer) or selected (work.pkg.Type)
     _type_mark: $ => prec(-1, seq(
-      $.identifier,
+      $._type_name,
       optional(choice(
         seq('(', /[^)]+/, ')'),  // Parenthesized constraint
         seq($._kw_range, $._expression, choice($._kw_to, $._kw_downto), $._expression)  // Range constraint
       ))
     )),
+
+    // Type name - simple identifier or selected name (work.pkg.Type)
+    _type_name: $ => seq(
+      $.identifier,
+      repeat(seq('.', $.identifier))
+    ),
 
     // -------------------------------------------------------------------------
     // type_declaration
@@ -423,11 +438,22 @@ module.exports = grammar({
         prec(10, $.record_type_definition),
         prec(10, $.enumeration_type_definition),
         prec(10, $.array_type_definition),
+        prec(10, $.physical_type_definition),
         prec(10, $.protected_type_declaration),
         prec(10, $.protected_type_body),
         prec(-10, $._type_expression)    // Fallback for simple/constrained types
       )),
       optional(';')
+    ),
+
+    // Physical type definition with units (e.g., time, resistance)
+    // type T is range X to Y units ... end units;
+    physical_type_definition: $ => seq(
+      $._kw_range, $._expression, choice($._kw_to, $._kw_downto), $._expression,
+      $._kw_units,
+      $.identifier, ';',  // Base unit
+      repeat(seq($.identifier, '=', $._expression, ';')),  // Secondary units
+      $._kw_end, $._kw_units, optional($.identifier)
     ),
 
     // VHDL-2008: Protected type declaration (interface)
@@ -523,11 +549,12 @@ module.exports = grammar({
     // -------------------------------------------------------------------------
     // subtype_declaration
     // -------------------------------------------------------------------------
-    // subtype identifier is subtype_indication;
+    // subtype identifier is [resolution_function] subtype_indication;
     subtype_declaration: $ => seq(
       $._kw_subtype,
       field('name', $.identifier),
       $._kw_is,
+      optional(field('resolution', $.identifier)),  // Optional resolution function
       field('indication', $._type_mark),
       ';'
     ),
@@ -881,7 +908,31 @@ module.exports = grammar({
       $.attribute_declaration,
       $.attribute_specification,
       $.shared_variable_declaration,
-      $.file_declaration
+      $.file_declaration,
+      $.configuration_specification
+    ),
+
+    // Configuration specification: for label : component use entity lib.entity(arch);
+    configuration_specification: $ => seq(
+      $._kw_for,
+      choice($.identifier, $._kw_all, $._kw_others),  // Component label(s)
+      ':',
+      $.identifier,  // Component name
+      $._kw_use,
+      choice(
+        seq($._kw_entity, $._entity_aspect),  // use entity work.foo(bar)
+        seq($._kw_configuration, $._selected_name),  // use configuration work.cfg
+        $._kw_open  // use open
+      ),
+      optional(seq($._kw_generic, $._kw_map, '(', /[^)]*/, ')')),
+      optional(seq($._kw_port, $._kw_map, '(', /[^)]*/, ')')),
+      ';'
+    ),
+
+    // Entity aspect: library.entity(architecture)
+    _entity_aspect: $ => seq(
+      $._selected_name,
+      optional(seq('(', $.identifier, ')'))  // Optional architecture name
     ),
 
     // VHDL-2008: Shared variable (requires protected type)
@@ -1035,11 +1086,13 @@ module.exports = grammar({
       $._force_release_assignment
     ),
 
+    // Simple signal assignment with waveform: signal <= value [after time] {, value [after time]};
     _simple_signal_assignment: $ => seq(
       $._name,  // Can be indexed: data(i) <= '0'
       '<=',
       optional($._kw_guarded),  // For guarded signal assignments in blocks
-      $._expression,
+      $._waveform_element,
+      repeat(seq(',', $._waveform_element)),
       ';'
     ),
 
@@ -1104,7 +1157,13 @@ module.exports = grammar({
       $.variable_declaration,
       $.type_declaration,
       $.subtype_declaration,
-      $.constant_declaration
+      $.constant_declaration,
+      $.alias_declaration,
+      $.attribute_declaration,
+      $.attribute_specification,
+      $.subprogram_declaration,
+      $.subprogram_body,
+      $.use_clause
     ),
 
     component_instantiation: $ => seq(
@@ -1191,12 +1250,20 @@ module.exports = grammar({
 
     // Sequential signal assignment (inside process/function)
     // Use prec.dynamic for runtime conflict resolution with procedure_call_statement
+    // Supports waveform: signal <= value [after time] {, value [after time]};
     sequential_signal_assignment: $ => prec.dynamic(10, seq(
-      $._name,
+      $._assignment_target,  // Includes identifier, selected_name, indexed_name
       '<=',
-      $._expression,
+      $._waveform_element,
+      repeat(seq(',', $._waveform_element)),
       ';'
     )),
+
+    // Waveform element: value [after time_expression]
+    _waveform_element: $ => seq(
+      $._expression,
+      optional(seq($._kw_after, $._expression))
+    ),
 
     exit_statement: $ => seq(
       $._kw_exit,
@@ -1224,14 +1291,20 @@ module.exports = grammar({
       repeat($._sequential_statement)
     ),
 
+    // Wait statement: wait [on signal_list] [until condition] [for time_expression];
     wait_statement: $ => seq(
       $._kw_wait,
-      optional(choice(
-        seq($._kw_until, $._expression),
-        seq($._kw_for, $._expression),
-        seq($._kw_on, $.identifier, repeat(seq(',', $.identifier)))
-      )),
+      optional(seq($._kw_on, $._signal_name, repeat(seq(',', $._signal_name)))),  // sensitivity clause
+      optional(seq($._kw_until, $._expression)),  // condition clause
+      optional(seq($._kw_for, $._expression)),    // timeout clause
       ';'
+    ),
+
+    // Signal name - used in sensitivity lists (wait on X, process(X))
+    _signal_name: $ => choice(
+      $.indexed_name,   // A(1), arr(idx)
+      $.selected_name,  // record.field
+      $.identifier      // simple signal
     ),
 
     return_statement: $ => seq(
@@ -1241,7 +1314,7 @@ module.exports = grammar({
     ),
 
     assignment_statement: $ => seq(
-      $._name,  // Can be identifier or indexed/sliced name
+      $._assignment_target,  // Can be identifier, selected name, or indexed/sliced name
       ':=',
       $._expression,
       optional(seq(  // Conditional assignment (VHDL-2008): x := expr when cond else expr
@@ -1251,27 +1324,67 @@ module.exports = grammar({
       ';'
     ),
 
-    // Name can be simple identifier or indexed/sliced
-    // For assignments: identifier or identifier(index_expression)
+    // Assignment target - left side of := assignment
+    // Includes selected names like V1.field.subfield
+    _assignment_target: $ => choice(
+      $.indexed_name,   // arr(i), foo.bar(i)
+      $.selected_name,  // record.field, V1.S11.S12
+      $.identifier      // Simple variable
+    ),
+
+    // Name can be simple identifier, indexed/sliced, or attribute
+    // Supports chaining: arr(1)(2), arr(1 to 8)(7), V(2 to 4)'LOW
+    // Note: selected_name (pkg.name) is handled separately in procedure_call_statement
     _name: $ => choice(
-      $.indexed_name,   // Indexed name: foo(i)
+      $.indexed_name,   // Indexed/sliced name: foo(i), foo(1 to 8)
+      $.attribute_name, // Attribute: foo'attr
       $.external_name,  // VHDL-2008: << signal .path : type >>
       $.identifier      // Simple name
     ),
 
-    // Indexed name for array access: foo(i), shift_reg(j+1)
-    // Higher precedence to prefer this when followed by <= or :=
-    indexed_name: $ => prec.dynamic(5, seq(
+    // Simple name (cannot be recursive) - used as base for chained names
+    _simple_name: $ => choice(
       $.identifier,
+      $.external_name
+    ),
+
+    // Selected name: prefix.suffix
+    selected_name: $ => prec.left(6, seq(
+      choice($.identifier, $.selected_name),
+      '.',
+      $.identifier
+    )),
+
+    // Indexed/sliced name for array access: foo(i), foo(1 to 8), foo(1)(2)
+    // Prefix can be identifier, selected_name, or another indexed_name for chaining
+    indexed_name: $ => prec.dynamic(5, seq(
+      choice(
+        $.identifier,
+        $.selected_name,
+        $.indexed_name    // Allow chaining: foo(1)(2)
+      ),
       '(',
       $._index_expression,
       ')'
     )),
 
-    // Simple index expression - identifiers and operators, no nested parens for now
-    _index_expression: $ => repeat1(choice(
+    // Attribute name: prefix'attribute
+    attribute_name: $ => prec.left(4, seq(
+      choice($.identifier, $.indexed_name, $.selected_name),
+      "'",
+      $.identifier
+    )),
+
+    // Index expression - supports identifiers, numbers, ranges, operators
+    _index_expression: $ => seq(
+      $._index_element,
+      repeat(seq(choice(',', $._kw_to, $._kw_downto), $._index_element))
+    ),
+
+    _index_element: $ => repeat1(choice(
       $.identifier,
       $.number,
+      /'[^']+'/,  // Character literal: '0', 'a', etc.
       /[+\-*/<>=]+/
     )),
 
@@ -1296,8 +1409,10 @@ module.exports = grammar({
       ';'
     ),
 
-    // Simplified loop (while, for, or infinite)
+    // Simplified loop (while, for, or infinite) with optional label
+    // label : [while cond | for i in range] loop ... end loop [label];
     loop_statement: $ => seq(
+      optional(seq($.identifier, ':')),  // Optional label
       optional(choice(
         seq($._kw_while, $._expression),  // while loop
         seq($._kw_for, $.identifier, $._kw_in, $._range_or_expression)  // for loop
@@ -1306,6 +1421,7 @@ module.exports = grammar({
       repeat($._sequential_statement),
       $._kw_end,
       $._kw_loop,
+      optional($.identifier),  // Optional label at end
       ';'
     ),
 
@@ -1317,6 +1433,9 @@ module.exports = grammar({
     _expression_term: $ => choice(
       $._literal,  // Must be early to catch '0' before it's seen as quote
       $.qualified_expression,  // type'(expr) - must be before _name_or_attribute
+      $.attribute_name,  // V(2 to 4)'LOW - attribute on complex name
+      $.indexed_name,    // arr(i), arr(1 to 8) - indexed/sliced names in expressions
+      $.selected_name,   // pkg.const - selected names in expressions
       $._name_or_attribute,  // Identifier optionally followed by attribute
       $.external_name,  // VHDL-2008: << signal .path : type >>
       $.number,
@@ -1395,16 +1514,17 @@ module.exports = grammar({
       seq($.identifier, ';'),                    // No args: bar;
       seq($.identifier, '(', ')', ';'),          // Empty parens: bar();
       seq($._procedure_call_with_args, ';'),     // With args: foo(a, b, c);
-      seq($._selected_name, ';'),                // Selected: obj.method;
-      seq($._selected_name, '(', ')', ';'),      // Selected with parens: obj.method();
-      seq($._selected_name, '(', $._procedure_argument, repeat(seq(',', $._procedure_argument)), ')', ';')
+      seq($.selected_name, ';'),                 // Selected: obj.method, pkg.func.call;
+      seq($.selected_name, '(', ')', ';'),       // Selected with parens: obj.method();
+      seq($.selected_name, '(', $._procedure_argument, repeat(seq(',', $._procedure_argument)), ')', ';'),
+      seq($.indexed_name, ';')                   // Indexed: pkg.func(arg);
     )),
 
     // Selected name: a.b or a.b.c (for method calls, package references)
-    _selected_name: $ => seq(
+    _selected_name: $ => prec.left(5, seq(
       $.identifier,
       repeat1(seq('.', $.identifier))
-    ),
+    )),
 
     // Procedure call with arguments - separate from indexed_name
     _procedure_call_with_args: $ => seq(
@@ -1419,6 +1539,8 @@ module.exports = grammar({
     _procedure_argument: $ => choice(
       $.qualified_expression,  // string'("hello")
       $._function_call_in_expr,  // ROUND(var2), func(a, b)
+      $.indexed_name,  // arr(i), slice(0 to 3)
+      $.selected_name, // record.field
       $.identifier,
       $.number,
       $._literal
