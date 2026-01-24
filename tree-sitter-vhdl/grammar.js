@@ -628,7 +628,8 @@ module.exports = grammar({
 
     // Default values can be identifiers, numbers, literals, or expressions
     _default_value: $ => choice(
-      $.number,
+      seq(optional(choice('+', '-')), $.number, optional($.identifier)),  // Numbers: 1, -1, 1.0, 1 fs, -1.0 ns
+      seq($.identifier, $._string_literal),  // Based string like B"10010110"
       $.identifier,
       $._string_literal,
       seq('(', /[^)]+/, ')')  // Expression in parens
