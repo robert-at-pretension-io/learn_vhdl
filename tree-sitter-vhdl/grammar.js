@@ -2,17 +2,6 @@
 // Tree-sitter Grammar for VHDL
 // ============================================================================
 //
-// NOTE: VHDL is case-insensitive. We use the ci() helper function below
-// to generate case-insensitive regex patterns for keywords.
-
-// Helper function for case-insensitive keywords
-// ci('entity') returns /[eE][nN][tT][iI][tT][yY]/
-function ci(word) {
-  return new RegExp(word.split('').map(c =>
-    /[a-z]/i.test(c) ? `[${c.toLowerCase()}${c.toUpperCase()}]` : c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  ).join(''));
-}
-
 // ============================================================================
 //
 // WHAT IS THIS FILE?
@@ -38,10 +27,10 @@ function ci(word) {
 // RULE COMBINATORS (how to build rules):
 //
 //   seq(a, b, c)        Match a, then b, then c in sequence
-//                       Example: seq(ci("if"), $.condition, ci("then"))
+//                       Example: seq('if', $.condition, 'then')
 //
 //   choice(a, b, c)     Match a OR b OR c (first one that works)
-//                       Example: choice(ci("and"), ci("or"), ci("xor"))
+//                       Example: choice('and', 'or', 'xor')
 //
 //   repeat(rule)        Match rule zero or more times (like regex *)
 //                       Example: repeat($.statement) -- 0+ statements
@@ -50,7 +39,7 @@ function ci(word) {
 //                       Example: repeat1($.identifier) -- 1+ identifiers
 //
 //   optional(rule)      Match rule zero or one time (like regex ?)
-//                       Example: optional(ci("entity")) -- ci("entity") or nothing
+//                       Example: optional('entity') -- 'entity' or nothing
 //
 //   token(rule)         Combine into single token (no whitespace allowed inside)
 //                       Example: token(seq('--', /.*/)) -- comment as one token
@@ -70,7 +59,7 @@ function ci(word) {
 // TERMINALS (leaf nodes that match actual text):
 //
 //   'keyword'           Literal string match (case-sensitive by default)
-//                       Example: ci("entity"), ci("begin"), ';'
+//                       Example: 'entity', 'begin', ';'
 //
 //   /regex/             Regular expression match
 //                       Example: /[0-9]+/ for integers
@@ -151,7 +140,7 @@ module.exports = grammar({
   // Example: In VHDL, `foo(x)` could be a function call OR an array index.
   // You'd add: conflicts: $ => [[$.function_call, $.indexed_name]]
   //
-  // Package vs package body can conflict since both start with ci("package")
+  // Package vs package body can conflict since both start with 'package'
   // ===========================================================================
   conflicts: $ => [
     [$.package_declaration, $._package_declarative_item],
@@ -221,8 +210,8 @@ module.exports = grammar({
     comment: $ => token(seq('--', /.*/)),
     identifier: $ => token(seq(/[_a-zA-Z]+/, /[a-zA-Z0-9_]*/)),
     selector_clause: $=> prec.left(3, repeat1(seq('.', $.identifier))),
-    library_clause: $=> seq(ci("library"), $.identifier, ';'),
-    use_clause: $ => seq(ci("use"), $.identifier, optional($.selector_clause), ';'),
+    library_clause: $=> seq('library', $.identifier, ';'),
+    use_clause: $ => seq('use', $.identifier, optional($.selector_clause), ';'),
 
     // -------------------------------------------------------------------------
     // package_declaration
@@ -232,20 +221,20 @@ module.exports = grammar({
     //   declarations...
     // end [package] [identifier];
     package_declaration: $ => seq(
-      ci("package"),
+      'package',
       field('name', $.identifier),
-      ci("is"),
+      'is',
       optional($._package_generic_clause),  // VHDL-2008 package generics
       repeat($._package_declarative_item),
-      ci("end"),
-      optional(ci("package")),
+      'end',
+      optional('package'),
       optional($.identifier),
       ';'
     ),
 
     // VHDL-2008: Package generic clause
     _package_generic_clause: $ => seq(
-      ci("generic"),
+      'generic',
       '(',
       $.generic_item,
       repeat(seq(';', $.generic_item)),
@@ -255,8 +244,8 @@ module.exports = grammar({
 
     // Generic item can be type, constant, or function
     generic_item: $ => choice(
-      seq(ci("type"), $.identifier),  // Generic type parameter
-      seq(ci("function"), $.identifier, $._parameter_list, ci("return"), $.identifier),  // Generic function
+      seq('type', $.identifier),  // Generic type parameter
+      seq('function', $.identifier, $._parameter_list, 'return', $.identifier),  // Generic function
       $.parameter  // Generic constant (like normal parameter)
     ),
 
@@ -276,7 +265,7 @@ module.exports = grammar({
     // -------------------------------------------------------------------------
     // constant identifier : type := expression;
     constant_declaration: $ => seq(
-      ci("constant"),
+      'constant',
       field('name', $.identifier),
       ':',
       field('type', $._type_mark),
@@ -307,25 +296,25 @@ module.exports = grammar({
     // Matches: identifier optionally followed by constraint
     // e.g., "integer", "std_logic_vector(7 downto 0)", "file of string"
     _type_expression: $ => choice(
-      seq(ci("access"), $.identifier),        // Access type: access integer
+      seq('access', $.identifier),        // Access type: access integer
       seq(
         $.identifier,
         optional(choice(
           seq('(', /[^)]+/, ')'),         // Constraint in parens
-          seq(ci("range"), /[^;]+/),          // Range constraint
-          seq(ci("of"), $.identifier)         // For "file of X" types
+          seq('range', /[^;]+/),          // Range constraint
+          seq('of', $.identifier)         // For "file of X" types
         ))
       )
     ),
 
     // Type mark - a type name, possibly with constraints like std_logic_vector(7 downto 0)
     // Includes closing parens for the constraints
-    // Type mark - structured to stop at keywords like ci("is")
+    // Type mark - structured to stop at keywords like 'is'
     _type_mark: $ => prec(-1, seq(
       $.identifier,
       optional(choice(
         seq('(', /[^)]+/, ')'),  // Parenthesized constraint
-        seq(ci("range"), $._expression)  // Range constraint: range 0 to 100
+        seq('range', $._expression)  // Range constraint: range 0 to 100
       ))
     )),
 
@@ -334,9 +323,9 @@ module.exports = grammar({
     // -------------------------------------------------------------------------
     // type identifier is type_definition;
     type_declaration: $ => seq(
-      ci("type"),
+      'type',
       field('name', $.identifier),
-      ci("is"),
+      'is',
       field('definition', choice(
         prec(10, $.record_type_definition),
         prec(10, $.enumeration_type_definition),
@@ -353,10 +342,10 @@ module.exports = grammar({
     //   procedure/function declarations...
     // end protected [name];
     protected_type_declaration: $ => seq(
-      ci("protected"),
+      'protected',
       repeat($._protected_type_declarative_item),
-      ci("end"),
-      ci("protected"),
+      'end',
+      'protected',
       optional($.identifier)
     ),
 
@@ -365,12 +354,12 @@ module.exports = grammar({
     //   variable declarations, procedure/function bodies...
     // end protected body [name];
     protected_type_body: $ => seq(
-      ci("protected"),
-      ci("body"),
+      'protected',
+      'body',
       repeat($._protected_type_body_item),
-      ci("end"),
-      ci("protected"),
-      ci("body"),
+      'end',
+      'protected',
+      'body',
       optional($.identifier)
     ),
 
@@ -402,11 +391,11 @@ module.exports = grammar({
     // array (range1, range2, ...) of element_type
     // array (index_type range <>) of element_type  -- unconstrained
     array_type_definition: $ => seq(
-      ci("array"),
+      'array',
       '(',
       $._simple_expression,  // index constraint(s)
       ')',
-      ci("of"),
+      'of',
       $._type_mark  // element type
     ),
 
@@ -418,10 +407,10 @@ module.exports = grammar({
     //   ...
     // end record [identifier];
     record_type_definition: $ => seq(
-      ci("record"),
+      'record',
       repeat($.element_declaration),
-      ci("end"),
-      ci("record"),
+      'end',
+      'record',
       optional($.identifier)
     ),
 
@@ -438,9 +427,9 @@ module.exports = grammar({
     // -------------------------------------------------------------------------
     // subtype identifier is subtype_indication;
     subtype_declaration: $ => seq(
-      ci("subtype"),
+      'subtype',
       field('name', $.identifier),
-      ci("is"),
+      'is',
       field('indication', $._type_mark),
       ';'
     ),
@@ -450,10 +439,10 @@ module.exports = grammar({
     // -------------------------------------------------------------------------
     // alias identifier [: type] is name;
     alias_declaration: $ => seq(
-      ci("alias"),
+      'alias',
       field('name', $.identifier),
       optional(seq(':', $._type_mark)),  // Optional type constraint
-      ci("is"),
+      'is',
       field('aliased_name', $._type_mark),  // Use _type_mark to allow foo(7 downto 4)
       ';'
     ),
@@ -470,21 +459,21 @@ module.exports = grammar({
 
     // Function: unified rule that handles both declaration and body
     function_declaration: $ => seq(
-      optional(choice(ci("pure"), ci("impure"))),  // VHDL-2008
-      ci("function"),
+      optional(choice('pure', 'impure')),  // VHDL-2008
+      'function',
       field('name', choice($.identifier, $._operator_symbol)),
       optional($._parameter_list),
-      ci("return"),
+      'return',
       field('return_type', $.identifier),
       choice(
         ';',  // Declaration only
         seq(  // Body
-          ci("is"),
+          'is',
           repeat($._subprogram_declarative_item),
-          ci("begin"),
+          'begin',
           repeat($._sequential_statement),
-          ci("end"),
-          optional(ci("function")),
+          'end',
+          optional('function'),
           optional(choice($.identifier, $._operator_symbol)),  // Can be operator symbol too
           ';'
         )
@@ -496,18 +485,18 @@ module.exports = grammar({
 
     // Procedure: unified rule that handles both declaration and body
     procedure_declaration: $ => seq(
-      ci("procedure"),
+      'procedure',
       field('name', $.identifier),
       optional($._parameter_list),
       choice(
         ';',  // Declaration only
         seq(  // Body
-          ci("is"),
+          'is',
           repeat($._subprogram_declarative_item),
-          ci("begin"),
+          'begin',
           repeat($._sequential_statement),
-          ci("end"),
-          optional(ci("procedure")),
+          'end',
+          optional('procedure'),
           optional($.identifier),
           ';'
         )
@@ -530,11 +519,11 @@ module.exports = grammar({
 
     // parameter: [signal|variable|constant] name[, name...] : [in|out|inout] type [:= default]
     parameter: $ => seq(
-      optional(choice(ci("signal"), ci("variable"), ci("constant"), ci("file"))),
+      optional(choice('signal', 'variable', 'constant', 'file')),
       $.identifier,
       repeat(seq(',', $.identifier)),
       ':',
-      optional(choice(ci("in"), ci("out"), 'inout', ci("buffer"), ci("linkage"))),
+      optional(choice('in', 'out', 'inout', 'buffer', 'linkage')),
       $._parameter_type,
       optional(seq(':=', $._default_value))  // default value
     ),
@@ -573,13 +562,13 @@ module.exports = grammar({
     //   [port (...);]
     // end component [identifier];
     component_declaration: $ => seq(
-      ci("component"),
+      'component',
       field('name', $.identifier),
-      optional(ci("is")),  // VHDL-93+: optional ci("is")
-      optional(seq(ci("generic"), $._parameter_list, ';')),
-      optional(seq(ci("port"), $._parameter_list, ';')),
-      ci("end"),
-      ci("component"),
+      optional('is'),  // VHDL-93+: optional 'is'
+      optional(seq('generic', $._parameter_list, ';')),
+      optional(seq('port', $._parameter_list, ';')),
+      'end',
+      'component',
       optional($.identifier),
       ';'
     ),
@@ -591,13 +580,13 @@ module.exports = grammar({
     //   declarations and subprogram bodies...
     // end [package body] [identifier];
     package_body: $ => seq(
-      ci("package"),
-      ci("body"),
+      'package',
+      'body',
       field('name', $.identifier),
-      ci("is"),
+      'is',
       repeat($._package_body_declarative_item),
-      ci("end"),
-      optional(seq(ci("package"), ci("body"))),
+      'end',
+      optional(seq('package', 'body')),
       optional($.identifier),
       ';'
     ),
@@ -618,18 +607,18 @@ module.exports = grammar({
     //   [declarative items]
     // end [entity] [identifier];
     entity_declaration: $ => seq(
-      ci("entity"),
+      'entity',
       field('name', $.identifier),
-      ci("is"),
-      optional(seq(ci("generic"), $._parameter_list, ';')),
-      optional(seq(ci("port"), $._parameter_list, ';')),
+      'is',
+      optional(seq('generic', $._parameter_list, ';')),
+      optional(seq('port', $._parameter_list, ';')),
       repeat($._entity_declarative_item),
       optional(seq(
-        ci("begin"),
+        'begin',
         repeat($._entity_statement)
       )),
-      ci("end"),
-      optional(ci("entity")),
+      'end',
+      optional('entity'),
       optional($.identifier),
       ';'
     ),
@@ -641,14 +630,14 @@ module.exports = grammar({
     ),
 
     assert_statement: $ => seq(
-      ci("assert"),
+      'assert',
       $._expression,
-      optional(seq(ci("report"), $._report_expression)),
-      optional(seq(ci("severity"), $.identifier)),
+      optional(seq('report', $._report_expression)),
+      optional(seq('severity', $.identifier)),
       ';'
     ),
 
-    // Report expression - strings and concatenation, but stops at ci("severity") keyword
+    // Report expression - strings and concatenation, but stops at 'severity' keyword
     _report_expression: $ => repeat1(choice(
       $._string_literal,
       $._name_or_attribute,
@@ -682,16 +671,16 @@ module.exports = grammar({
     //   [statements]
     // end [architecture] [identifier];
     architecture_body: $ => seq(
-      ci("architecture"),
+      'architecture',
       field('name', $.identifier),
-      ci("of"),
+      'of',
       field('entity', $.identifier),
-      ci("is"),
+      'is',
       repeat($._block_declarative_item),
-      ci("begin"),
+      'begin',
       repeat($._concurrent_statement),
-      ci("end"),
-      optional(ci("architecture")),
+      'end',
+      optional('architecture'),
       optional($.identifier),
       ';'
     ),
@@ -707,14 +696,14 @@ module.exports = grammar({
     //   end for;
     // end [configuration] [name];
     configuration_declaration: $ => seq(
-      ci("configuration"),
+      'configuration',
       field('name', $.identifier),
-      ci("of"),
+      'of',
       field('entity', $.identifier),
-      ci("is"),
+      'is',
       repeat($._configuration_item),
-      ci("end"),
-      optional(ci("configuration")),
+      'end',
+      optional('configuration'),
       optional($.identifier),
       ';'
     ),
@@ -725,11 +714,11 @@ module.exports = grammar({
     ),
 
     _block_configuration: $ => seq(
-      ci("for"),
+      'for',
       $.identifier,  // architecture or generate label
       repeat($._configuration_item_or_component),
-      ci("end"),
-      ci("for"),
+      'end',
+      'for',
       ';'
     ),
 
@@ -740,24 +729,24 @@ module.exports = grammar({
     ),
 
     _component_configuration: $ => seq(
-      ci("for"),
+      'for',
       choice(
         seq($.identifier, ':', $.identifier),  // instance : component
-        seq(ci("all"), ':', $.identifier),         // all : component
-        seq(ci("others"), ':', $.identifier),      // others : component
+        seq('all', ':', $.identifier),         // all : component
+        seq('others', ':', $.identifier),      // others : component
         $.identifier                           // Just generate label
       ),
       optional(seq(
-        ci("use"),
-        ci("entity"),
+        'use',
+        'entity',
         $.identifier,
         '.',
         $.identifier,
         optional(seq('(', $.identifier, ')')),  // Optional architecture
         ';'  // Semicolon after binding indication
       )),
-      ci("end"),
-      ci("for"),
+      'end',
+      'for',
       ';'
     ),
 
@@ -768,12 +757,12 @@ module.exports = grammar({
     //   library ...; use ...;
     // end [context] [name];
     context_declaration: $ => seq(
-      ci("context"),
+      'context',
       field('name', $.identifier),
-      ci("is"),
+      'is',
       repeat(choice($.library_clause, $.use_clause, $.comment)),
-      ci("end"),
-      optional(ci("context")),
+      'end',
+      optional('context'),
       optional($.identifier),
       ';'
     ),
@@ -795,8 +784,8 @@ module.exports = grammar({
 
     // VHDL-2008: Shared variable (requires protected type)
     shared_variable_declaration: $ => seq(
-      ci("shared"),
-      ci("variable"),
+      'shared',
+      'variable',
       field('name', $.identifier),
       ':',
       field('type', $._type_mark),
@@ -805,17 +794,17 @@ module.exports = grammar({
 
     // File declaration
     file_declaration: $ => seq(
-      ci("file"),
+      'file',
       field('name', $.identifier),
       ':',
       field('type', $.identifier),
-      optional(seq(ci("open"), $.identifier, ci("is"), $._expression)),  // Optional file open
+      optional(seq('open', $.identifier, 'is', $._expression)),  // Optional file open
       ';'
     ),
 
     // attribute identifier : type;
     attribute_declaration: $ => seq(
-      ci("attribute"),
+      'attribute',
       field('name', $.identifier),
       ':',
       field('type', $.identifier),
@@ -824,19 +813,19 @@ module.exports = grammar({
 
     // attribute identifier of entity_list : entity_class is expression;
     attribute_specification: $ => seq(
-      ci("attribute"),
+      'attribute',
       field('name', $.identifier),
-      ci("of"),
+      'of',
       field('target', $.identifier),
       ':',
       field('class', $.identifier),
-      ci("is"),
+      'is',
       field('value', choice($._string_literal, $.identifier)),
       ';'
     ),
 
     signal_declaration: $ => seq(
-      ci("signal"),
+      'signal',
       field('name', $.identifier),
       repeat(seq(',', $.identifier)),
       ':',
@@ -868,55 +857,55 @@ module.exports = grammar({
     ),
 
     _for_generate: $ => seq(
-      ci("for"), $.identifier, ci("in"), $._range_or_expression, ci("generate"),
+      'for', $.identifier, 'in', $._range_or_expression, 'generate',
       choice(
         // VHDL-2008: declarations + begin + statements
         seq(
           repeat($._block_declarative_item),
-          ci("begin"),
+          'begin',
           repeat($._concurrent_statement)
         ),
         // Pre-2008 or simple: just statements (no declarations)
         repeat($._concurrent_statement)
       ),
-      ci("end"), ci("generate"), optional($.identifier), ';'
+      'end', 'generate', optional($.identifier), ';'
     ),
 
     _if_generate: $ => seq(
-      ci("if"), $._expression, ci("generate"),
+      'if', $._expression, 'generate',
       choice(
         // VHDL-2008: declarations + begin + statements
         seq(
           repeat($._block_declarative_item),
-          ci("begin"),
+          'begin',
           repeat($._concurrent_statement)
         ),
         // Pre-2008 or simple: just statements
         repeat($._concurrent_statement)
       ),
       optional($._generate_else),  // VHDL-2008
-      ci("end"), ci("generate"), optional($.identifier), ';'
+      'end', 'generate', optional($.identifier), ';'
     ),
 
     _generate_else: $ => seq(
-      ci("else"), ci("generate"),
+      'else', 'generate',
       repeat($._concurrent_statement)
     ),
 
     _case_generate: $ => seq(
-      ci("case"), $._expression, ci("generate"),
+      'case', $._expression, 'generate',
       repeat($._case_generate_alternative),
-      ci("end"), ci("generate"), optional($.identifier), ';'
+      'end', 'generate', optional($.identifier), ';'
     ),
 
     _case_generate_alternative: $ => seq(
-      ci("when"), $._expression, '=>',
+      'when', $._expression, '=>',
       repeat($._concurrent_statement)  // Label handled by process_statement
     ),
 
     // Range expression: 0 to 10, vec'range, etc.
     _range_or_expression: $ => choice(
-      seq($._expression, choice(ci("to"), ci("downto")), $._expression),  // Explicit range
+      seq($._expression, choice('to', 'downto'), $._expression),  // Explicit range
       $._expression  // Attribute like vec'range
     ),
 
@@ -924,14 +913,14 @@ module.exports = grammar({
     block_statement: $ => seq(
       field('label', $.identifier),
       ':',
-      ci("block"),
+      'block',
       optional(seq('(', $._expression, ')')),  // Guard condition
-      optional(ci("is")),
+      optional('is'),
       repeat($._block_declarative_item),
-      ci("begin"),
+      'begin',
       repeat($._concurrent_statement),
-      ci("end"),
-      ci("block"),
+      'end',
+      'block',
       optional($.identifier),
       ';'
     ),
@@ -947,7 +936,7 @@ module.exports = grammar({
     _simple_signal_assignment: $ => seq(
       $._name,  // Can be indexed: data(i) <= '0'
       '<=',
-      optional(ci("guarded")),  // For guarded signal assignments in blocks
+      optional('guarded'),  // For guarded signal assignments in blocks
       $._expression,
       ';'
     ),
@@ -957,23 +946,23 @@ module.exports = grammar({
       $.identifier,
       '<=',
       $._expression,
-      ci("when"),
+      'when',
       $._expression,
-      repeat(seq(ci("else"), $._expression, optional(seq(ci("when"), $._expression)))),
+      repeat(seq('else', $._expression, optional(seq('when', $._expression)))),
       ';'
     ),
 
     // with selector select target <= value when choice, value when others;
     _selected_signal_assignment: $ => seq(
-      ci("with"),
+      'with',
       $._expression,
-      ci("select"),
+      'select',
       $.identifier,
       '<=',
       $._expression,
-      ci("when"),
+      'when',
       $._expression,
-      repeat(seq(',', $._expression, ci("when"), $._expression)),
+      repeat(seq(',', $._expression, 'when', $._expression)),
       ';'
     ),
 
@@ -981,33 +970,33 @@ module.exports = grammar({
     _force_release_assignment: $ => seq(
       $.identifier,
       '<=',
-      choice(ci("force"), ci("release")),
+      choice('force', 'release'),
       optional($._expression),
-      optional(seq(ci("when"), $._expression)),
+      optional(seq('when', $._expression)),
       ';'
     ),
 
     process_statement: $ => seq(
       optional(seq($.identifier, ':')),  // Optional label
-      ci("process"),
+      'process',
       optional(seq('(', $._sensitivity_list, ')')),  // Sensitivity list
-      optional(ci("is")),
+      optional('is'),
       repeat($._process_declarative_item),
-      ci("begin"),
+      'begin',
       repeat($._sequential_statement),
-      ci("end"),
-      ci("process"),
+      'end',
+      'process',
       optional($.identifier),
       ';'
     ),
 
-    // Sensitivity list: ci("all") (VHDL-2008) or list of signal names
+    // Sensitivity list: 'all' (VHDL-2008) or list of signal names
     _sensitivity_list: $ => choice(
-      ci("all"),  // VHDL-2008: sensitive to all signals read in process
+      'all',  // VHDL-2008: sensitive to all signals read in process
       seq($.identifier, repeat(seq(',', $.identifier)))
     ),
 
-    // Process declarative items - what can appear before ci("begin") in a process
+    // Process declarative items - what can appear before 'begin' in a process
     _process_declarative_item: $ => choice(
       $.comment,
       $.variable_declaration,
@@ -1022,7 +1011,7 @@ module.exports = grammar({
       choice(
         // Direct entity instantiation: entity lib.entity(arch)
         seq(
-          ci("entity"),
+          'entity',
           $.identifier,  // library
           '.',
           $.identifier,  // entity
@@ -1031,8 +1020,8 @@ module.exports = grammar({
         // Component instantiation: component_name
         field('component', $.identifier)
       ),
-      optional(seq(ci("generic"), ci("map"), '(', $._association_list, ')')),
-      optional(seq(ci("port"), ci("map"), '(', $._association_list, ')')),
+      optional(seq('generic', 'map', '(', $._association_list, ')')),
+      optional(seq('port', 'map', '(', $._association_list, ')')),
       ';'
     ),
 
@@ -1063,7 +1052,7 @@ module.exports = grammar({
     ),
 
     variable_declaration: $ => seq(
-      ci("variable"),
+      'variable',
       field('name', $.identifier),
       repeat(seq(',', $.identifier)),  // Multiple names: seed1, seed2
       ':',
@@ -1092,9 +1081,9 @@ module.exports = grammar({
 
     // Report statement (standalone, without assertion)
     report_statement: $ => seq(
-      ci("report"),
+      'report',
       $._report_expression,  // Message string, can include concatenation
-      optional(seq(ci("severity"), $.identifier)),
+      optional(seq('severity', $.identifier)),
       ';'
     ),
 
@@ -1108,43 +1097,43 @@ module.exports = grammar({
     )),
 
     exit_statement: $ => seq(
-      ci("exit"),
+      'exit',
       optional($.identifier),  // Optional loop label
-      optional(seq(ci("when"), $._expression)),
+      optional(seq('when', $._expression)),
       ';'
     ),
 
     next_statement: $ => seq(
-      ci("next"),
+      'next',
       optional($.identifier),  // Optional loop label
-      optional(seq(ci("when"), $._expression)),
+      optional(seq('when', $._expression)),
       ';'
     ),
 
     // Case statement
     case_statement: $ => seq(
-      ci("case"), $._expression, ci("is"),
+      'case', $._expression, 'is',
       repeat1($._case_alternative),
-      ci("end"), ci("case"), ';'
+      'end', 'case', ';'
     ),
 
     _case_alternative: $ => seq(
-      ci("when"), $._expression, '=>',
+      'when', $._expression, '=>',
       repeat($._sequential_statement)
     ),
 
     wait_statement: $ => seq(
-      ci("wait"),
+      'wait',
       optional(choice(
-        seq(ci("until"), $._expression),
-        seq(ci("for"), $._expression),
-        seq(ci("on"), $.identifier, repeat(seq(',', $.identifier)))
+        seq('until', $._expression),
+        seq('for', $._expression),
+        seq('on', $.identifier, repeat(seq(',', $.identifier)))
       )),
       ';'
     ),
 
     return_statement: $ => seq(
-      ci("return"),
+      'return',
       optional($._expression),
       ';'
     ),
@@ -1182,35 +1171,35 @@ module.exports = grammar({
 
     // Simplified if statement
     if_statement: $ => seq(
-      ci("if"),
+      'if',
       $._expression,  // condition
-      ci("then"),
+      'then',
       repeat($._sequential_statement),
       repeat(seq(  // elsif clauses
-        ci("elsif"),
+        'elsif',
         $._expression,
-        ci("then"),
+        'then',
         repeat($._sequential_statement)
       )),
       optional(seq(
-        ci("else"),
+        'else',
         repeat($._sequential_statement)
       )),
-      ci("end"),
-      ci("if"),
+      'end',
+      'if',
       ';'
     ),
 
     // Simplified loop (while, for, or infinite)
     loop_statement: $ => seq(
       optional(choice(
-        seq(ci("while"), $._expression),  // while loop
-        seq(ci("for"), $.identifier, ci("in"), $._range_or_expression)  // for loop
+        seq('while', $._expression),  // while loop
+        seq('for', $.identifier, 'in', $._range_or_expression)  // for loop
       )),
-      ci("loop"),
+      'loop',
       repeat($._sequential_statement),
-      ci("end"),
-      ci("loop"),
+      'end',
+      'loop',
       ';'
     ),
 
@@ -1226,8 +1215,8 @@ module.exports = grammar({
       $.external_name,  // VHDL-2008: << signal .path : type >>
       $.number,
       /[+\-*/<>=&|?]+/,  // Symbolic operators (including ?= ?/= ?< etc.)
-      choice(ci("and"), ci("or"), ci("xor"), ci("nand"), ci("nor"), ci("xnor"), ci("not"),  // Logical operators
-             ci("mod"), ci("rem"), ci("abs"), ci("sll"), ci("srl"), ci("sla"), ci("sra"), ci("rol"), ci("ror")),  // Other operators
+      choice('and', 'or', 'xor', 'nand', 'nor', 'xnor', 'not',  // Logical operators
+             'mod', 'rem', 'abs', 'sll', 'srl', 'sla', 'sra', 'rol', 'ror'),  // Other operators
       $._parenthesized_expression  // Grouped or aggregate
     ),
 
@@ -1245,7 +1234,7 @@ module.exports = grammar({
     // << signal .testbench.dut.sig : std_logic >>
     external_name: $ => seq(
       '<<',
-      choice(ci("signal"), ci("variable"), ci("constant")),
+      choice('signal', 'variable', 'constant'),
       $._external_pathname,
       ':',
       $._type_mark,
@@ -1272,7 +1261,7 @@ module.exports = grammar({
 
     // Element in an aggregate or parenthesized expression
     _aggregate_element: $ => choice(
-      seq(ci("others"), '=>', repeat1($._expression_term)),  // others => value
+      seq('others', '=>', repeat1($._expression_term)),  // others => value
       seq($.identifier, '=>', repeat1($._expression_term)),  // named: x => 1
       seq($.number, '=>', repeat1($._expression_term)),  // positional with index
       repeat1($._expression_term)  // Just a value
