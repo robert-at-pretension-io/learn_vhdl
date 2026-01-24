@@ -154,7 +154,8 @@ module.exports = grammar({
     [$.indexed_name, $._expression_term],  // selected_name followed by ( in expression
     [$._index_expression, $._literal],  // character literal in index vs literal
     [$._index_expression, $._name_or_attribute],  // identifier in index expression
-    [$._index_expression, $._expression_term]  // number/identifier in nested index
+    [$._index_expression, $._expression_term],  // number/identifier in nested index
+    [$._index_expression, $._procedure_arg_value]  // identifier in procedure argument
   ],
 
   // ===========================================================================
@@ -1148,7 +1149,7 @@ module.exports = grammar({
     // Sensitivity list: $._kw_all (VHDL-2008) or list of signal names
     _sensitivity_list: $ => choice(
       $._kw_all,  // VHDL-2008: sensitive to all signals read in process
-      seq($.identifier, repeat(seq(',', $.identifier)))
+      seq($._signal_name, repeat(seq(',', $._signal_name)))  // Signal names including selected/indexed
     ),
 
     // Process declarative items - what can appear before $._kw_begin in a process
@@ -1206,10 +1207,17 @@ module.exports = grammar({
       $.procedure_declaration
     ),
 
-    // Variable declarations inside subprograms
+    // Declarative items inside subprograms (functions/procedures)
     _subprogram_declarative_item: $ => choice(
       $.comment,
-      $.variable_declaration
+      $.variable_declaration,
+      $.constant_declaration,
+      $.type_declaration,
+      $.subtype_declaration,
+      $.attribute_declaration,
+      $.attribute_specification,
+      $.alias_declaration,
+      $.use_clause
     ),
 
     variable_declaration: $ => seq(
@@ -1535,15 +1543,23 @@ module.exports = grammar({
       ')'
     ),
 
-    // Procedure argument - allows function calls and complex expressions
+    // Procedure argument - allows function calls, named associations, aggregates
     _procedure_argument: $ => choice(
+      seq($.selected_name, '=>', $._procedure_arg_value),  // Named: P.a => V.b
+      seq($.identifier, '=>', $._procedure_arg_value),     // Named: x => value
+      $._procedure_arg_value  // Positional
+    ),
+
+    // Value in a procedure argument (without the named association part)
+    _procedure_arg_value: $ => choice(
       $.qualified_expression,  // string'("hello")
       $._function_call_in_expr,  // ROUND(var2), func(a, b)
       $.indexed_name,  // arr(i), slice(0 to 3)
       $.selected_name, // record.field
       $.identifier,
       $.number,
-      $._literal
+      $._literal,
+      $._parenthesized_expression  // Aggregates: (1, 2), (x => 1)
     ),
 
     // Catch-all for other statements (very low priority)
