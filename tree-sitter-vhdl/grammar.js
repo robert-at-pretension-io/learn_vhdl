@@ -978,15 +978,27 @@ module.exports = grammar({
       ';'
     ),
 
+    // Signal declaration: signal name : [resolution_func] type [signal_kind] [:= value];
+    // Resolution function comes before type name if present
     signal_declaration: $ => seq(
       $._kw_signal,
       field('name', $.identifier),
       repeat(seq(',', $.identifier)),
       ':',
-      field('type', $._type_mark),
+      $._signal_type_indication,
       optional(seq(':=', $._constant_value)),
       ';'
     ),
+
+    // Signal type indication - handles resolution function and signal kind
+    _signal_type_indication: $ => seq(
+      repeat($.identifier),  // 0+ resolution functions/type parts before final type
+      $._type_mark,
+      optional(choice($._kw_bus, $._kw_register))  // Optional signal kind
+    ),
+
+    _kw_bus: _ => /[bB][uU][sS]/,
+    _kw_register: _ => /[rR][eE][gG][iI][sS][tT][eE][rR]/,
 
     // Concurrent statements (architecture body)
     _concurrent_statement: $ => choice(
@@ -1545,6 +1557,7 @@ module.exports = grammar({
 
     // Procedure argument - allows function calls, named associations, aggregates
     _procedure_argument: $ => choice(
+      seq($.indexed_name, '=>', $._procedure_arg_value),   // Named: P(1) => V
       seq($.selected_name, '=>', $._procedure_arg_value),  // Named: P.a => V.b
       seq($.identifier, '=>', $._procedure_arg_value),     // Named: x => value
       $._procedure_arg_value  // Positional
