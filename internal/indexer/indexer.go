@@ -127,7 +127,33 @@ func (idx *Indexer) Run(rootPath string) error {
 		fmt.Printf("\n=== Verbose: Extracted Processes ===\n")
 		for _, facts := range idx.Facts {
 			for _, p := range facts.Processes {
-				fmt.Printf("  %s.%s: sensitivity=%v\n", p.InArch, p.Label, p.SensitivityList)
+				kind := "combinational"
+				if p.IsSequential {
+					kind = "sequential"
+				}
+				fmt.Printf("  %s.%s: %s, sensitivity=%v\n", p.InArch, p.Label, kind, p.SensitivityList)
+				if p.ClockSignal != "" {
+					fmt.Printf("    clock: %s (%s_edge)\n", p.ClockSignal, p.ClockEdge)
+				}
+				if p.HasReset {
+					asyncStr := "sync"
+					if p.ResetAsync {
+						asyncStr = "async"
+					}
+					fmt.Printf("    reset: %s (%s)\n", p.ResetSignal, asyncStr)
+				}
+				if len(p.AssignedSignals) > 0 {
+					fmt.Printf("    writes: %v\n", p.AssignedSignals)
+				}
+				if len(p.ReadSignals) > 0 {
+					fmt.Printf("    reads: %v\n", p.ReadSignals)
+				}
+			}
+		}
+		fmt.Printf("\n=== Verbose: Clock Domains ===\n")
+		for _, facts := range idx.Facts {
+			for _, cd := range facts.ClockDomains {
+				fmt.Printf("  %s (%s): drives %v\n", cd.Clock, cd.Edge, cd.Registers)
 			}
 		}
 	}

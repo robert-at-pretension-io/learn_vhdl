@@ -26,6 +26,38 @@ type FileFacts struct {
 	Signals       []Signal
 	Ports         []Port
 	Processes     []Process
+	// Semantic analysis
+	ClockDomains  []ClockDomain
+	SignalUsages  []SignalUsage
+	ResetInfos    []ResetInfo
+}
+
+// ClockDomain represents a clock and the signals it drives
+type ClockDomain struct {
+	Clock     string   // Clock signal name
+	Edge      string   // "rising" or "falling"
+	Registers []string // Signals assigned under this clock
+	Process   string   // Which process
+	Line      int
+}
+
+// SignalUsage tracks where a signal is read or written
+type SignalUsage struct {
+	Signal    string
+	IsRead    bool   // Appears on RHS of assignment
+	IsWritten bool   // Appears on LHS of assignment
+	InProcess string // Which process (empty if concurrent)
+	Line      int
+}
+
+// ResetInfo represents reset signal detection
+type ResetInfo struct {
+	Signal    string // Reset signal name
+	Polarity  string // "active_high" or "active_low"
+	IsAsync   bool   // true if async (checked before clock edge)
+	Registers []string
+	Process   string
+	Line      int
 }
 
 // Process represents a VHDL process statement
@@ -34,6 +66,16 @@ type Process struct {
 	SensitivityList []string // Signals in sensitivity list (or "all" for VHDL-2008)
 	Line            int
 	InArch          string // Which architecture this process belongs to
+	// Semantic info
+	IsSequential    bool     // Has clock edge (rising_edge/falling_edge)
+	IsCombinational bool     // No clock edge
+	ClockSignal     string   // Clock signal if sequential
+	ClockEdge       string   // "rising" or "falling"
+	HasReset        bool     // Has reset logic
+	ResetSignal     string   // Reset signal name
+	ResetAsync      bool     // Is reset asynchronous
+	AssignedSignals []string // Signals assigned in this process
+	ReadSignals     []string // Signals read in this process
 }
 
 // Entity represents a VHDL entity declaration
@@ -192,6 +234,46 @@ func (e *Extractor) walkTree(node *sitter.Node, source []byte, facts *FileFacts,
 	case "process_statement":
 		proc := e.extractProcess(node, source, context)
 		facts.Processes = append(facts.Processes, proc)
+
+		// Add to semantic collections
+		if proc.ClockSignal != "" {
+			facts.ClockDomains = append(facts.ClockDomains, ClockDomain{
+				Clock:     proc.ClockSignal,
+				Edge:      proc.ClockEdge,
+				Registers: proc.AssignedSignals,
+				Process:   proc.Label,
+				Line:      proc.Line,
+			})
+		}
+
+		if proc.HasReset {
+			facts.ResetInfos = append(facts.ResetInfos, ResetInfo{
+				Signal:    proc.ResetSignal,
+				Polarity:  "active_high", // TODO: detect from comparison value
+				IsAsync:   proc.ResetAsync,
+				Registers: proc.AssignedSignals,
+				Process:   proc.Label,
+				Line:      proc.Line,
+			})
+		}
+
+		// Add signal usages
+		for _, sig := range proc.AssignedSignals {
+			facts.SignalUsages = append(facts.SignalUsages, SignalUsage{
+				Signal:    sig,
+				IsWritten: true,
+				InProcess: proc.Label,
+				Line:      proc.Line,
+			})
+		}
+		for _, sig := range proc.ReadSignals {
+			facts.SignalUsages = append(facts.SignalUsages, SignalUsage{
+				Signal:  sig,
+				IsRead:  true,
+				InProcess: proc.Label,
+				Line:    proc.Line,
+			})
+		}
 	}
 
 	// Recurse into children
@@ -456,7 +538,181 @@ func (e *Extractor) extractProcess(node *sitter.Node, source []byte, context str
 		}
 	}
 
+	// Semantic analysis: walk the process body for clock edges, resets, and signal usage
+	e.analyzeProcessSemantics(node, source, &proc)
+
+	// Determine if combinational or sequential
+	if proc.ClockSignal != "" {
+		proc.IsSequential = true
+	} else {
+		proc.IsCombinational = true
+	}
+
 	return proc
+}
+
+// analyzeProcessSemantics walks the process body to extract semantic information
+func (e *Extractor) analyzeProcessSemantics(node *sitter.Node, source []byte, proc *Process) {
+	assignedSet := make(map[string]bool)
+	readSet := make(map[string]bool)
+
+	var walk func(n *sitter.Node, inCondition bool)
+	walk = func(n *sitter.Node, inCondition bool) {
+		if n == nil {
+			return
+		}
+
+		nodeType := n.Type()
+
+		switch nodeType {
+		case "indexed_name":
+			// Check for rising_edge(clk) or falling_edge(clk)
+			if n.ChildCount() >= 2 {
+				funcName := ""
+				argName := ""
+				for i := 0; i < int(n.ChildCount()); i++ {
+					child := n.Child(i)
+					if child.Type() == "identifier" {
+						if funcName == "" {
+							funcName = strings.ToLower(child.Content(source))
+						} else if argName == "" {
+							argName = child.Content(source)
+						}
+					}
+				}
+				if funcName == "rising_edge" && argName != "" {
+					proc.ClockSignal = argName
+					proc.ClockEdge = "rising"
+				} else if funcName == "falling_edge" && argName != "" {
+					proc.ClockSignal = argName
+					proc.ClockEdge = "falling"
+				}
+			}
+
+		case "sequential_signal_assignment":
+			// Extract LHS (assigned signal) and RHS (read signals)
+			for i := 0; i < int(n.ChildCount()); i++ {
+				child := n.Child(i)
+				if child.Type() == "identifier" {
+					// First identifier is typically the target
+					sig := child.Content(source)
+					assignedSet[sig] = true
+					break
+				}
+			}
+			// Walk RHS for reads
+			e.extractReadsFromNode(n, source, readSet, true)
+
+		case "if_statement":
+			// Check for reset pattern in if condition
+			// Pattern: if reset = '1' then (before clock edge = async)
+			// Pattern: elsif reset = '1' then (after clock edge = sync)
+			e.checkResetPattern(n, source, proc)
+			// Continue walking children
+			for i := 0; i < int(n.ChildCount()); i++ {
+				walk(n.Child(i), false)
+			}
+			return
+
+		case "identifier":
+			// In expression context, this is a read
+			if inCondition {
+				readSet[n.Content(source)] = true
+			}
+		}
+
+		// Recurse into children
+		for i := 0; i < int(n.ChildCount()); i++ {
+			walk(n.Child(i), inCondition)
+		}
+	}
+
+	walk(node, false)
+
+	// Convert sets to slices
+	for sig := range assignedSet {
+		proc.AssignedSignals = append(proc.AssignedSignals, sig)
+	}
+	for sig := range readSet {
+		proc.ReadSignals = append(proc.ReadSignals, sig)
+	}
+}
+
+// extractReadsFromNode finds all identifiers read in an expression
+func (e *Extractor) extractReadsFromNode(node *sitter.Node, source []byte, readSet map[string]bool, skipFirst bool) {
+	first := true
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n == nil {
+			return
+		}
+		if n.Type() == "identifier" {
+			if skipFirst && first {
+				first = false
+			} else {
+				readSet[n.Content(source)] = true
+			}
+		}
+		for i := 0; i < int(n.ChildCount()); i++ {
+			walk(n.Child(i))
+		}
+	}
+	walk(node)
+}
+
+// checkResetPattern looks for reset patterns in if statements
+// Pattern: if reset = '1' then (async if first condition before clock edge)
+func (e *Extractor) checkResetPattern(node *sitter.Node, source []byte, proc *Process) {
+	// node is an if_statement - look at immediate children
+	// The tree structure is: identifier, relational_op, literal, [statements...], indexed_name (elsif cond), [statements...]
+	// We want to detect the FIRST condition (before any clock edge check)
+
+	var firstIdentifier string
+	var sawRelOp bool
+	var firstValue string
+	var sawClockEdgeFirst bool
+	foundFirstCondition := false
+
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		childType := child.Type()
+
+		// Stop collecting the first condition when we hit a statement or another condition marker
+		if childType == "sequential_signal_assignment" || childType == "if_statement" {
+			foundFirstCondition = true
+		}
+
+		if !foundFirstCondition {
+			switch childType {
+			case "identifier":
+				if firstIdentifier == "" {
+					firstIdentifier = child.Content(source)
+				}
+			case "relational_operator":
+				sawRelOp = true
+			case "character_literal":
+				if firstValue == "" {
+					firstValue = child.Content(source)
+				}
+			case "indexed_name":
+				// If the FIRST condition is a clock edge, not a reset
+				content := strings.ToLower(child.Content(source))
+				if strings.Contains(content, "rising_edge") || strings.Contains(content, "falling_edge") {
+					sawClockEdgeFirst = true
+				}
+			}
+		}
+	}
+
+	// If the first condition is a simple comparison (not a clock edge), it's likely reset
+	if firstIdentifier != "" && sawRelOp && firstValue != "" && !sawClockEdgeFirst {
+		if !proc.HasReset {
+			proc.HasReset = true
+			proc.ResetSignal = firstIdentifier
+			// Async reset pattern: reset check is FIRST (before clock edge in elsif)
+			proc.ResetAsync = true
+		}
+	}
 }
 
 func (e *Extractor) extractSensitivityList(node *sitter.Node, source []byte) []string {
