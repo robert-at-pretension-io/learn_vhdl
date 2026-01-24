@@ -6,12 +6,12 @@ import (
 	"os"
 
 	sitter "github.com/smacker/go-tree-sitter"
+	tree_sitter_vhdl "github.com/tree-sitter/tree-sitter-vhdl"
 )
 
 // Extractor uses Tree-sitter to parse VHDL files and extract facts
 type Extractor struct {
-	parser *sitter.Parser
-	lang   *sitter.Language
+	lang *sitter.Language
 }
 
 // FileFacts contains all extracted information from a single VHDL file
@@ -78,23 +78,18 @@ type Port struct {
 	Line      int
 }
 
-// New creates a new Extractor
-// Note: Tree-sitter VHDL language needs to be loaded
+// New creates a new Extractor with VHDL language loaded
 func New() *Extractor {
-	parser := sitter.NewParser()
-	// Language will be set when we have the VHDL grammar loaded
+	// Load the VHDL language (thread-safe, can be shared)
+	lang := sitter.NewLanguage(tree_sitter_vhdl.Language())
+
 	return &Extractor{
-		parser: parser,
+		lang: lang,
 	}
 }
 
-// SetLanguage sets the Tree-sitter language (VHDL)
-func (e *Extractor) SetLanguage(lang *sitter.Language) {
-	e.lang = lang
-	e.parser.SetLanguage(lang)
-}
-
 // Extract parses a VHDL file and extracts facts
+// Creates a new parser per call for thread safety
 func (e *Extractor) Extract(filePath string) (FileFacts, error) {
 	facts := FileFacts{File: filePath}
 
@@ -109,8 +104,12 @@ func (e *Extractor) Extract(filePath string) (FileFacts, error) {
 		return e.extractSimple(filePath, content)
 	}
 
+	// Create a new parser for this extraction (thread-safe)
+	parser := sitter.NewParser()
+	parser.SetLanguage(e.lang)
+
 	// Parse with Tree-sitter
-	tree, err := e.parser.ParseCtx(context.Background(), nil, content)
+	tree, err := parser.ParseCtx(context.Background(), nil, content)
 	if err != nil {
 		return facts, fmt.Errorf("parsing: %w", err)
 	}

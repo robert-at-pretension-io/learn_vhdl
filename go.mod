@@ -4,7 +4,12 @@ go 1.24.0
 
 toolchain go1.24.12
 
-require github.com/smacker/go-tree-sitter v0.0.0-20240827094217-dd81d9e9be82
+require (
+	github.com/smacker/go-tree-sitter v0.0.0-20240827094217-dd81d9e9be82
+	github.com/tree-sitter/tree-sitter-vhdl v0.0.0
+)
+
+replace github.com/tree-sitter/tree-sitter-vhdl => ./tree-sitter-vhdl/bindings/go
 
 require (
 	cuelabs.dev/go/oci/ociregistry v0.0.0-20250722084951-074d06050084 // indirect
