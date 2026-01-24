@@ -17,14 +17,23 @@ type Extractor struct {
 
 // FileFacts contains all extracted information from a single VHDL file
 type FileFacts struct {
-	File         string
-	Entities     []Entity
+	File          string
+	Entities      []Entity
 	Architectures []Architecture
-	Packages     []Package
-	Components   []Component
-	Dependencies []Dependency
-	Signals      []Signal
-	Ports        []Port
+	Packages      []Package
+	Components    []Component
+	Dependencies  []Dependency
+	Signals       []Signal
+	Ports         []Port
+	Processes     []Process
+}
+
+// Process represents a VHDL process statement
+type Process struct {
+	Label           string   // Optional label
+	SensitivityList []string // Signals in sensitivity list (or "all" for VHDL-2008)
+	Line            int
+	InArch          string // Which architecture this process belongs to
 }
 
 // Entity represents a VHDL entity declaration
@@ -179,6 +188,10 @@ func (e *Extractor) walkTree(node *sitter.Node, source []byte, facts *FileFacts,
 	case "component_declaration":
 		comp := e.extractComponentDecl(node, source)
 		facts.Components = append(facts.Components, comp)
+
+	case "process_statement":
+		proc := e.extractProcess(node, source, context)
+		facts.Processes = append(facts.Processes, proc)
 	}
 
 	// Recurse into children
@@ -340,9 +353,11 @@ func (e *Extractor) extractPortsFromEntity(node *sitter.Node, source []byte, ent
 			return
 		}
 		if n.Type() == "parameter" {
-			port := e.extractPort(n, source)
-			port.InEntity = entityName
-			facts.Ports = append(facts.Ports, port)
+			ports := e.extractPorts(n, source)
+			for i := range ports {
+				ports[i].InEntity = entityName
+			}
+			facts.Ports = append(facts.Ports, ports...)
 		}
 		for i := 0; i < int(n.ChildCount()); i++ {
 			walkForPorts(n.Child(i))
@@ -351,40 +366,122 @@ func (e *Extractor) extractPortsFromEntity(node *sitter.Node, source []byte, ent
 	walkForPorts(node)
 }
 
-func (e *Extractor) extractPort(node *sitter.Node, source []byte) Port {
-	port := Port{
-		Line: int(node.StartPoint().Row) + 1,
+// extractPorts extracts one or more ports from a parameter node
+// A single parameter can declare multiple ports: a, b : in std_logic
+func (e *Extractor) extractPorts(node *sitter.Node, source []byte) []Port {
+	line := int(node.StartPoint().Row) + 1
+	direction := ""
+
+	// Extract direction from field (now visible in grammar as port_direction)
+	if dirNode := node.ChildByFieldName("direction"); dirNode != nil {
+		direction = strings.ToLower(dirNode.Content(source))
 	}
 
-	// Extract name, direction, type from parameter node
+	// Collect all identifiers and find where direction appears
+	// Structure: [name1, name2, ...] direction type
+	var identifiers []string
+	directionIndex := -1
+
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
-		content := child.Content(source)
+		childType := child.Type()
+
+		if childType == "port_direction" {
+			directionIndex = len(identifiers)
+		} else if childType == "identifier" {
+			identifiers = append(identifiers, child.Content(source))
+		}
+	}
+
+	// Determine which identifiers are names vs type
+	// Names come before direction, type comes after
+	var names []string
+	var portType string
+
+	if directionIndex >= 0 && len(identifiers) > directionIndex {
+		// Direction was found - names are before direction, type is after
+		names = identifiers[:directionIndex]
+		if directionIndex < len(identifiers) {
+			portType = identifiers[directionIndex] // First identifier after direction is the type
+		}
+	} else if len(identifiers) >= 2 {
+		// No direction - all but last are names, last is type
+		names = identifiers[:len(identifiers)-1]
+		portType = identifiers[len(identifiers)-1]
+	} else if len(identifiers) == 1 {
+		// Just one identifier, treat as name
+		names = identifiers
+	}
+
+	// Create a port for each name
+	var ports []Port
+	for _, name := range names {
+		ports = append(ports, Port{
+			Name:      name,
+			Direction: direction,
+			Type:      portType,
+			Line:      line,
+		})
+	}
+
+	return ports
+}
+
+func (e *Extractor) extractProcess(node *sitter.Node, source []byte, context string) Process {
+	proc := Process{
+		Line:   int(node.StartPoint().Row) + 1,
+		InArch: context,
+	}
+
+	// Walk through children to find label and sensitivity list
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
 		childType := child.Type()
 
 		switch childType {
 		case "identifier":
-			if port.Name == "" {
-				port.Name = content
-			} else if port.Type == "" {
-				port.Type = content
+			// First identifier before ':' is the label
+			if proc.Label == "" {
+				// Check if this is followed by ':'
+				if i+1 < int(node.ChildCount()) {
+					next := node.Child(i + 1)
+					if next.Content(source) == ":" {
+						proc.Label = child.Content(source)
+					}
+				}
 			}
-		}
-
-		// Check for direction keywords
-		switch strings.ToLower(content) {
-		case "in":
-			port.Direction = "in"
-		case "out":
-			port.Direction = "out"
-		case "inout":
-			port.Direction = "inOut"
-		case "buffer":
-			port.Direction = "buffer"
+		case "sensitivity_list":
+			// Extract signals from sensitivity list
+			proc.SensitivityList = e.extractSensitivityList(child, source)
 		}
 	}
 
-	return port
+	return proc
+}
+
+func (e *Extractor) extractSensitivityList(node *sitter.Node, source []byte) []string {
+	var signals []string
+
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		childType := child.Type()
+
+		switch childType {
+		case "identifier":
+			signals = append(signals, child.Content(source))
+		case "selected_name", "indexed_name":
+			// For complex signal names like rec.field or arr(i)
+			signals = append(signals, child.Content(source))
+		}
+	}
+
+	// Check for VHDL-2008 "all" - represented as the raw content
+	content := strings.TrimSpace(node.Content(source))
+	if strings.ToLower(content) == "all" {
+		return []string{"all"}
+	}
+
+	return signals
 }
 
 // extractSimple is a fallback regex-based extractor when Tree-sitter isn't available

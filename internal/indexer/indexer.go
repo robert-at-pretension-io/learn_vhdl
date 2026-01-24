@@ -23,6 +23,9 @@ type Indexer struct {
 
 	// Extracted facts from all files
 	Facts []extractor.FileFacts
+
+	// Verbose output
+	Verbose bool
 }
 
 // SymbolTable holds all exported symbols across files
@@ -111,6 +114,22 @@ func (idx *Indexer) Run(rootPath string) error {
 	// Collect facts
 	for facts := range factsChan {
 		idx.Facts = append(idx.Facts, facts)
+	}
+
+	// Verbose output for debugging
+	if idx.Verbose {
+		fmt.Printf("\n=== Verbose: Extracted Ports ===\n")
+		for _, facts := range idx.Facts {
+			for _, p := range facts.Ports {
+				fmt.Printf("  %s.%s: direction=%q type=%q\n", p.InEntity, p.Name, p.Direction, p.Type)
+			}
+		}
+		fmt.Printf("\n=== Verbose: Extracted Processes ===\n")
+		for _, facts := range idx.Facts {
+			for _, p := range facts.Processes {
+				fmt.Printf("  %s.%s: sensitivity=%v\n", p.InArch, p.Label, p.SensitivityList)
+			}
+		}
 	}
 
 	// 3. Pass 2: Resolution (check imports)

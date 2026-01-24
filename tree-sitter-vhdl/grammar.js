@@ -721,17 +721,35 @@ module.exports = grammar({
 
     // parameter: [signal|variable|constant] name[, name...] : [in|out|inout] type [:= default]
     parameter: $ => seq(
-      optional(choice($._kw_signal, $._kw_variable, $._kw_constant, $._kw_file)),
+      optional(field('class', $.parameter_class)),
       $.identifier,
       repeat(seq(',', $.identifier)),
       ':',
-      optional(choice($._kw_in, $._kw_out, $._kw_inout, $._kw_buffer, $._kw_linkage)),
+      optional(field('direction', $.port_direction)),
       $._parameter_type,
-      optional(seq(':=', $._default_value))  // default value
+      optional(seq(':=', field('default', $.default_value)))  // default value
+    ),
+
+    // Port/parameter direction - visible for extraction
+    port_direction: _ => choice(
+      /[iI][nN]/,
+      /[oO][uU][tT]/,
+      /[iI][nN][oO][uU][tT]/,
+      /[bB][uU][fF][fF][eE][rR]/,
+      /[lL][iI][nN][kK][aA][gG][eE]/
+    ),
+
+    // Parameter class - visible for extraction
+    parameter_class: _ => choice(
+      /[sS][iI][gG][nN][aA][lL]/,
+      /[vV][aA][rR][iI][aA][bB][lL][eE]/,
+      /[cC][oO][nN][sS][tT][aA][nN][tT]/,
+      /[fF][iI][lL][eE]/
     ),
 
     // Default values can be identifiers, numbers, literals, or expressions
-    _default_value: $ => choice(
+    // Visible for extraction
+    default_value: $ => choice(
       seq(optional(choice('+', '-')), $.number, optional($.identifier)),  // Numbers: 1, -1, 1.0, 1 fs, -1.0 ns
       seq($.identifier, $._string_literal),  // Based string like B"10010110"
       $._string_literal,  // String literal: "1011"
@@ -1358,7 +1376,7 @@ module.exports = grammar({
     process_statement: $ => seq(
       optional(seq($.identifier, ':')),  // Optional label
       $._kw_process,
-      optional(seq('(', $._sensitivity_list, ')')),  // Sensitivity list
+      optional(seq('(', $.sensitivity_list, ')')),  // Sensitivity list
       optional($._kw_is),
       repeat($._process_declarative_item),
       $._kw_begin,
@@ -1369,8 +1387,9 @@ module.exports = grammar({
       ';'
     ),
 
-    // Sensitivity list: $._kw_all (VHDL-2008) or list of signal names
-    _sensitivity_list: $ => choice(
+    // Sensitivity list: all (VHDL-2008) or list of signal names
+    // Visible for extraction
+    sensitivity_list: $ => choice(
       $._kw_all,  // VHDL-2008: sensitive to all signals read in process
       seq($._signal_name, repeat(seq(',', $._signal_name)))  // Signal names including selected/indexed
     ),
