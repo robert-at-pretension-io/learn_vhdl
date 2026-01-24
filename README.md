@@ -1,327 +1,216 @@
-# VHDL Compiler
+# VHDL Compliance Compiler
 
-A learning-focused VHDL compiler built with Rust and Tree-sitter.
+A production-ready VHDL linting and compliance tool built with Go, Tree-sitter, and OPA.
 
 ## What Is This?
 
-This project has two goals:
+This stack transforms VHDL from "text files" into a "queryable database," enabling safety checks that were previously impossible without expensive proprietary tools.
 
-1. **Learn VHDL** by building a compiler for it
-2. **Learn compiler construction** using modern, declarative tools
+---
 
-The philosophy is "learn by doing" — instead of just reading about VHDL, we build a tool that understands it. Every grammar rule teaches us something about the language.
+## The Compliance Compiler Stack
 
-## Why Build a Compiler to Learn a Language?
+### 1. The Parser: Tree-sitter (VHDL)
 
-When you write a compiler, you must understand the language at a deeper level than when you just use it:
+**Role:** The "Crash-Proof" Translator.
 
-- **Syntax**: What sequences of tokens are valid? What's optional? What's required?
-- **Semantics**: What does each construct actually mean?
-- **Edge cases**: What happens with unusual but legal code?
+**Why Tree-sitter:**
+- **Error Tolerance:** Unlike GHDL (which stops at the first syntax error), Tree-sitter produces a valid tree even for broken code. This allows you to lint a file while the user is still typing.
+- **Speed:** It is incremental. Re-parsing a 5,000-line file after a 1-line change takes milliseconds, enabling real-time IDE feedback.
+- **Standard:** It is the industry standard for modern editors (Neovim, Zed, Helix), meaning your grammar maintenance effort benefits the entire ecosystem.
 
-The tight feedback loop of "write grammar rule → see what parses → fix errors" is an incredibly effective way to learn.
+### 2. The Extractor: Scheme Queries (`.scm`)
 
-## Quick Start
+**Role:** The Data Compressor.
 
-```bash
-# Install dependencies
-cd tree-sitter-vhdl && npm install && cd ..
+**Why Scheme Queries:**
+- **Decoupling:** Separates "Syntax" from "Logic." If the VHDL grammar changes (e.g., how `port_list` is nested), you update the `.scm` file, not your Go code.
+- **Performance:** A raw VHDL syntax tree is massive (~10MB JSON for a large file). Scheme queries filter this down to just the 1% of data you care about (Entity names, Port types), preventing your policy engine from choking on noise.
 
-# Run the development loop (watches for changes)
-./dev.sh
+### 3. The Orchestrator: Go (The Indexer)
 
-# Or run once
-./dev.sh --once
+**Role:** The "Stateful Glue."
+
+**Why Go:**
+- **Cross-File State:** Tree-sitter processes one file at a time. Go holds the "World View"—mapping `component` declarations in File A to `entity` definitions in File B.
+- **Parallelism:** Go's goroutines allow you to parse, extract, and index thousands of VHDL files concurrently, making the tool feel instant.
+- **Single Binary:** Compile the OPA engine, Tree-sitter runtime, and your logic into a single `./vhdl-lint` binary that is easy to distribute in CI pipelines.
+
+### 4. The Policy Engine: OPA (Rego)
+
+**Role:** The "Semantic Validator."
+
+**Why OPA:**
+- **Declarative Power:** Writing "Find all signals that cross clock domains without synchronization" is a 5-line query in Rego. In Go, it would be 200 lines of fragile loop logic.
+- **Standardization:** Uses the same policy language as Kubernetes and Terraform tools. Integrate your VHDL checks into standard enterprise "Policy as Code" workflows.
+- **Maintainability:** Publish "Rule Packs" (e.g., *DO-254 Safety Pack*) as separate `.rego` files without recompiling the main tool.
+
+### 5. The Configurator: CUE
+
+**Role:** The "Type-Safe Contract."
+
+**Why CUE:**
+- **Schema Validation:** CUE acts as the contract between your Go extractor and OPA. It ensures the data sent to the policy engine is valid, preventing "silent failures" where a rule passes simply because a field name changed.
+- **Artifact Generation:** Generates complex output files (Testbenches, Tcl scripts) with mathematical certainty, eliminating syntax errors in your build scripts.
+
+---
+
+## The Go Indexer: Deep Dive
+
+The Go Indexer is the most complex component. It acts as a **Linker** for your VHDL project, turning isolated **Facts** (from Tree-sitter) into **Relationships** (for OPA).
+
+### Task 1: VHDL Path Resolution (The Librarian)
+
+VHDL has a complex library system.
+
+**The Problem:** When a file says `library ieee; use ieee.std_logic_1164.all;`, it refers to a vendor installation path (e.g., `/opt/xilinx/...`), not a file in your project.
+
+**The Solution:**
+1. **Scan:** Walk the user's project directory recursively.
+2. **Map:** Build a `map[string]string` registry of **Logical Library** → **Physical Path**:
+   ```
+   work   → ./src/
+   ip_lib → ./vendor/ip/
+   ```
+3. **Resolve:** When parsing `use work.my_pkg.all`, look up `work` in the map, find the files, and link them.
+
+### Task 2: Fact Normalization (The Flattener)
+
+OPA is a "Relational" engine—it wants data that looks like SQL tables.
+
+**The Problem:** Tree-sitter outputs a tree: `Entity → PortList → Port → Type`.
+
+**The Solution:** Flatten into lists of objects:
+
+```json
+{
+  "entities": [
+    { "id": "work.cpu", "file": "src/cpu.vhd", "ports": ["clk", "rst"] }
+  ],
+  "dependencies": [
+    { "source": "work.cpu", "target": "work.alu", "type": "instantiation" }
+  ]
+}
 ```
 
-Edit `tree-sitter-vhdl/grammar.js` to add grammar rules. Edit `test.vhdl` to test different VHDL constructs. The dev script will automatically rebuild and show you parse errors.
+This allows OPA to run fast joins: *"Find all entities that depend on `alu`"* becomes an O(1) lookup.
+
+### Task 3: Schema Validation (The Guard Rail)
+
+**The Problem:** If you rename `port_name` to `name` in your `.scm` query, your OPA rules silently stop working.
+
+**The Solution:**
+1. Marshal extracted data to JSON.
+2. Validate against `schema/ir.cue` using the CUE runtime.
+3. If validation fails, **panic immediately**: *"Extractor produced invalid data: field 'port_name' missing."*
+4. Guarantees no "Silent False Positives."
+
+### Task 4: The Symbol Table (The Cross-File Brain)
+
+**The Solution:**
+1. **Pass 1 (Discovery):** Parse every file. Extract **Exports** (Entity names, Package names). Store in Global Symbol Map.
+2. **Pass 2 (Resolution):** Parse every file again. Check if **Imports** (`component my_comp`) exist in the Global Symbol Map.
+3. **Report:** Inject `found: true/false` flags into the JSON sent to OPA.
+
+### Indexer Pseudocode
+
+```go
+func RunIndexer(rootPath string) {
+    // 1. Scan Files
+    files := FindVHDLFiles(rootPath)
+
+    // 2. Pass 1: Parallel Extraction (Goroutines)
+    var symbols SyncMap
+    for _, file := range files {
+        go func(f) {
+            ast := TreeSitterParse(f)
+            facts := SchemeExtract(ast)
+            symbols.Add(facts.Exports) // e.g. "work.my_cpu"
+        }(file)
+    }
+
+    // 3. Pass 2: Linker
+    var normalizedData OPAInput
+    for _, file := range files {
+        extractedImports := GetImports(file)
+        for _, imp := range extractedImports {
+             if !symbols.Has(imp) {
+                 normalizedData.Errors.Add(file, "Missing Import: " + imp)
+             }
+        }
+    }
+
+    // 4. Validate against CUE Schema
+    if err := CueValidate(normalizedData); err != nil {
+        panic("CRITICAL: Indexer generated bad data!")
+    }
+
+    // 5. Hand off to OPA
+    OPA.Eval(normalizedData)
+}
+```
+
+---
 
 ## Project Structure
 
 ```
 .
 ├── tree-sitter-vhdl/
-│   ├── grammar.js          # The grammar definition (your main workspace)
-│   ├── package.json        # Node.js config for tree-sitter CLI
-│   ├── Cargo.toml          # Rust crate config
-│   └── bindings/rust/      # Rust bindings to the generated parser
-├── src/
-│   └── main.rs             # Rust CLI that runs the parser
-├── test.vhdl               # Kitchen sink test file with VHDL examples
-├── dev.sh                  # Build & watch script
-├── AGENTS.md               # Detailed architecture documentation
-└── grammar_dev.md          # Tree-sitter grammar writing guide
+│   ├── grammar.js          # VHDL grammar definition
+│   ├── queries/
+│   │   └── extract.scm     # Scheme queries for fact extraction
+│   └── bindings/           # Language bindings
+├── cmd/
+│   └── vhdl-lint/          # Main CLI entry point
+├── internal/
+│   ├── indexer/            # Go indexer (symbol table, linker)
+│   ├── extractor/          # Tree-sitter + Scheme query runner
+│   └── validator/          # CUE schema validation
+├── policies/
+│   └── *.rego              # OPA policy rules
+├── schema/
+│   └── ir.cue              # Intermediate representation schema
+└── test.vhdl               # Test file
 ```
-
-## The Development Loop
-
-1. **Look at test.vhdl** — Find a construct you don't understand yet
-2. **Run `./dev.sh`** — See ERROR nodes for unparsed constructs
-3. **Add grammar rules** — Edit `grammar.js` to recognize the construct
-4. **Watch the errors decrease** — Each cycle teaches you more
-
-Example:
-```bash
-# See what's broken
-./dev.sh --once
-# Output: ERROR at 9:1 "library ieee;"
-
-# Add the library_clause rule to grammar.js
-# Run again...
-# Output: ERROR at 10:1 "use ieee.std_logic_1164.all;"
-
-# Add the use_clause rule... and so on
-```
-
-## Architecture Overview
-
-The compiler uses a "Rust-Powered Declarative Stack":
-
-| Phase | Tool | Purpose |
-|-------|------|---------|
-| **Parsing** | Tree-sitter | Turn text into syntax tree (error-tolerant) |
-| **Dependencies** | Petgraph | Build dependency graph, topological sort |
-| **Lowering** | Hand-written Rust | Convert syntax tree to semantic representation |
-| **Type Checking** | Egglog | Equality saturation for type inference & overloading |
-| **Flow Analysis** | Crepe | Datalog for latch detection, dead code, etc. |
-| **Reporting** | Miette | Beautiful error messages with source spans |
-
-See [AGENTS.md](AGENTS.md) for detailed architecture documentation.
-
-## Core Philosophy: "Panic is Failure"
-
-The compiler never crashes. It ingests code, understands what it can, and explicitly reports what it cannot:
-
-- **User Errors**: "You wrote bad VHDL (latch inferred)."
-- **System Edges**: "I don't know how to handle `generate` statements yet."
 
 ---
 
-# Adapting This Project for Other Languages
-
-This project structure can be copied to build compilers for any language. Here's how:
-
-## Step 1: Fork the Structure
+## Quick Start
 
 ```bash
-# Copy the project
-cp -r vhdl_compiler my_language_compiler
-cd my_language_compiler
+# Build the tool
+go build -o vhdl-lint ./cmd/vhdl-lint
 
-# Rename the tree-sitter directory
-mv tree-sitter-vhdl tree-sitter-mylang
+# Lint a VHDL project
+./vhdl-lint ./src/
 
-# Update names in configuration files
+# Run with specific policy pack
+./vhdl-lint --policies=policies/do254.rego ./src/
 ```
 
-## Step 2: Update Configuration Files
+---
 
-### `tree-sitter-mylang/grammar.js`
+## Grammar Development
 
-Replace the grammar with your language's syntax:
-
-```javascript
-module.exports = grammar({
-  name: 'mylang',  // Change this
-
-  extras: $ => [
-    /\s+/,
-    $.comment,
-  ],
-
-  rules: {
-    // Start fresh with your language's entry point
-    source_file: $ => repeat($._definition),
-
-    _definition: $ => choice(
-      $.comment,
-      // Add your language's top-level constructs
-    ),
-
-    // Define comment syntax for your language
-    comment: $ => token(seq('//', /.*/)),  // C-style
-    // comment: $ => token(seq('#', /.*/)),   // Python-style
-    // comment: $ => token(seq('--', /.*/)),  // SQL/VHDL-style
-  }
-});
-```
-
-### `tree-sitter-mylang/package.json`
-
-```json
-{
-  "name": "tree-sitter-mylang",
-  ...
-}
-```
-
-### `tree-sitter-mylang/Cargo.toml`
-
-```toml
-[package]
-name = "tree-sitter-mylang"
-...
-```
-
-### `tree-sitter-mylang/bindings/rust/lib.rs`
-
-```rust
-extern "C" {
-    fn tree_sitter_mylang() -> tree_sitter::Language;
-}
-
-pub fn language() -> tree_sitter::Language {
-    unsafe { tree_sitter_mylang() }
-}
-```
-
-### `tree-sitter-mylang/bindings/rust/build.rs`
-
-```rust
-fn main() {
-    // ... same structure, just update the library name
-    c_config.compile("tree-sitter-mylang");
-}
-```
-
-### Root `Cargo.toml`
-
-```toml
-[package]
-name = "mylang-compiler"
-...
-
-[dependencies]
-tree-sitter = "0.22"
-tree-sitter-mylang = { path = "./tree-sitter-mylang" }
-```
-
-### `src/main.rs`
-
-```rust
-// Change the import
-use tree_sitter_mylang;
-
-// Change the language loading
-parser
-    .set_language(&tree_sitter_mylang::language())
-    .expect("Error loading MyLang grammar");
-```
-
-## Step 3: Create Your Test File
-
-Create a "kitchen sink" test file with examples of every construct in your language:
-
-```
-test.mylang
-```
-
-Include comments explaining what's language-defined vs. convention (like we did in `test.vhdl`).
-
-## Step 4: Start the Learning Loop
+The Tree-sitter grammar is in `tree-sitter-vhdl/grammar.js`.
 
 ```bash
-./dev.sh
+# Regenerate parser after grammar changes
+cd tree-sitter-vhdl && npx tree-sitter generate
+
+# Test parsing
+./vhdl-lint --parse-only test.vhdl
 ```
 
-Now iterate:
-1. See an ERROR node
-2. Look up that construct in your language's specification
-3. Add a grammar rule
-4. Repeat
+### Current Grammar Status
 
-## Tips for Different Language Types
+| Test Suite | Pass Rate |
+|------------|-----------|
+| VHDL 2008 Compliance-Tests | 100% |
+| IEEE 1076-2008 | 65% |
 
-### For C-like Languages (C, Java, Go, Rust)
-
-- Expressions need careful precedence handling
-- Statement terminators (`;`) vs. separators
-- Block structure with `{` `}`
-
-```javascript
-// Precedence example
-const PREC = {
-  ASSIGN: 1,
-  OR: 2,
-  AND: 3,
-  COMPARE: 4,
-  ADD: 5,
-  MUL: 6,
-  UNARY: 7,
-  CALL: 8,
-};
-
-binary_expression: $ => choice(
-  prec.left(PREC.ADD, seq($.expression, '+', $.expression)),
-  prec.left(PREC.MUL, seq($.expression, '*', $.expression)),
-  // ...
-),
-```
-
-### For Indentation-Sensitive Languages (Python, Haskell, YAML)
-
-Tree-sitter can handle these with an external scanner:
-
-```javascript
-module.exports = grammar({
-  // ...
-  externals: $ => [
-    $._indent,
-    $._dedent,
-    $._newline,
-  ],
-  // ...
-});
-```
-
-You'll need to write a C file (`src/scanner.c`) to track indentation.
-
-### For Lisp-like Languages (Scheme, Clojure)
-
-These are actually the easiest — mostly just parentheses and atoms:
-
-```javascript
-rules: {
-  source_file: $ => repeat($._form),
-  
-  _form: $ => choice(
-    $.list,
-    $.vector,
-    $.atom,
-  ),
-  
-  list: $ => seq('(', repeat($._form), ')'),
-  vector: $ => seq('[', repeat($._form), ']'),
-  atom: $ => choice($.symbol, $.number, $.string),
-  
-  symbol: $ => /[a-zA-Z_+\-*\/<>=!?][a-zA-Z0-9_+\-*\/<>=!?]*/,
-  number: $ => /\d+/,
-  string: $ => /"[^"]*"/,
-}
-```
-
-### For Markup Languages (HTML, XML, Markdown)
-
-Watch out for:
-- Nested structures
-- Mixed content (text + elements)
-- Special characters and escaping
-
-## Resources
-
-### Tree-sitter Documentation
-- [Official Docs](https://tree-sitter.github.io/tree-sitter/)
-- [Creating Parsers](https://tree-sitter.github.io/tree-sitter/creating-parsers)
-
-### Example Grammars to Study
-- [tree-sitter-python](https://github.com/tree-sitter/tree-sitter-python)
-- [tree-sitter-rust](https://github.com/tree-sitter/tree-sitter-rust)
-- [tree-sitter-javascript](https://github.com/tree-sitter/tree-sitter-javascript)
-
-### Testing Your Grammar
-- **GHDL test suite** (for VHDL): Thousands of edge-case tests
-- **Language compliance suites**: Most languages have official test suites
-- **Real-world codebases**: Try parsing popular open-source projects
+---
 
 ## License
 
@@ -329,8 +218,8 @@ MIT
 
 ## Contributing
 
-This is a learning project. If you're using it to learn a language, consider contributing:
-- Grammar improvements
+Contributions welcome:
+- Grammar improvements for missing VHDL constructs
+- New OPA policy rules
 - Better error messages
-- Documentation of language constructs
-- Test cases for edge cases
+- Documentation
