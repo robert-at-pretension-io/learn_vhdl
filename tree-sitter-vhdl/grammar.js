@@ -1728,13 +1728,22 @@ module.exports = grammar({
       $._name_or_attribute,  // Identifier optionally followed by attribute
       $.external_name,  // VHDL-2008: << signal .path : type >>
       $.number,
-      /[+\-*/<>=&|?]+/,  // Symbolic operators (including ?= ?/= ?< etc.)
-      choice($._kw_and, $._kw_or, $._kw_xor, $._kw_nand, $._kw_nor, $._kw_xnor, $._kw_not,  // Logical operators
-             $._kw_mod, $._kw_rem, $._kw_abs, $._kw_sll, $._kw_srl, $._kw_sla, $._kw_sra, $._kw_rol, $._kw_ror),  // Other operators
+      $.relational_operator,  // =, /=, <, >, <=, >= (visible for semantic analysis)
+      $.logical_operator,     // and, or, xor, etc. (visible for semantic analysis)
+      $.arithmetic_operator,  // +, -, *, /, etc. (visible for semantic analysis)
+      $.shift_operator,       // sll, srl, sla, sra, rol, ror
+      $._kw_not,              // Unary not
+      $._kw_abs,              // Unary abs
       $._kw_always,  // PSL: always temporal operator
       $.psl_next_expression,  // PSL: next[n](expr)
       $._parenthesized_expression  // Grouped or aggregate
     ),
+
+    // Visible operator nodes for semantic analysis
+    relational_operator: _ => choice('=', '/=', '<', '>', '<=', '>=', '?=', '?/=', '?<', '?>', '?<=', '?>='),
+    logical_operator: _ => choice(/[aA][nN][dD]/, /[oO][rR]/, /[xX][oO][rR]/, /[nN][aA][nN][dD]/, /[nN][oO][rR]/, /[xX][nN][oO][rR]/),
+    arithmetic_operator: _ => choice('+', '-', '*', '/', '**', '&', /[mM][oO][dD]/, /[rR][eE][mM]/),
+    shift_operator: _ => choice(/[sS][lL][lL]/, /[sS][rR][lL]/, /[sS][lL][aA]/, /[sS][rR][aA]/, /[rR][oO][lL]/, /[rR][oO][rR]/),
 
     // PSL: next[count](expression) - temporal operator
     psl_next_expression: $ => seq(
