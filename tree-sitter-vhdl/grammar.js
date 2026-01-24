@@ -187,6 +187,7 @@ module.exports = grammar({
     _kw_file: _ => /[fF][iI][lL][eE]/,
     _kw_in: _ => /[iI][nN]/,
     _kw_out: _ => /[oO][uU][tT]/,
+    _kw_inout: _ => /[iI][nN][oO][uU][tT]/,
     _kw_buffer: _ => /[bB][uU][fF][fF][eE][rR]/,
     _kw_linkage: _ => /[lL][iI][nN][kK][aA][gG][eE]/,
     _kw_subtype: _ => /[sS][uU][bB][tT][yY][pP][eE]/,
@@ -354,14 +355,14 @@ module.exports = grammar({
     // -------------------------------------------------------------------------
     // constant_declaration
     // -------------------------------------------------------------------------
-    // constant identifier : type := expression;
+    // constant identifier : type [:= expression];
+    // Without := it's a "deferred constant" (value in package body)
     constant_declaration: $ => seq(
       $._kw_constant,
       field('name', $.identifier),
       ':',
       field('type', $._type_mark),
-      ':=',
-      field('value', $._constant_value),
+      optional(seq(':=', field('value', $._constant_value))),
       ';'
     ),
 
@@ -469,12 +470,17 @@ module.exports = grammar({
     // -------------------------------------------------------------------------
     // enumeration_type_definition
     // -------------------------------------------------------------------------
-    // (ID1, ID2, ID3, ...)
+    // (ID1, ID2, ID3, ...) or ('Z', '0', '1', 'X') for character enums
     enumeration_type_definition: $ => seq(
       '(',
-      $.identifier,
-      repeat(seq(',', $.identifier)),
+      $._enumeration_literal,
+      repeat(seq(',', $._enumeration_literal)),
       ')'
+    ),
+
+    _enumeration_literal: $ => choice(
+      $.identifier,
+      /'[^']+'/  // Character literal like '0', 'Z', etc.
     ),
 
     // -------------------------------------------------------------------------
@@ -615,7 +621,7 @@ module.exports = grammar({
       $.identifier,
       repeat(seq(',', $.identifier)),
       ':',
-      optional(choice($._kw_in, $._kw_out, 'inout', $._kw_buffer, $._kw_linkage)),
+      optional(choice($._kw_in, $._kw_out, $._kw_inout, $._kw_buffer, $._kw_linkage)),
       $._parameter_type,
       optional(seq(':=', $._default_value))  // default value
     ),
