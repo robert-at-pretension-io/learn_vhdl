@@ -69,13 +69,14 @@ type FileFacts struct {
 	CaseStatements []CaseStatement      // Case statements for latch detection
 	Generates      []GenerateStatement  // Generate statements (for-generate, if-generate, case-generate)
 	// Type system
-	Types      []TypeDeclaration      // Type declarations (enum, record, array, etc.)
-	Subtypes   []SubtypeDeclaration   // Subtype declarations
-	Functions  []FunctionDeclaration  // Function declarations/bodies
-	Procedures []ProcedureDeclaration // Procedure declarations/bodies
-	// Type system information (for filtering false positives) - LEGACY, use Types instead
+	Types         []TypeDeclaration        // Type declarations (enum, record, array, etc.)
+	Subtypes      []SubtypeDeclaration     // Subtype declarations
+	Functions     []FunctionDeclaration    // Function declarations/bodies
+	Procedures    []ProcedureDeclaration   // Procedure declarations/bodies
+	ConstantDecls []ConstantDeclaration    // Constant declarations with full info
+	// Type system information (for filtering false positives) - LEGACY, use Types/ConstantDecls instead
 	EnumLiterals []string          // Enum literals from type declarations (e.g., S_IDLE, S_RUN)
-	Constants    []string          // Constants from constant declarations
+	Constants    []string          // Constants from constant declarations (names only)
 	// Concurrent statements (outside processes)
 	ConcurrentAssignments []ConcurrentAssignment // Concurrent signal assignments
 	// Semantic analysis
@@ -363,6 +364,17 @@ type SubprogramParameter struct {
 	Line      int
 }
 
+// ConstantDeclaration represents a VHDL constant declaration
+// Captures: constant name : type := value;
+type ConstantDeclaration struct {
+	Name      string
+	Type      string
+	Value     string  // The expression value (may be empty for deferred constants)
+	Line      int
+	InPackage string  // Package containing this constant
+	InArch    string  // Architecture if local constant
+}
+
 // New creates a new Extractor with VHDL language loaded
 func New() *Extractor {
 	// Load the VHDL language (thread-safe, can be shared)
@@ -494,7 +506,10 @@ func (e *Extractor) walkTreeWithPkg(node *sitter.Node, source []byte, facts *Fil
 		facts.Procedures = append(facts.Procedures, pd)
 
 	case "constant_declaration":
-		// Extract constant names to filter out false positives
+		// Extract full constant declarations with context
+		constDecls := e.extractConstantDeclarations(node, source, pkgContext, archContext)
+		facts.ConstantDecls = append(facts.ConstantDecls, constDecls...)
+		// Also extract names for legacy filtering
 		constNames := e.extractConstantNames(node, source)
 		facts.Constants = append(facts.Constants, constNames...)
 
@@ -973,6 +988,103 @@ func (e *Extractor) extractConstantNames(node *sitter.Node, source []byte) []str
 	}
 
 	return names
+}
+
+// extractConstantDeclarations extracts full constant declarations with type and context
+// Example: constant WIDTH : integer := 8; -> returns [{Name: "WIDTH", Type: "integer", Value: "8"}]
+func (e *Extractor) extractConstantDeclarations(node *sitter.Node, source []byte, pkgContext, archContext string) []ConstantDeclaration {
+	var decls []ConstantDeclaration
+	line := int(node.StartPoint().Row) + 1
+
+	// Constant declaration structure: constant name1, name2 : type := value;
+	var names []string
+	var typeStr string
+	var valueStr string
+
+	sawColon := false
+	sawAssign := false
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		childType := child.Type()
+
+		if childType == ":" {
+			sawColon = true
+			continue
+		}
+		if childType == ":=" {
+			sawAssign = true
+			continue
+		}
+
+		// Names come before the colon
+		if !sawColon && childType == "identifier" {
+			names = append(names, child.Content(source))
+		}
+
+		// Type comes after colon, before :=
+		if sawColon && !sawAssign {
+			// The type is usually in a subtype_indication or identifier
+			if typeStr == "" {
+				typeStr = e.extractTypeName(child, source)
+			}
+		}
+
+		// Value comes after :=
+		if sawAssign && valueStr == "" {
+			valueStr = strings.TrimSpace(child.Content(source))
+		}
+	}
+
+	// Create a declaration for each name
+	for _, name := range names {
+		decls = append(decls, ConstantDeclaration{
+			Name:      name,
+			Type:      typeStr,
+			Value:     valueStr,
+			Line:      line,
+			InPackage: pkgContext,
+			InArch:    archContext,
+		})
+	}
+
+	return decls
+}
+
+// extractTypeName extracts a type name from a type indication node
+func (e *Extractor) extractTypeName(node *sitter.Node, source []byte) string {
+	if node == nil {
+		return ""
+	}
+
+	nodeType := node.Type()
+
+	// Direct identifier
+	if nodeType == "identifier" || nodeType == "simple_name" {
+		return node.Content(source)
+	}
+
+	// Selected name (e.g., ieee.std_logic_1164.std_logic)
+	if nodeType == "selected_name" {
+		return node.Content(source)
+	}
+
+	// Type mark or subtype indication - recurse to find the actual type name
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		childType := child.Type()
+		if childType == "identifier" || childType == "simple_name" || childType == "selected_name" {
+			return child.Content(source)
+		}
+		// Recurse into type_mark, subtype_indication, etc.
+		if childType == "type_mark" || childType == "subtype_indication" || childType == "_type_mark" {
+			result := e.extractTypeName(child, source)
+			if result != "" {
+				return result
+			}
+		}
+	}
+
+	return ""
 }
 
 func (e *Extractor) extractSignals(node *sitter.Node, source []byte, context string) []Signal {

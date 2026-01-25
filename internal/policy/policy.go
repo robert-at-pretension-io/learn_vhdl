@@ -54,13 +54,14 @@ type Input struct {
 	ConcurrentAssignments []ConcurrentAssignment `json:"concurrent_assignments"` // Concurrent signal assignments (outside processes)
 	Generates             []GenerateStatement    `json:"generates"`              // Generate statements (for/if/case generate)
 	// Type system
-	Types      []TypeDeclaration      `json:"types"`      // Type declarations (enum, record, array, etc.)
-	Subtypes   []SubtypeDeclaration   `json:"subtypes"`   // Subtype declarations
-	Functions  []FunctionDeclaration  `json:"functions"`  // Function declarations/bodies
-	Procedures []ProcedureDeclaration `json:"procedures"` // Procedure declarations/bodies
-	// Type system info for filtering false positives (LEGACY - use Types instead)
+	Types         []TypeDeclaration        `json:"types"`          // Type declarations (enum, record, array, etc.)
+	Subtypes      []SubtypeDeclaration     `json:"subtypes"`       // Subtype declarations
+	Functions     []FunctionDeclaration    `json:"functions"`      // Function declarations/bodies
+	Procedures    []ProcedureDeclaration   `json:"procedures"`     // Procedure declarations/bodies
+	ConstantDecls []ConstantDeclaration    `json:"constant_decls"` // Constant declarations with full info
+	// Type system info for filtering false positives (LEGACY - use Types/ConstantDecls instead)
 	EnumLiterals []string `json:"enum_literals"` // Enum literals from type declarations
-	Constants    []string `json:"constants"`     // Constants from constant declarations
+	Constants    []string `json:"constants"`     // Constants from constant declarations (names only)
 	// Advanced analysis for security/power/correctness
 	Comparisons   []Comparison   `json:"comparisons"`    // Comparisons for trojan/trigger detection
 	ArithmeticOps []ArithmeticOp `json:"arithmetic_ops"` // Expensive operations for power analysis
@@ -323,6 +324,17 @@ type SubprogramParameter struct {
 	Class     string `json:"class,omitempty"`   // "signal", "variable", "constant", "file"
 	Default   string `json:"default,omitempty"` // Default value expression
 	Line      int    `json:"line"`
+}
+
+// ConstantDeclaration represents a VHDL constant declaration
+type ConstantDeclaration struct {
+	Name      string `json:"name"`
+	Type      string `json:"type"`
+	Value     string `json:"value,omitempty"`      // May be empty for deferred constants
+	File      string `json:"file"`
+	Line      int    `json:"line"`
+	InPackage string `json:"in_package,omitempty"` // Package containing this constant
+	InArch    string `json:"in_arch,omitempty"`    // Architecture if local constant
 }
 
 // New creates a new policy engine, loading policies from the given directory

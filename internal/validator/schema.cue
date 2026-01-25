@@ -26,9 +26,10 @@ package schema
     subtypes:               [...#SubtypeDeclaration]
     functions:              [...#FunctionDeclaration]
     procedures:             [...#ProcedureDeclaration]
-    // Type system info for filtering false positives (LEGACY - use types instead)
+    constant_decls:         [...#ConstantDeclaration]
+    // Type system info for filtering false positives (LEGACY - use types/constant_decls instead)
     enum_literals:          [...string]  // Enum literals from type declarations (e.g., S_IDLE, S_RUN)
-    constants:              [...string]  // Constants from constant declarations
+    constants:              [...string]  // Constants from constant declarations (names only)
     // Advanced analysis for security/power/correctness
     comparisons:            [...#Comparison]
     arithmetic_ops:         [...#ArithmeticOp]
@@ -105,8 +106,8 @@ package schema
 
 // Global symbol in the cross-file symbol table
 #Symbol: {
-    name: string & =~"^[a-zA-Z_][a-zA-Z0-9_.]*$"  // Qualified: work.my_entity
-    kind: "entity" | "package" | "component" | "architecture"
+    name: string & =~"^[a-zA-Z_][a-zA-Z0-9_.]*$"  // Qualified: work.my_entity or work.my_pkg.my_type
+    kind: "entity" | "package" | "component" | "architecture" | "type" | "constant" | "function" | "procedure"
     file: string & =~".+\\.(vhd|vhdl)$"
     line: int & >=1
 }
@@ -303,4 +304,15 @@ package schema
     class?:     "signal" | "variable" | "constant" | "file" | ""
     default?:   string                                  // Default value expression
     line:       int & >=1
+}
+
+// ConstantDeclaration represents a VHDL constant declaration
+#ConstantDeclaration: {
+    name:       string & =~"^[a-zA-Z_][a-zA-Z0-9_]*$"
+    type:       string & !=""
+    value?:     string                                  // May be empty for deferred constants
+    file:       string & =~".+\\.(vhd|vhdl)$"
+    line:       int & >=1
+    in_package?: string                                 // Package containing this constant
+    in_arch?:    string                                 // Architecture if local constant
 }

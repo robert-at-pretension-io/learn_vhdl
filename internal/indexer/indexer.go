@@ -215,6 +215,49 @@ func (idx *Indexer) Run(rootPath string) error {
 					Line: pkg.Line,
 				})
 			}
+
+			// Register package contents in symbol table for cross-file resolution
+			// Format: library.package.item (e.g., work.my_pkg.state_t)
+			for _, t := range facts.Types {
+				if t.InPackage != "" {
+					idx.Symbols.Add(Symbol{
+						Name: fmt.Sprintf("%s.%s.%s", libName, strings.ToLower(t.InPackage), strings.ToLower(t.Name)),
+						Kind: "type",
+						File: f,
+						Line: t.Line,
+					})
+				}
+			}
+			for _, c := range facts.ConstantDecls {
+				if c.InPackage != "" {
+					idx.Symbols.Add(Symbol{
+						Name: fmt.Sprintf("%s.%s.%s", libName, strings.ToLower(c.InPackage), strings.ToLower(c.Name)),
+						Kind: "constant",
+						File: f,
+						Line: c.Line,
+					})
+				}
+			}
+			for _, fn := range facts.Functions {
+				if fn.InPackage != "" {
+					idx.Symbols.Add(Symbol{
+						Name: fmt.Sprintf("%s.%s.%s", libName, strings.ToLower(fn.InPackage), strings.ToLower(fn.Name)),
+						Kind: "function",
+						File: f,
+						Line: fn.Line,
+					})
+				}
+			}
+			for _, pr := range facts.Procedures {
+				if pr.InPackage != "" {
+					idx.Symbols.Add(Symbol{
+						Name: fmt.Sprintf("%s.%s.%s", libName, strings.ToLower(pr.InPackage), strings.ToLower(pr.Name)),
+						Kind: "procedure",
+						File: f,
+						Line: pr.Line,
+					})
+				}
+			}
 		}(file)
 	}
 
@@ -427,6 +470,20 @@ func (idx *Indexer) Run(rootPath string) error {
 				}
 			}
 		}
+		fmt.Printf("\n=== Verbose: Constant Declarations ===\n")
+		for _, facts := range idx.Facts {
+			for _, c := range facts.ConstantDecls {
+				scope := c.InPackage
+				if scope == "" {
+					scope = c.InArch
+				}
+				value := ""
+				if c.Value != "" {
+					value = fmt.Sprintf(" := %s", c.Value)
+				}
+				fmt.Printf("  %s.%s: %s%s\n", scope, c.Name, c.Type, value)
+			}
+		}
 	}
 
 	// 3. Pass 2: Resolution (check imports)
@@ -534,10 +591,11 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 		ConcurrentAssignments: []policy.ConcurrentAssignment{},
 		Generates:             []policy.GenerateStatement{},
 		// Type system
-		Types:      []policy.TypeDeclaration{},
-		Subtypes:   []policy.SubtypeDeclaration{},
-		Functions:  []policy.FunctionDeclaration{},
-		Procedures: []policy.ProcedureDeclaration{},
+		Types:         []policy.TypeDeclaration{},
+		Subtypes:      []policy.SubtypeDeclaration{},
+		Functions:     []policy.FunctionDeclaration{},
+		Procedures:    []policy.ProcedureDeclaration{},
+		ConstantDecls: []policy.ConstantDeclaration{},
 		// Type system info for filtering (LEGACY)
 		EnumLiterals: []string{},
 		Constants:    []string{},
@@ -925,6 +983,19 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 				Line:       pr.Line,
 				InPackage:  pr.InPackage,
 				InArch:     pr.InArch,
+			})
+		}
+
+		// Type system: Constants
+		for _, c := range facts.ConstantDecls {
+			input.ConstantDecls = append(input.ConstantDecls, policy.ConstantDeclaration{
+				Name:      c.Name,
+				Type:      c.Type,
+				Value:     c.Value,
+				File:      facts.File,
+				Line:      c.Line,
+				InPackage: c.InPackage,
+				InArch:    c.InArch,
 			})
 		}
 

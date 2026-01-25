@@ -10,11 +10,11 @@ This stack transforms VHDL from "text files" into a "queryable database," enabli
 | Metric | Value |
 |--------|-------|
 | Test Files | 12,762 |
-| Valid Acceptance | 98.75% |
-| Grammar Quality | 85.40% |
+| Valid Acceptance | 100.00% |
+| Grammar Quality | 80.97% |
 
 **Current Capabilities:**
-- Parse VHDL with error recovery (98.75% acceptance across 12,700+ test files)
+- Parse VHDL with error recovery (100% valid acceptance across 12,700+ test files)
 - Extract semantic information: entities, architectures, signals, ports, processes
 - Detect clock domains, reset patterns, and signal read/write analysis
 - Extract component instantiations with port/generic mappings
@@ -100,6 +100,9 @@ This stack transforms VHDL from "text files" into a "queryable database," enabli
 **Grammar Lessons:**
 - Prefer deferred decisions for VHDL "syntactic homonyms" like `name(0)`; unify names instead of guessing array vs call.
 - Avoid local-maximum hacks that only improve a narrow test set; aim for abstractions that generalize.
+- Discrete ranges show up in loops, slices, and type constraints; handle subtype indications like `natural range 0 to ...`.
+- Report strings can be qualified expressions (`string'("...")`); treat them as first-class expressions.
+- Non-UTF8 test files are a data issue, not a grammar issue; exclude or re-encode rather than loosening the grammar.
 
 ### 2. Go Extractor (`internal/extractor/`)
 
@@ -617,7 +620,7 @@ Based on impact analysis, these are the highest-value improvements ranked by ROI
 |------|------|--------|--------|
 | **#1** | **Type System & Function Extraction** | Enables type-aware rules, width checking | ✅ IMPLEMENTED |
 | **#2** | **Latch Inference Detection** | Critical synthesis rule | ✅ IMPLEMENTED |
-| **#3** | **Package Contents Indexing** | Complete cross-file resolution | Partial (types extracted) |
+| **#3** | **Package Contents Indexing** | Complete cross-file resolution | ✅ IMPLEMENTED |
 | **#4** | **Generate Elaboration** | Evaluate for-generate ranges | Pending |
 | **#5** | **CDC Enhancement** | Clock domain crossing analysis | Pending |
 
@@ -628,11 +631,11 @@ Based on impact analysis, these are the highest-value improvements ranked by ROI
 - [ ] Generic packages with type parameters
 - [ ] Matching case statements
 
-### Phase 2: Library & Scope Model
+### Phase 2: Library & Scope Model ✅ IMPLEMENTED
 - [x] Per-library symbol registration
 - [x] Nested scope tracking (generate statements)
-- [ ] Package contents indexing
-- [ ] Library-qualified name resolution
+- [x] Package contents indexing (types, constants, functions, procedures)
+- [x] Library-qualified name resolution (work.pkg.type format)
 
 ### Phase 3: Type System ✅ IMPLEMENTED
 - [x] Function/procedure extraction with signatures
