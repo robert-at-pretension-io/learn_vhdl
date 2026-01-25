@@ -44,7 +44,7 @@ fn walk_errors(cursor: &mut tree_sitter::TreeCursor, source: &str, error_count: 
     loop {
         let node = cursor.node();
         
-        if node.is_error() || node.is_missing() || node.kind() == "invalid_prefixed_string_literal" {
+        if node.is_error() || node.is_missing() || node.kind() == "invalid_bit_string_literal" {
             *error_count += 1;
 
             if *error_count <= MAX_ERRORS {
@@ -52,9 +52,9 @@ fn walk_errors(cursor: &mut tree_sitter::TreeCursor, source: &str, error_count: 
                 let end = node.end_position();
                 let text = node.utf8_text(source.as_bytes()).unwrap_or("<invalid utf8>");
 
-                if node.kind() == "invalid_prefixed_string_literal" {
+                if node.kind() == "invalid_bit_string_literal" {
                     println!(
-                        "ERROR at {}:{}-{}:{}: invalid prefixed string literal \"{}\"",
+                        "ERROR at {}:{}-{}:{}: invalid bit string literal \"{}\"",
                         start.row + 1, start.column + 1,
                         end.row + 1, end.column + 1,
                         text.chars().take(40).collect::<String>()

@@ -136,6 +136,12 @@ signal_is_assigned(sig_name) {
     lower(ca.target) == lower(sig_name)
     is_actual_signal(ca.target)
 }
+signal_is_assigned(sig_name) {
+    # Signal may be driven by component output port in port map
+    usage := input.signal_usages[_]
+    usage.in_port_map == true
+    lower(usage.signal) == lower(sig_name)
+}
 
 # Rule: Signal assigned in multiple places (potential multi-driver)
 # Now checks both processes and concurrent assignments

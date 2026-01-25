@@ -79,6 +79,23 @@ npx tree-sitter parse file.vhd
 - To reduce XPASS quickly, tighten broad fallbacks first (`_simple_expression`, `_simple_statement`) before adding targeted strictness.
 - Syntax-only negatives (e.g., `bug0100`, `synth/err*`) are best fixed in grammar; semantic negatives belong in extractor/OPA.
 
+#### Semantic Issues: What Must Be Tested (Rules Needed)
+
+Grammar alone cannot detect semantic violations. To correctly flag semantic issues, add extractor + OPA rules and ensure tests cover:
+
+- **Type compatibility:** reject assignments between incompatible types (e.g., `display := item_name;`), mismatched array dimensions, illegal conversions.
+- **Port/generic conformance:** actuals match formals (types, directions, widths), missing/extra associations, illegal mode usage.
+- **Drivers and resolution:** multiple drivers on unresolved types, undriven signals, partial assignment to composite signals in a process.
+- **Process semantics:** latch inference (incomplete assignments in combinational processes), sensitivity list completeness, clock/reset patterns.
+- **Visibility and scope:** unresolved identifiers, illegal use of declarations outside scope, missing library/package imports.
+- **Constraint validity:** range direction mismatches, null range usage where disallowed, invalid index bounds.
+- **Elaboration rules:** illegal generates, duplicate labels, configuration mismatches, component/entity binding errors.
+
+Recommended test sources for semantic rules:
+- `*/non_compliant/*/analyzer_failure/*` (semantic-invalid by design)
+- `external_tests/ghdl/testsuite/synth/err*` (semantic misuses)
+- Targeted positive tests (valid VHDL) to guard against false positives.
+
 #### AI-Assisted Grammar Improvement Workflow
 
 The test suite contains **12,000+ VHDL files** from production projects (GRLIB, OSVVM, VUnit, neorv32, ghdl, etc.). Running the full suite and caching results enables efficient AI-assisted improvement.

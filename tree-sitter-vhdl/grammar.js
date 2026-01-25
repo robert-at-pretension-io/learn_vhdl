@@ -158,7 +158,8 @@ module.exports = grammar({
   // first crack at recognizing these tokens. See src/scanner.c for details.
   // ===========================================================================
   externals: $ => [
-    $.bit_string_literal,  // X"...", B"...", O"..." - handled by scanner.c
+    $.bit_string_literal,          // X"...", B"...", O"..." - handled by scanner.c
+    $.invalid_bit_string_literal,  // invalid base prefixes (scanner.c)
   ],
 
   // ===========================================================================
@@ -1056,14 +1057,8 @@ module.exports = grammar({
       /"([^"]|"")*"/,             // Regular string "text" with doubled quotes
       /%([^%]|%%)*%/,             // Percent-delimited string: %% => %
       $.bit_string_literal,       // X"1A", B"1010", O"17" (from external scanner)
+      $.invalid_bit_string_literal
     ),
-
-    // Invalid prefixed strings like bx"00" (invalid base prefix)
-    // Tokenized to allow explicit error reporting in the driver.
-    invalid_prefixed_string_literal: _ => token(prec(1, choice(
-      /[A-Za-z][A-Za-z0-9_]+\"([^"]|"")*\"/,
-      /[0-9][0-9_]*[sSuU]?[A-Za-z_][A-Za-z0-9_]+\"([^"]|"")*\"/
-    ))),
 
     // bit_string_literal is declared in externals and handled by src/scanner.c
     // This gives it priority over the identifier rule, solving the X"..." tokenization issue
@@ -2713,8 +2708,7 @@ module.exports = grammar({
     _literal: $ => prec(10, choice(
       $.character_literal,    // Single character: 'a', '0', ' ', etc.
       /'''/,                  // Apostrophe character: '''
-      $._string_literal,      // Includes quoted, percent-delimited, and bit strings
-      $.invalid_prefixed_string_literal
+      $._string_literal       // Includes quoted, percent-delimited, and bit strings
     )),
 
     // Procedure call statement - lower precedence than assignments

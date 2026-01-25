@@ -67,6 +67,7 @@ type Input struct {
 	ArithmeticOps []ArithmeticOp `json:"arithmetic_ops"` // Expensive operations for power analysis
 	SignalDeps    []SignalDep    `json:"signal_deps"`    // Signal dependencies for loop detection
 	CDCCrossings  []CDCCrossing  `json:"cdc_crossings"`  // Clock domain crossings
+	SignalUsages  []SignalUsage  `json:"signal_usages"`  // Signal read/write/port-map tracking
 	// Configuration for lint rules
 	LintConfig LintRuleConfig `json:"lint_config"` // Rule severities and enabled/disabled
 	// Third-party file tracking
@@ -228,6 +229,18 @@ type SignalDep struct {
 	File         string `json:"file"`
 	Line         int    `json:"line"`
 	InArch       string `json:"in_arch"`
+}
+
+// SignalUsage represents a signal read/write/port-map usage
+// Used to track where signals are used for accurate dead code detection
+type SignalUsage struct {
+	Signal       string `json:"signal"`
+	IsRead       bool   `json:"is_read"`
+	IsWritten    bool   `json:"is_written"`
+	InProcess    string `json:"in_process"`
+	InPortMap    bool   `json:"in_port_map"`    // True if signal is in a component port map
+	InstanceName string `json:"instance_name"`  // Instance name if InPortMap
+	Line         int    `json:"line"`
 }
 
 // CDCCrossing represents a potential clock domain crossing

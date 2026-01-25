@@ -103,11 +103,13 @@ type ClockDomain struct {
 
 // SignalUsage tracks where a signal is read or written
 type SignalUsage struct {
-	Signal    string
-	IsRead    bool   // Appears on RHS of assignment
-	IsWritten bool   // Appears on LHS of assignment
-	InProcess string // Which process (empty if concurrent)
-	Line      int
+	Signal       string
+	IsRead       bool   // Appears on RHS of assignment
+	IsWritten    bool   // Appears on LHS of assignment
+	InProcess    string // Which process (empty if concurrent)
+	InPortMap    bool   // Appears as actual in component port map (may be driven by output)
+	InstanceName string // If InPortMap, which instance
+	Line         int
 }
 
 // ResetInfo represents reset signal detection
@@ -503,6 +505,21 @@ func (e *Extractor) walkTreeWithPkg(node *sitter.Node, source []byte, facts *Fil
 		// Also extract as Instance with port/generic maps for system-level analysis
 		inst := e.extractInstance(node, source, archContext)
 		facts.Instances = append(facts.Instances, inst)
+		// Track signals used in port maps - they may be driven by component outputs
+		for _, actual := range inst.PortMap {
+			if actual != "" && actual != "open" {
+				// Extract base signal name (handle indexed like sig(0))
+				baseSig := extractBaseSignalName(actual)
+				if baseSig != "" {
+					facts.SignalUsages = append(facts.SignalUsages, SignalUsage{
+						Signal:       baseSig,
+						InPortMap:    true,
+						InstanceName: inst.Name,
+						Line:         inst.Line,
+					})
+				}
+			}
+		}
 
 	case "signal_declaration":
 		signals := e.extractSignals(node, source, archContext)
@@ -648,10 +665,24 @@ func (e *Extractor) flattenGenerateToFacts(gen *GenerateStatement, archContext s
 		facts.Signals = append(facts.Signals, sig)
 	}
 
-	// Add instances with generate scope
+	// Add instances with generate scope and track port map signals
 	for _, inst := range gen.Instances {
 		inst.InArch = scope
 		facts.Instances = append(facts.Instances, inst)
+		// Track signals used in port maps
+		for _, actual := range inst.PortMap {
+			if actual != "" && actual != "open" {
+				baseSig := extractBaseSignalName(actual)
+				if baseSig != "" {
+					facts.SignalUsages = append(facts.SignalUsages, SignalUsage{
+						Signal:       baseSig,
+						InPortMap:    true,
+						InstanceName: inst.Name,
+						Line:         inst.Line,
+					})
+				}
+			}
+		}
 	}
 
 	// Add processes with generate scope
@@ -3208,4 +3239,37 @@ func estimateSignalWidth(typeStr string) int {
 
 	// Unknown type - assume single bit to avoid false positives
 	return 1
+}
+
+// extractBaseSignalName extracts the base signal name from an expression
+// Examples: "sig" -> "sig", "sig(0)" -> "sig", "sig(7 downto 0)" -> "sig"
+// Returns empty string for complex expressions or literals
+func extractBaseSignalName(expr string) string {
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return ""
+	}
+
+	// Skip literals and keywords
+	if strings.HasPrefix(expr, "'") || strings.HasPrefix(expr, "\"") {
+		return ""
+	}
+	exprLower := strings.ToLower(expr)
+	if exprLower == "open" || exprLower == "others" {
+		return ""
+	}
+
+	// Handle indexed/sliced: sig(index) or sig(high downto low)
+	if parenIdx := strings.Index(expr, "("); parenIdx > 0 {
+		return expr[:parenIdx]
+	}
+
+	// Handle selected: sig.field - return full path as it may be the signal
+	// But if it contains multiple dots, it's likely a qualified name
+	if strings.Count(expr, ".") > 1 {
+		return ""
+	}
+
+	// Simple identifier or record.field
+	return expr
 }

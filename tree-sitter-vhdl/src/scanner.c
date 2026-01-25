@@ -30,6 +30,7 @@
 // Token types we handle - must match order in grammar.js externals array
 enum TokenType {
     BIT_STRING_LITERAL,
+    INVALID_BIT_STRING_LITERAL,
 };
 
 /**
@@ -91,6 +92,18 @@ static bool is_decimal_digit(int32_t c) {
     return (c >= '0' && c <= '9') || c == '_';
 }
 
+static bool is_base_specifier(int32_t c) {
+    return c == 'B' || c == 'b' ||
+           c == 'O' || c == 'o' ||
+           c == 'X' || c == 'x' ||
+           c == 'D' || c == 'd';
+}
+
+static bool is_signedness(int32_t c) {
+    return c == 'S' || c == 's' ||
+           c == 'U' || c == 'u';
+}
+
 /**
  * Main scanning function - called by Tree-sitter for each token
  *
@@ -104,8 +117,8 @@ bool tree_sitter_vhdl_external_scanner_scan(
     TSLexer *lexer,
     const bool *valid_symbols
 ) {
-    // Only try to match if bit_string_literal is valid at this position
-    if (!valid_symbols[BIT_STRING_LITERAL]) {
+    // Only try to match if a bit-string token is valid at this position
+    if (!valid_symbols[BIT_STRING_LITERAL] && !valid_symbols[INVALID_BIT_STRING_LITERAL]) {
         return false;
     }
 
@@ -115,41 +128,88 @@ bool tree_sitter_vhdl_external_scanner_scan(
         lexer->advance(lexer, true);  // true = skip
     }
 
-    // Check for bit string prefix: X, x, B, b, O, o
+    // Check for bit string prefix with optional size and signedness
     int32_t prefix = lexer->lookahead;
     bool (*digit_check)(int32_t) = NULL;
+    bool saw_size = false;
+    bool saw_sign = false;
 
     if (prefix >= '0' && prefix <= '9') {
         // Sized bit string literal: <size>[s|u]<base>"..."
         while (is_decimal_digit(lexer->lookahead)) {
             lexer->advance(lexer, false);
         }
+        saw_size = true;
         if (lexer->lookahead == 's' || lexer->lookahead == 'S' ||
             lexer->lookahead == 'u' || lexer->lookahead == 'U') {
             lexer->advance(lexer, false);
+            saw_sign = true;
         }
+        prefix = lexer->lookahead;
+    } else if (lexer->lookahead == 's' || lexer->lookahead == 'S' ||
+               lexer->lookahead == 'u' || lexer->lookahead == 'U') {
+        // Unsized signedness prefix: sX"..." or uB"..."
+        lexer->advance(lexer, false);
+        saw_sign = true;
         prefix = lexer->lookahead;
     }
 
-    if (prefix == 'X' || prefix == 'x') {
-        digit_check = is_hex_digit;
-    } else if (prefix == 'B' || prefix == 'b') {
-        digit_check = is_binary_digit;
-    } else if (prefix == 'O' || prefix == 'o') {
-        digit_check = is_octal_digit;
-    } else if (prefix == 'D' || prefix == 'd') {
-        digit_check = is_decimal_digit;
-    } else {
-        return false;  // Not a bit string literal
+    if (!iswalpha(prefix)) {
+        return false;
     }
 
-    // Consume the prefix
+    // Consume the first prefix letter
     lexer->advance(lexer, false);
+
+    int32_t prefix2 = 0;
+    if (iswalpha(lexer->lookahead)) {
+        prefix2 = lexer->lookahead;
+        lexer->advance(lexer, false);
+    }
 
     // Must be followed by opening quote or percent delimiter
     int32_t delimiter = lexer->lookahead;
     if (delimiter != '"' && delimiter != '%') {
         return false;  // Not a bit string literal, let normal lexer handle
+    }
+
+    bool valid = false;
+    int32_t base = 0;
+
+    if (saw_sign) {
+        // Signedness already consumed: next must be a single base letter
+        if (is_base_specifier(prefix) && prefix2 == 0) {
+            valid = true;
+            base = prefix;
+        }
+    } else {
+        if (prefix2 == 0) {
+            if (is_base_specifier(prefix)) {
+                valid = true;
+                base = prefix;
+            }
+        } else if (!saw_size && is_signedness(prefix) && is_base_specifier(prefix2)) {
+            // Unsized signedness prefix: sX"..." or uB"..."
+            valid = true;
+            base = prefix2;
+        }
+    }
+
+    if (valid) {
+        if (!valid_symbols[BIT_STRING_LITERAL]) {
+            return false;
+        }
+        if (base == 'X' || base == 'x') {
+            digit_check = is_hex_digit;
+        } else if (base == 'B' || base == 'b') {
+            digit_check = is_binary_digit;
+        } else if (base == 'O' || base == 'o') {
+            digit_check = is_octal_digit;
+        } else if (base == 'D' || base == 'd') {
+            digit_check = is_decimal_digit;
+        }
+    } else if (!valid_symbols[INVALID_BIT_STRING_LITERAL]) {
+        return false;
     }
 
     // Mark the end of the token so far (the prefix)
@@ -161,7 +221,7 @@ bool tree_sitter_vhdl_external_scanner_scan(
 
     // Consume digits until closing delimiter
     while (lexer->lookahead != delimiter && lexer->lookahead != 0) {
-        if (!digit_check(lexer->lookahead)) {
+        if (digit_check != NULL && !digit_check(lexer->lookahead)) {
             // Invalid digit for this base - still consume to closing quote
             // This allows for better error recovery
         }
@@ -180,7 +240,7 @@ bool tree_sitter_vhdl_external_scanner_scan(
     lexer->mark_end(lexer);
 
     // Set the token type
-    lexer->result_symbol = BIT_STRING_LITERAL;
+    lexer->result_symbol = valid ? BIT_STRING_LITERAL : INVALID_BIT_STRING_LITERAL;
 
     return true;  // Successfully matched!
 }

@@ -666,6 +666,7 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 		ArithmeticOps: []policy.ArithmeticOp{},
 		SignalDeps:    []policy.SignalDep{},
 		CDCCrossings:  []policy.CDCCrossing{},
+		SignalUsages:  []policy.SignalUsage{},
 		// Configuration
 		LintConfig: policy.LintRuleConfig{
 			Rules: idx.Config.Lint.Rules,
@@ -929,6 +930,19 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 				File:           cdc.File,
 				Line:           cdc.Line,
 				InArch:         cdc.InArch,
+			})
+		}
+
+		// Signal usages: tracking reads, writes, and port map connections
+		for _, usage := range facts.SignalUsages {
+			input.SignalUsages = append(input.SignalUsages, policy.SignalUsage{
+				Signal:       usage.Signal,
+				IsRead:       usage.IsRead,
+				IsWritten:    usage.IsWritten,
+				InProcess:    usage.InProcess,
+				InPortMap:    usage.InPortMap,
+				InstanceName: usage.InstanceName,
+				Line:         usage.Line,
 			})
 		}
 
