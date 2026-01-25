@@ -1459,6 +1459,8 @@ func (e *Extractor) extractExpressionSignal(node *sitter.Node, source []byte) st
 }
 
 // isLiteralNode checks if a node represents a literal value
+// Note: bit_string_literal is handled by the external scanner (src/scanner.c)
+// so it appears as a proper node type, no need to check content
 func isLiteralNode(node *sitter.Node) bool {
 	if node == nil {
 		return false
@@ -1466,7 +1468,7 @@ func isLiteralNode(node *sitter.Node) bool {
 
 	nodeType := node.Type()
 
-	// Direct literal types
+	// Direct literal types (bit_string_literal from external scanner)
 	literalTypes := []string{"number", "character_literal", "bit_string_literal", "string_literal"}
 	for _, lt := range literalTypes {
 		if nodeType == lt {
@@ -1474,16 +1476,7 @@ func isLiteralNode(node *sitter.Node) bool {
 		}
 	}
 
-	// Check content for hex/binary literals (X"...", B"...")
-	content := node.Content(nil)
-	if len(content) > 2 {
-		prefix := strings.ToUpper(string(content[0]))
-		if (prefix == "X" || prefix == "B" || prefix == "O") && content[1] == '"' {
-			return true
-		}
-	}
-
-	// Check first child
+	// Check first child (for wrapped literals)
 	if node.ChildCount() > 0 {
 		return isLiteralNode(node.Child(0))
 	}
