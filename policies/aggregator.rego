@@ -19,6 +19,7 @@ import data.vhdl.hierarchy
 import data.vhdl.quality
 import data.vhdl.synthesis
 import data.vhdl.testbench
+import data.vhdl.latch
 # Advanced static analysis modules
 import data.vhdl.security
 import data.vhdl.rdc
@@ -80,6 +81,9 @@ synthesis_violations := synthesis.violations
 # Testbench rules
 testbench_violations := testbench.violations
 
+# Latch inference detection rules
+latch_violations := latch.violations
+
 # =============================================================================
 # Advanced Static Analysis ("God-Tier" Rules)
 # =============================================================================
@@ -98,7 +102,7 @@ power_violations := power.violations
 # =============================================================================
 
 # Raw violations from all modules before filtering
-raw_violations := core_violations | sensitivity_violations | clock_reset_violations | signal_violations | port_violations | instance_violations | style_violations | naming_violations | process_violations | type_violations | fsm_violations | combinational_violations | sequential_violations | hierarchy_violations | quality_violations | synthesis_violations | testbench_violations | security_violations | rdc_violations | power_violations
+raw_violations := core_violations | sensitivity_violations | clock_reset_violations | signal_violations | port_violations | instance_violations | style_violations | naming_violations | process_violations | type_violations | fsm_violations | combinational_violations | sequential_violations | hierarchy_violations | quality_violations | synthesis_violations | testbench_violations | latch_violations | security_violations | rdc_violations | power_violations
 
 # Filter out:
 # 1. Violations for rules that are disabled (severity == "off")
@@ -163,6 +167,7 @@ summary := {
         "quality": count(quality_violations),
         "synthesis": count(synthesis_violations),
         "testbench": count(testbench_violations),
+        "latch": count(latch_violations),
         # Advanced static analysis
         "security": count(security_violations),
         "rdc": count(rdc_violations),
@@ -260,6 +265,14 @@ optional_rules := {
         "testbench_with_ports - TB entity has ports",
         "mismatched_tb_architecture - TB arch name mismatch",
         "tb_with_synth_arch - TB with RTL architecture name"
+    ],
+    # Latch inference detection
+    "latch.optional_violations": [
+        "combinational_incomplete_assignment - Signal read and written in comb process",
+        "conditional_assignment_review - Verify conditional has else clause",
+        "selected_assignment_review - Verify selected has when others",
+        "combinational_default_values - Suggest default values at process start",
+        "fsm_no_reset_state - State signal without reset"
     ],
     # Security (hardware trojan detection)
     "security.optional_violations": [

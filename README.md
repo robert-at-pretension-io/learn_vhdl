@@ -67,7 +67,7 @@ This stack transforms VHDL from "text files" into a "queryable database," enabli
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                    OPA Policy Engine (policies/*.rego)                   │
 │                    - Declarative compliance rules                        │
-│                    - Naming conventions, unresolved deps                 │
+│                    - Latch detection, sensitivity analysis               │
 │                    - Extensible rule packs                               │
 └─────────────────────────────────────────────────────────────────────────┘
                                     │
@@ -613,13 +613,13 @@ These constructs cause parse failures in production code:
 
 Based on impact analysis, these are the highest-value improvements ranked by ROI:
 
-| Rank | Task | Impact | Blocking |
-|------|------|--------|----------|
-| **#1** | **Type System & Function Extraction** | Enables type-aware rules, width checking | Latch detection, overload resolution |
-| **#2** | **Latch Inference Detection** | Critical synthesis rule | Needs type info for proper detection |
-| **#3** | **Package Contents Indexing** | Complete cross-file resolution | Type lookups, constant evaluation |
-| **#4** | **Generate Elaboration** | Evaluate for-generate ranges | Instance counting, signal tracing |
-| **#5** | **CDC Enhancement** | Clock domain crossing analysis | Multi-clock designs |
+| Rank | Task | Impact | Status |
+|------|------|--------|--------|
+| **#1** | **Type System & Function Extraction** | Enables type-aware rules, width checking | ✅ IMPLEMENTED |
+| **#2** | **Latch Inference Detection** | Critical synthesis rule | ✅ IMPLEMENTED |
+| **#3** | **Package Contents Indexing** | Complete cross-file resolution | Partial (types extracted) |
+| **#4** | **Generate Elaboration** | Evaluate for-generate ranges | Pending |
+| **#5** | **CDC Enhancement** | Clock domain crossing analysis | Pending |
 
 ### Phase 1: Grammar Completion (Current Focus)
 - [x] 98.75% valid acceptance rate
@@ -634,17 +634,21 @@ Based on impact analysis, these are the highest-value improvements ranked by ROI
 - [ ] Package contents indexing
 - [ ] Library-qualified name resolution
 
-### Phase 3: Type System (HIGH PRIORITY)
-- [ ] Function/procedure extraction with signatures
-- [ ] Type declaration extraction (records, enums, arrays)
-- [ ] Constant extraction with values
-- [ ] Type signature storage in indexer
-- [ ] Overload resolution
-- [ ] Type compatibility checking
-- [ ] Width validation
+### Phase 3: Type System ✅ IMPLEMENTED
+- [x] Function/procedure extraction with signatures
+- [x] Type declaration extraction (records, enums, arrays)
+- [x] Subtype declaration extraction
+- [x] Parameter extraction (direction, type, class, default)
+- [ ] Overload resolution (future)
+- [ ] Type compatibility checking (future)
+- [ ] Width validation (future)
 
 ### Phase 4: Advanced Analysis
-- [ ] Latch inference detection
+- [x] Latch inference detection ✅ IMPLEMENTED
+  - Incomplete case statements (missing `when others`)
+  - Enum case without full coverage (uses type system!)
+  - Combinational process feedback detection
+  - FSM state signals without reset
 - [ ] Clock domain crossing analysis
 - [ ] Multi-driver detection
 - [ ] FSM extraction and completeness checking
@@ -664,9 +668,11 @@ Based on impact analysis, these are the highest-value improvements ranked by ROI
 - [ ] Configuration specifications
 
 ### Extractors
-- [ ] Function/procedure signatures with parameter types
-- [ ] Package contents (types, constants, functions)
-- [ ] Generate instance scopes with local signals
+- [x] Function/procedure signatures with parameter types
+- [x] Type declarations (enum, record, array, physical, range)
+- [x] Subtype declarations with constraints
+- [x] Generate instance scopes with local signals
+- [ ] Package contents indexing in symbol table
 - [ ] FSM state/transition extraction
 - [ ] Attribute expressions (`'range`, `'length`, `'high`, `'low`)
 
