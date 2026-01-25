@@ -126,8 +126,52 @@ open_port_connection[violation] {
     }
 }
 
+# Rule: Input port of instantiated entity not connected
+# This catches missing connections that will cause synthesis errors or undefined behavior
+floating_instance_input[violation] {
+    inst := input.instances[_]
+    # Find the entity being instantiated
+    entity := input.entities[_]
+    inst_target_lower := lower(inst.target)
+    # Match either "entity_name" or "lib.entity_name"
+    target_matches_entity(inst_target_lower, lower(entity.name))
+    # Find input ports of that entity
+    port := entity.ports[_]
+    port.direction == "in"
+    # Check if this port is connected in the instance
+    not port_connected_in_instance(inst, port.name)
+    # Exclude clock and reset (often connected at top level or generated)
+    not helpers.is_clock_name(port.name)
+    not helpers.is_reset_name(port.name)
+    violation := {
+        "rule": "floating_instance_input",
+        "severity": "error",
+        "file": inst.file,
+        "line": inst.line,
+        "message": sprintf("Instance '%s' has unconnected input port '%s' from entity '%s'", [inst.name, port.name, entity.name])
+    }
+}
+
+# Helper: Check if instance target matches entity name
+target_matches_entity(target, entity_name) {
+    target == entity_name
+}
+target_matches_entity(target, entity_name) {
+    endswith(target, concat(".", [entity_name]))
+}
+
+# Helper: Check if port is connected in instance port map
+port_connected_in_instance(inst, port_name) {
+    _ = inst.port_map[port_name]
+}
+port_connected_in_instance(inst, port_name) {
+    # Also check case-insensitive
+    key := inst.port_map[k]
+    lower(k) == lower(port_name)
+}
+
 # Aggregate hierarchy violations
-violations := empty_port_map
+violations := empty_port_map | floating_instance_input
 
 # Optional violations (mostly informational)
 optional_violations := sparse_port_map | instance_name_matches_component | repeated_component_instantiation | many_instances | hardcoded_port_value | open_port_connection

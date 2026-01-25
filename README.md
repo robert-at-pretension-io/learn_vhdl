@@ -712,6 +712,110 @@ Based on impact analysis, these are the highest-value improvements ranked by ROI
 
 ---
 
+## Product Roadmap: High-Value Rules
+
+Rules prioritized by customer value and implementation effort. Focus is on rules that catch real bugs and save engineering time.
+
+### Tier 1: Synthesis Correctness (Immediate Value)
+
+These rules catch bugs that break synthesis or cause hardware failures. **Status: Implementation in progress.**
+
+| Rule | Severity | Description | Data Required |
+|------|----------|-------------|---------------|
+| `multi_driver` | Error | Two processes/assignments driving same signal | `processes.assigned_signals`, `concurrent_assignments` |
+| `floating_input` | Error | Input port not connected in instantiation | `instances.port_map`, `entities.ports` |
+| `dead_signal` | Warning | Signal declared but never read anywhere | `signals`, `processes.read_signals` |
+| `unregistered_output` | Warning | Output port driven by combinational logic | `ports`, `processes.is_sequential` |
+| `file_entity_mismatch` | Info | Filename doesn't match entity name | `entities.name`, `entities.file` |
+
+### Tier 2: Design Quality (Medium Effort, High Value)
+
+These rules improve design reliability and catch subtle bugs. **Status: Planned.**
+
+| Rule | Severity | Description | Implementation Notes |
+|------|----------|-------------|---------------------|
+| `combinational_loop` | Error | Cycle in combinational logic (simulation hangs) | Build dependency graph from `signal_deps`, detect cycles using DFS |
+| `fsm_unreachable_state` | Warning | FSM state that can never be reached | Extract state transitions from case statements, build reachability graph |
+| `fsm_no_default_state` | Warning | FSM without default/others handler | Check case statements on enum-typed signals |
+| `fsm_deadlock` | Error | FSM state with no exit transitions | Analyze state transition graph for sink nodes |
+| `sequential_no_reset` | Warning | Sequential process without reset logic | Check `processes.is_sequential && !processes.has_reset` |
+| `async_reset_no_sync` | Warning | Async reset used without synchronizer | Cross-reference reset signals with CDC analysis |
+| `wide_bus_no_handshake` | Warning | Wide bus crossing clock domains | Combine CDC + bit width analysis |
+
+#### Tier 2 Implementation Details
+
+**Combinational Loop Detection:**
+```
+Algorithm:
+1. Build directed graph: signal -> signals it depends on (from signal_deps where is_sequential=false)
+2. Run DFS from each node
+3. If we revisit a node in current path = cycle found
+4. Report all signals in the cycle
+
+Example violation:
+  a <= b and c;
+  b <= a or d;    -- Loop: a -> b -> a
+```
+
+**FSM Analysis:**
+```
+Algorithm:
+1. Identify state signals: enum-typed signals assigned in sequential processes
+2. Extract transitions: parse case statements on state signal
+   - Each "when STATE_X =>" branch defines transitions
+   - Look for "next_state <= STATE_Y" patterns
+3. Build state transition graph
+4. Check:
+   - Reachability: BFS from reset state, unreached = unreachable
+   - Deadlock: States with no outgoing transitions (except terminal states)
+   - Completeness: All enum values appear in case choices
+```
+
+**Reset Coverage Analysis:**
+```
+Algorithm:
+1. For each sequential process:
+   - If has_reset=false: flag as sequential_no_reset
+   - If has_reset=true but reset_async=true:
+     - Check if reset signal is in CDC crossing list
+     - If crossing domains without sync: flag as async_reset_no_sync
+2. Report missing reset for specific signals:
+   - Track which signals are assigned in reset branch vs clock branch
+   - Signals only in clock branch = partial reset coverage
+```
+
+### Tier 3: Safety-Critical Compliance (Enterprise Value)
+
+For DO-254 (aerospace), ISO 26262 (automotive), IEC 62304 (medical). **Status: Future.**
+
+| Rule Pack | Target Industry | Key Rules |
+|-----------|-----------------|-----------|
+| DO-254 | Aerospace | Dead code, unreachable states, defensive coding, traceability |
+| ISO 26262 | Automotive | Fault detection, safe states, diagnostic coverage |
+| MISRA-VHDL | General safety | Coding style, complexity limits, explicit typing |
+
+### Implementation Priority
+
+```
+Week 1: Tier 1 (5 rules)
+  [x] multi_driver - catches synthesis errors
+  [x] dead_signal - code cleanup
+  [x] floating_input - catches wiring bugs
+  [x] unregistered_output - timing closure
+  [x] file_entity_mismatch - best practice
+
+Week 2-3: Tier 2 (7 rules)
+  [ ] combinational_loop - simulation hangs
+  [ ] fsm_unreachable_state - dead code
+  [ ] fsm_no_default_state - robustness
+  [ ] fsm_deadlock - lockup bugs
+  [ ] sequential_no_reset - reliability
+  [ ] async_reset_no_sync - metastability
+  [ ] wide_bus_no_handshake - CDC correctness
+```
+
+---
+
 ## License
 
 MIT

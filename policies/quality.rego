@@ -189,8 +189,36 @@ trivial_architecture[violation] {
     }
 }
 
+# Rule: File name doesn't match entity name
+# Best practice: one entity per file, filename matches entity name
+file_entity_mismatch[violation] {
+    entity := input.entities[_]
+    filename := extract_filename(entity.file)
+    filename_lower := lower(filename)
+    entity_lower := lower(entity.name)
+    filename_lower != entity_lower
+    # Only flag if there's exactly one entity in the file (otherwise it's intentional multi-entity file)
+    entities_in_file := count([e | e := input.entities[_]; e.file == entity.file])
+    entities_in_file == 1
+    violation := {
+        "rule": "file_entity_mismatch",
+        "severity": "info",
+        "file": entity.file,
+        "line": entity.line,
+        "message": sprintf("Entity '%s' is in file '%s' - consider renaming file to '%s.vhd'", [entity.name, filename, entity.name])
+    }
+}
+
+# Helper: Extract filename without path and extension
+extract_filename(path) = name {
+    parts := split(path, "/")
+    file_with_ext := parts[count(parts) - 1]
+    # Remove .vhd or .vhdl extension
+    name := trim_suffix(trim_suffix(file_with_ext, ".vhd"), "l")
+} else = path
+
 # Aggregate quality violations
-violations := buffer_port | trivial_architecture
+violations := buffer_port | trivial_architecture | file_entity_mismatch
 
 # Optional violations (style preferences)
 optional_violations := very_long_file | large_package | short_signal_name | long_signal_name | short_port_name | entity_name_with_numbers | mixed_port_directions | bidirectional_port

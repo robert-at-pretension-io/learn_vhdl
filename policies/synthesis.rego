@@ -172,8 +172,52 @@ is_array_type(t) {
     regex.match(".*\\)\\s*\\(.*\\)", t)
 }
 
+# Rule: Output port driven by combinational logic (timing risk)
+# Unregistered outputs can cause timing closure issues
+unregistered_output[violation] {
+    port := input.ports[_]
+    port.direction == "out"
+    # Check if this output is driven by a sequential process
+    not output_driven_by_sequential(port.name)
+    # Must be driven by something (not just floating)
+    output_is_driven(port.name)
+    violation := {
+        "rule": "unregistered_output",
+        "severity": "warning",
+        "file": get_entity_file(port.in_entity),
+        "line": port.line,
+        "message": sprintf("Output port '%s' is driven by combinational logic - consider registering for timing closure", [port.name])
+    }
+}
+
+# Helper: Check if output is driven by sequential process
+output_driven_by_sequential(port_name) {
+    proc := input.processes[_]
+    proc.is_sequential == true
+    assigned := proc.assigned_signals[_]
+    lower(assigned) == lower(port_name)
+}
+
+# Helper: Check if output is driven at all
+output_is_driven(port_name) {
+    proc := input.processes[_]
+    assigned := proc.assigned_signals[_]
+    lower(assigned) == lower(port_name)
+}
+output_is_driven(port_name) {
+    ca := input.concurrent_assignments[_]
+    lower(ca.target) == lower(port_name)
+}
+
+# Helper: Get file for entity
+get_entity_file(entity_name) = file {
+    entity := input.entities[_]
+    lower(entity.name) == lower(entity_name)
+    file := entity.file
+} else = "unknown"
+
 # Aggregate synthesis violations
-violations := signal_crosses_clock_domain | gated_clock_detection
+violations := signal_crosses_clock_domain | gated_clock_detection | unregistered_output
 
 # Optional violations
 optional_violations := multiple_clock_domains | very_wide_bus | critical_signal_no_reset | combinational_reset | potential_memory_inference
