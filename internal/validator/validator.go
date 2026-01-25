@@ -1,5 +1,32 @@
 package validator
 
+// =============================================================================
+// VALIDATOR PHILOSOPHY: CRASH EARLY, CRASH LOUD
+// =============================================================================
+//
+// The CUE validator is the "contract guard" between Go and OPA.
+//
+// WHY THIS EXISTS:
+// Without validation, if a field name changes or a type is wrong:
+// - OPA silently receives `undefined`
+// - Rules don't fire
+// - You think your code is clean
+// - Silent bugs multiply
+//
+// With validation:
+// - Immediate crash with clear error
+// - "field 'assigned_signals' not allowed" tells you exactly what's wrong
+// - Fix the schema or the code, no guessing
+//
+// WHEN VALIDATION FAILS:
+// 1. DON'T suppress the error or add a workaround
+// 2. DON'T add fields to schema.cue without understanding why
+// 3. DO trace back: Is this a grammar bug? Extractor bug? Indexer bug?
+// 4. DO fix at the source (see AGENTS.md "The Grammar Improvement Cycle")
+//
+// The validator is the canary in the coal mine. When it complains, listen!
+// =============================================================================
+
 import (
 	"embed"
 	"encoding/json"

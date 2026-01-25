@@ -1,5 +1,24 @@
 # Combinational Logic Rules
 # Rules for detecting issues in combinational processes
+#
+# =============================================================================
+# POLICY PHILOSOPHY: FIX AT THE SOURCE
+# =============================================================================
+#
+# If these rules produce false positives, the problem is almost never the rule.
+#
+# WRONG: "combinational_feedback fires on 'downto' - add it to skip list"
+#        This means the grammar couldn't parse something, created an ERROR
+#        node, and "downto" leaked through as a signal name.
+#
+# RIGHT: Fix grammar.js so the construct parses cleanly, no ERROR nodes,
+#        and "downto" is recognized as a keyword, not a signal.
+#
+# Real combinational feedback IS a real problem. False positives mean our
+# extraction is broken, not that we need to weaken the rule.
+#
+# See: AGENTS.md "The Grammar Improvement Cycle"
+# =============================================================================
 package vhdl.combinational
 
 import data.vhdl.helpers
@@ -14,6 +33,8 @@ combinational_feedback[violation] {
     lower(assigned) == lower(read)
     not helpers.is_clock_name(assigned)
     not helpers.is_reset_name(assigned)
+    # Filter out false positives: enum literals, constants, functions
+    helpers.is_actual_signal(assigned)
     violation := {
         "rule": "combinational_feedback",
         "severity": "warning",
@@ -177,6 +198,8 @@ potential_comb_loop[violation] {
     lower(assigned) == lower(read)
     # Exclude common false positives
     not is_loop_false_positive(assigned)
+    # Filter out enum literals, constants, functions
+    helpers.is_actual_signal(assigned)
     violation := {
         "rule": "potential_combinational_loop",
         "severity": "warning",
@@ -215,6 +238,10 @@ cross_process_loop[violation] {
 
     lower(sig_a) == lower(sig_b2)  # proc1's output is proc2's input
     lower(sig_b) == lower(sig_a2)  # proc2's output is proc1's input
+
+    # Filter out enum literals, constants, functions
+    helpers.is_actual_signal(sig_a)
+    helpers.is_actual_signal(sig_b)
 
     # Only report once
     proc1.line < proc2.line

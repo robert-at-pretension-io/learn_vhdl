@@ -89,6 +89,10 @@ This stack transforms VHDL from "text files" into a "queryable database," enabli
 | VHDL 2008 Compliance-Tests | 100% (29/29) |
 | IEEE 1076-2008 | 70.21% (132/188) |
 
+**Grammar Lessons:**
+- Prefer deferred decisions for VHDL "syntactic homonyms" like `name(0)`; unify names instead of guessing array vs call.
+- Avoid local-maximum hacks that only improve a narrow test set; aim for abstractions that generalize.
+
 ### 2. Go Extractor (`internal/extractor/`)
 
 **Role:** Extract semantic facts from syntax trees.
@@ -234,6 +238,66 @@ RIGHT: Fix grammar to properly parse exponentiation with function calls.
 3. Fix the grammar rule in `grammar.js`
 4. Regenerate and rebuild
 
+### The Grammar Improvement Cycle
+
+Grammar development follows a tight iterative loop:
+
+```
+┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
+│ ./test_grammar.sh│────▶│ Find ERROR nodes │────▶│ Fix grammar.js   │
+│ (measure)        │     │ (identify)       │     │ (improve)        │
+└──────────────────┘     └──────────────────┘     └────────┬─────────┘
+        ▲                                                   │
+        │                                                   ▼
+        │                                         ┌──────────────────┐
+        │                                         │ npx tree-sitter  │
+        │                                         │ generate         │
+        │                                         └────────┬─────────┘
+        │                                                   │
+        │                                                   ▼
+        │                                         ┌──────────────────┐
+        └─────────────────────────────────────────│ go build         │
+                                                  │ (rebuild linter) │
+                                                  └──────────────────┘
+```
+
+**Step 1: Measure baseline**
+```bash
+# Test against all external VHDL projects
+./test_grammar.sh external_tests
+
+# Output shows pass rate:
+# Total: 1247, Pass: 1089, Fail: 158, Score: 87.33%
+```
+
+**Step 2: Find what's failing**
+```bash
+# See ERROR nodes in a specific file
+cd tree-sitter-vhdl
+npx tree-sitter parse ../external_tests/neorv32/rtl/core/neorv32_cpu.vhd 2>&1 | grep ERROR
+```
+
+**Step 3: Fix the grammar**
+```bash
+# Edit grammar rule
+vim grammar.js
+
+# Regenerate parser
+npx tree-sitter generate
+
+# Quick test - ERROR should be gone
+npx tree-sitter parse ../external_tests/neorv32/rtl/core/neorv32_cpu.vhd 2>&1 | grep ERROR
+```
+
+**Step 4: Rebuild and verify**
+```bash
+cd ..
+go build -o vhdl-lint ./cmd/vhdl-lint
+./test_grammar.sh external_tests  # Score should improve!
+```
+
+**Step 5: Repeat** until pass rate is acceptable.
+
 ### Development Commands
 
 ```bash
@@ -243,15 +307,44 @@ vim tree-sitter-vhdl/grammar.js
 # Regenerate parser
 cd tree-sitter-vhdl && npx tree-sitter generate
 
-# Rebuild Go bindings (important!)
-cd bindings/go && go build .
+# Rebuild Go linter (picks up new parser)
+go build -o vhdl-lint ./cmd/vhdl-lint
 
-# Test against compliance suite
-./test_grammar.sh external_tests/vhdl-tests/ieee-1076-2008
+# Test grammar against external projects
+./test_grammar.sh external_tests
+
+# Test against specific project
+./test_grammar.sh external_tests/neorv32
+
+# Limit to first N files (faster iteration)
+./test_grammar.sh external_tests 50
 
 # Check a specific file for ERROR nodes
+cd tree-sitter-vhdl
 npx tree-sitter parse /path/to/file.vhd 2>&1 | grep ERROR
+
+# Full parse tree for debugging
+npx tree-sitter parse /path/to/file.vhd > /tmp/tree.txt
 ```
+
+### Common ERROR Patterns
+
+| ERROR near | Likely cause | Where to fix |
+|------------|--------------|--------------|
+| `<=` | Signal assignment target | `_simple_signal_assignment` |
+| `when ... else` | Conditional expression | `_conditional_signal_assignment` |
+| `generate` | Generate statement | `generate_statement` |
+| `'attr` | Attribute expression | `attribute_name` |
+| `**` | Exponentiation | Operator precedence |
+| `(others => '0')` | Aggregate | `_aggregate` rules |
+
+### Lessons Learned (Keep These Handy)
+
+- Treat `external_tests` results as signal, not verdict. Most failures are grammar gaps, not bugs in real-world code.
+- Use `ANALYZE=1 ./test_grammar.sh` to see the most common failing constructs before changing anything.
+- Exclude known anti-tests (`non_compliant`, `negative`, `analyzer_failure`) from the pass rate, but still review them when debugging.
+- Prefer fixing parse ambiguity with minimal conflicts; avoid broad fallback rules unless you also re-run `test_grammar.sh`.
+- If `npx tree-sitter generate` panics, run `npm run build` in `tree-sitter-vhdl/` (uses the pinned CLI).
 
 ---
 
@@ -321,14 +414,52 @@ npx tree-sitter parse ../external_tests/neorv32/rtl/core/neorv32_top.vhd 2>&1 | 
 
 ### The Improvement Loop
 
-1. Run on external_tests, collect violations
-2. Investigate each - is it real or false positive?
-3. For false positives, find what we're missing:
-   - Grammar not parsing a construct? Fix `grammar.js`
-   - Extraction missing a pattern? Fix extractor
-   - Policy too strict? Adjust Rego rules
-4. Verify - false positives should decrease
-5. Repeat until acceptable accuracy
+**Phase 1: Grammar (fix parsing first)**
+```bash
+# 1. Run grammar tests to see baseline
+./test_grammar.sh external_tests/neorv32
+
+# 2. Find files with ERROR nodes
+cd tree-sitter-vhdl
+npx tree-sitter parse ../external_tests/neorv32/rtl/core/neorv32_cpu.vhd 2>&1 | grep ERROR
+
+# 3. Identify the VHDL construct causing the ERROR
+# 4. Fix grammar.js to handle that construct
+# 5. Regenerate: npx tree-sitter generate
+# 6. Verify ERROR is gone
+# 7. Rebuild Go: go build -o vhdl-lint ./cmd/vhdl-lint
+# 8. Repeat until pass rate improves
+```
+
+**Phase 2: Extraction (once parsing is clean)**
+```bash
+# Run linter and look at violations
+./vhdl-lint external_tests/neorv32/rtl/core/
+
+# For each violation, ask:
+# - Is this a real bug? (unlikely for production code)
+# - Or is extraction missing something?
+
+# Common extraction gaps:
+# - Signal used in generate statement not tracked
+# - Port map associations not extracted
+# - Record field access not handled
+```
+
+**Phase 3: Policy (tune false positive rate)**
+```bash
+# If extraction is correct but policy is too strict:
+# - Adjust Rego rules in policies/*.rego
+# - Add exceptions for known-good patterns
+# - Filter out enum literals, constants, keywords
+```
+
+**The Golden Rule:** Fix issues at the lowest level possible:
+1. Grammar issues -> fix grammar.js
+2. Extraction issues -> fix extractor
+3. Only then -> adjust policies
+
+Never add workarounds in policies for grammar/extraction bugs!
 
 ---
 

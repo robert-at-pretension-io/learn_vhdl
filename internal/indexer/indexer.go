@@ -1,5 +1,29 @@
 package indexer
 
+// =============================================================================
+// INDEXER PHILOSOPHY: TRUST THE EXTRACTOR, VALIDATE WITH CUE
+// =============================================================================
+//
+// The indexer sits between extraction and policy evaluation. Its job is to:
+// 1. Aggregate facts from multiple files into a unified view
+// 2. Build the cross-file symbol table
+// 3. Resolve dependencies between files
+// 4. Prepare normalized data for OPA policy evaluation
+//
+// IMPORTANT: The indexer should NOT work around extraction bugs!
+//
+// If the indexer needs to "fix" or "clean up" extracted data, that's a sign
+// that either:
+// - The GRAMMAR is missing a construct (fix grammar.js first!)
+// - The EXTRACTOR is missing logic (fix extractor.go second!)
+//
+// The CUE validator (internal/validator) catches schema mismatches between
+// what we produce here and what OPA expects. If validation fails, it means
+// our contract is broken - fix the source, don't suppress the error.
+//
+// See: AGENTS.md "The Grammar Improvement Cycle"
+// =============================================================================
+
 import (
 	"fmt"
 	"os"
@@ -309,6 +333,9 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 		CaseStatements:        []policy.CaseStatement{},
 		Processes:             []policy.Process{},
 		ConcurrentAssignments: []policy.ConcurrentAssignment{},
+		// Type system info for filtering
+		EnumLiterals: []string{},
+		Constants:    []string{},
 		// Advanced analysis
 		Comparisons:   []policy.Comparison{},
 		ArithmeticOps: []policy.ArithmeticOp{},
@@ -539,6 +566,10 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 				InArch:       dep.InArch,
 			})
 		}
+
+		// Type system info: collect enum literals and constants for filtering
+		input.EnumLiterals = append(input.EnumLiterals, facts.EnumLiterals...)
+		input.Constants = append(input.Constants, facts.Constants...)
 	}
 
 	// Add symbols

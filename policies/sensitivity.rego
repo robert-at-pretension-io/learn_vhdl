@@ -1,5 +1,32 @@
 # Sensitivity List Rules
 # Rules for detecting simulation/synthesis mismatches due to incomplete sensitivity lists
+#
+# =============================================================================
+# POLICY PHILOSOPHY: SENSITIVITY LIST ACCURACY DEPENDS ON EXTRACTION
+# =============================================================================
+#
+# These rules compare process sensitivity lists against extracted read_signals.
+# False positives here usually mean EXTRACTION is wrong, not the rule.
+#
+# COMMON FALSE POSITIVE PATTERNS:
+#
+# 1. "Signal 'downto' read but missing from sensitivity list"
+#    → Grammar ERROR node; "downto" keyword leaked into signal list
+#    → FIX: Improve grammar.js to parse the failing construct
+#
+# 2. "Signal 'ctrl_i' read but missing from sensitivity list"
+#    → Grammar can't parse `ctrl_i.field`, creates ERROR, misses the read
+#    → FIX: Improve grammar.js to handle selected_name in that context
+#
+# 3. "Signal 'x' in sensitivity but never read"
+#    → Extractor misses read in complex expression (aggregate, generate)
+#    → FIX: Update extractor to handle that expression type
+#
+# The helpers.is_skip_name() function filters LEGITIMATE false positives
+# (constants, loop vars, types). Don't abuse it to work around parsing bugs!
+#
+# See: AGENTS.md "The Grammar Improvement Cycle"
+# =============================================================================
 package vhdl.sensitivity
 
 import data.vhdl.helpers

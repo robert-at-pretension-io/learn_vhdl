@@ -65,6 +65,15 @@ npx tree-sitter parse file.vhd 2>&1 | grep ERROR
 npx tree-sitter parse file.vhd
 ```
 
+#### Recent Lessons & Advice
+
+- Use `ANALYZE=1 ./test_grammar.sh` to identify the top failing constructs before editing grammar.
+- Exclude anti-tests (`*/non_compliant/*`, `*/negative/*`, `*/analyzer_failure/*`) from the score, but still inspect them for grammar clues.
+- Favor minimal `conflicts` additions over broad regex fallbacks; re-run `test_grammar.sh` after each change.
+- If `npx tree-sitter generate` panics, run `npm run build` in `tree-sitter-vhdl/` (pinned CLI).
+- Prefer deferred decisions for VHDL "syntactic homonyms" like `name(0)`; unify names instead of guessing array vs call.
+- Avoid local-maximum hacks that only improve a narrow test set; aim for abstractions that generalize.
+
 ### Phase 2: The Extractor (Go)
 
 * **The Goal:** Transform syntax trees into semantic facts.
@@ -219,6 +228,165 @@ This is the tight feedback loop for learning:
 7. **Add CUE schema** if new data types are introduced
 8. **Add OPA rules** to check for violations
 9. **Repeat** - each cycle teaches you more VHDL
+
+---
+
+## The Grammar Improvement Cycle
+
+The grammar is the foundation of everything. When it can't parse a construct, ERROR nodes propagate through the entire pipeline causing false positives. Here's the systematic approach to improving it:
+
+### Step 1: Measure Current State
+
+```bash
+# Run against all external tests to get baseline
+./test_grammar.sh external_tests
+
+# Or test specific project
+./test_grammar.sh external_tests/neorv32
+
+# Or limit to first N files for quick iteration
+./test_grammar.sh external_tests 50
+```
+
+Example output:
+```
+Testing against files in: external_tests
+Progress: 500 files tested (423 pass, 77 fail)
+Progress: 1000 files tested (891 pass, 109 fail)
+
+=== Results ===
+Total:  1247
+Pass:   1089
+Fail:   158
+Score:  87.33%
+```
+
+### Step 2: Find Failing Files
+
+```bash
+# Find files that fail to parse cleanly
+for f in $(find external_tests/neorv32 -name "*.vhd"); do
+  if ! npx tree-sitter parse "$f" 2>&1 | grep -q ERROR; then
+    echo "PASS: $f"
+  else
+    echo "FAIL: $f"
+  fi
+done
+```
+
+### Step 3: Identify the Problem
+
+```bash
+# See ERROR nodes in a specific file
+cd tree-sitter-vhdl
+npx tree-sitter parse ../external_tests/neorv32/rtl/core/neorv32_cpu_control.vhd 2>&1 | grep -A2 ERROR
+
+# Get full parse tree for detailed analysis
+npx tree-sitter parse ../external_tests/neorv32/rtl/core/neorv32_cpu_control.vhd > /tmp/tree.txt
+
+# Find the exact line causing issues
+npx tree-sitter parse ../external_tests/neorv32/rtl/core/neorv32_cpu_control.vhd 2>&1 | grep "ERROR" | head -5
+```
+
+### Step 4: Fix the Grammar
+
+```bash
+# Edit the grammar
+vim grammar.js
+
+# Regenerate the parser (creates src/parser.c)
+npx tree-sitter generate
+
+# Quick test on the problem file
+npx tree-sitter parse ../external_tests/neorv32/rtl/core/neorv32_cpu_control.vhd 2>&1 | grep ERROR
+```
+
+### Step 5: Rebuild and Verify
+
+```bash
+# Go back to project root
+cd ..
+
+# Rebuild the Go linter (picks up new parser)
+go build -o vhdl-lint ./cmd/vhdl-lint
+
+# Re-run grammar tests
+./test_grammar.sh external_tests
+
+# Score should improve!
+```
+
+### Step 6: Iterate
+
+Repeat steps 2-5 until the pass rate improves. Common patterns to look for:
+
+| ERROR Pattern | Likely Grammar Issue |
+|---------------|---------------------|
+| `ERROR` around `<=` | Signal assignment target not matching |
+| `ERROR` around `when` | Conditional expression/assignment |
+| `ERROR` around `generate` | Generate statement handling |
+| `ERROR` around `'` | Attribute expression |
+| `ERROR` around `**` | Exponentiation operator |
+
+### The Full Workflow Diagram
+
+```
+                    ┌────────────────────┐
+                    │  ./test_grammar.sh │
+                    │  See pass rate     │
+                    └─────────┬──────────┘
+                              │
+                              ▼
+                    ┌────────────────────┐
+              ┌─────│  Pass rate OK?     │─────┐
+              │     └────────────────────┘     │
+              │ NO                             │ YES
+              ▼                                ▼
+    ┌────────────────────┐           ┌────────────────────┐
+    │ Find failing files │           │ Done! Commit       │
+    │ grep ERROR         │           │ grammar changes    │
+    └─────────┬──────────┘           └────────────────────┘
+              │
+              ▼
+    ┌────────────────────┐
+    │ Identify construct │
+    │ causing ERROR      │
+    └─────────┬──────────┘
+              │
+              ▼
+    ┌────────────────────┐
+    │ Edit grammar.js    │
+    │ Add/fix rule       │
+    └─────────┬──────────┘
+              │
+              ▼
+    ┌────────────────────┐
+    │ npx tree-sitter    │
+    │ generate           │
+    └─────────┬──────────┘
+              │
+              ▼
+    ┌────────────────────┐
+    │ Test problem file  │
+    │ ERROR gone?        │
+    └─────────┬──────────┘
+              │
+              ▼
+    ┌────────────────────┐
+    │ go build           │
+    │ ./cmd/vhdl-lint    │
+    └─────────┬──────────┘
+              │
+              └────────────────► (back to top)
+```
+
+### Tips for Grammar Development
+
+1. **Start small**: Fix one construct at a time, verify it works
+2. **Use precedence carefully**: `prec()`, `prec.left()`, `prec.right()`, `prec.dynamic()`
+3. **Check conflicts**: `npx tree-sitter generate` shows conflict warnings
+4. **Test incrementally**: Don't wait until you've made 10 changes to test
+5. **Read the failing code**: Sometimes the VHDL itself reveals what construct is missing
 
 ---
 

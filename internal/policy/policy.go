@@ -52,6 +52,9 @@ type Input struct {
 	CaseStatements        []CaseStatement        `json:"case_statements"`        // Case statements for latch detection
 	Processes             []Process              `json:"processes"`              // Process statements for sensitivity/clock analysis
 	ConcurrentAssignments []ConcurrentAssignment `json:"concurrent_assignments"` // Concurrent signal assignments (outside processes)
+	// Type system info for filtering false positives
+	EnumLiterals []string `json:"enum_literals"` // Enum literals from type declarations
+	Constants    []string `json:"constants"`     // Constants from constant declarations
 	// Advanced analysis for security/power/correctness
 	Comparisons   []Comparison   `json:"comparisons"`    // Comparisons for trojan/trigger detection
 	ArithmeticOps []ArithmeticOp `json:"arithmetic_ops"` // Expensive operations for power analysis

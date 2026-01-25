@@ -1,9 +1,50 @@
 # Signal Analysis Rules
 # Rules for signal usage: unused, undriven, multi-driven signals
 # Now includes concurrent assignment tracking for accurate analysis
+#
+# =============================================================================
+# POLICY PHILOSOPHY: RULES SHOULD BE SIMPLE, GRAMMAR SHOULD BE RICH
+# =============================================================================
+#
+# If you're adding complex filtering logic here (skip lists, keyword checks,
+# pattern matching to work around bad data), STOP and ask:
+#
+# "Is this a GRAMMAR or EXTRACTOR bug?"
+#
+# FALSE POSITIVES usually mean:
+# - Grammar has ERROR nodes → keywords leak into signal lists
+# - Extractor misses a construct → signals appear unread/unassigned
+#
+# DON'T: Add "downto", "others", "when" to skip lists here
+# DO:    Fix grammar.js so these never appear as signal names
+#
+# The helpers in helpers.rego (is_enum_literal, is_constant, is_skip_name)
+# are for LEGITIMATE filtering (enum literals, constants, loop variables),
+# NOT for working around parsing bugs.
+#
+# See: AGENTS.md "The Grammar Improvement Cycle"
+# =============================================================================
 package vhdl.signals
 
 import data.vhdl.helpers
+
+# Helper: Check if name is an enum literal (not a signal)
+is_enum_literal(name) {
+    lit := input.enum_literals[_]
+    lower(lit) == lower(name)
+}
+
+# Helper: Check if name is a constant (not a signal)
+is_constant(name) {
+    c := input.constants[_]
+    lower(c) == lower(name)
+}
+
+# Helper: Check if name is actually a signal (not enum/constant)
+is_actual_signal(name) {
+    not is_enum_literal(name)
+    not is_constant(name)
+}
 
 # Rule: Signal declared but never used (dead code)
 unused_signal[violation] {
@@ -19,32 +60,38 @@ unused_signal[violation] {
 }
 
 # Helper: Check if signal is used in any process or concurrent statement
+# Excludes enum literals and constants from being treated as signals
 signal_is_used(sig_name, entity_name) {
     proc := input.processes[_]
     sig := proc.read_signals[_]
     lower(sig) == lower(sig_name)
+    is_actual_signal(sig)
 }
 signal_is_used(sig_name, entity_name) {
     proc := input.processes[_]
     sig := proc.assigned_signals[_]
     lower(sig) == lower(sig_name)
+    is_actual_signal(sig)
 }
 signal_is_used(sig_name, entity_name) {
     # Used in instance port map
     inst := input.instances[_]
     actual := inst.port_map[_]
     contains(lower(actual), lower(sig_name))
+    is_actual_signal(sig_name)
 }
 signal_is_used(sig_name, entity_name) {
     # Read in concurrent assignment
     ca := input.concurrent_assignments[_]
     sig := ca.read_signals[_]
     lower(sig) == lower(sig_name)
+    is_actual_signal(sig)
 }
 signal_is_used(sig_name, entity_name) {
     # Assigned in concurrent assignment
     ca := input.concurrent_assignments[_]
     lower(ca.target) == lower(sig_name)
+    is_actual_signal(ca.target)
 }
 
 # Rule: Signal read but never assigned (undriven)
@@ -62,26 +109,32 @@ undriven_signal[violation] {
 }
 
 # Helper: Check if signal is read (in process or concurrent)
+# Excludes enum literals and constants from being treated as signals
 signal_is_read(sig_name) {
     proc := input.processes[_]
     sig := proc.read_signals[_]
     lower(sig) == lower(sig_name)
+    is_actual_signal(sig)
 }
 signal_is_read(sig_name) {
     ca := input.concurrent_assignments[_]
     sig := ca.read_signals[_]
     lower(sig) == lower(sig_name)
+    is_actual_signal(sig)
 }
 
 # Helper: Check if signal is assigned (in process or concurrent)
+# Excludes enum literals and constants from being treated as signals
 signal_is_assigned(sig_name) {
     proc := input.processes[_]
     sig := proc.assigned_signals[_]
     lower(sig) == lower(sig_name)
+    is_actual_signal(sig)
 }
 signal_is_assigned(sig_name) {
     ca := input.concurrent_assignments[_]
     lower(ca.target) == lower(sig_name)
+    is_actual_signal(ca.target)
 }
 
 # Rule: Signal assigned in multiple places (potential multi-driver)
@@ -107,9 +160,11 @@ count_drivers(sig_name) = total {
 }
 
 # Helper: Check if signal is assigned in a specific process
+# Excludes enum literals and constants
 sig_assigned_in_process(sig_name, proc) {
     assigned := proc.assigned_signals[_]
     lower(assigned) == lower(sig_name)
+    is_actual_signal(assigned)
 }
 
 # Rule: Very wide signal (potential performance issue)

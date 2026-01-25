@@ -2,6 +2,26 @@
 package vhdl.helpers
 
 # =============================================================================
+# POLICY PHILOSOPHY: FIX AT THE SOURCE, NOT HERE
+# =============================================================================
+#
+# Before adding a workaround here, ask: "Is this a grammar or extractor bug?"
+#
+# WRONG: Grammar can't parse `rec.field <= '1';`, keywords leak into signals
+#        -> Add keyword to is_skip_name() list below
+#
+# RIGHT: Fix grammar.js to parse selected_name in concurrent assignments
+#        -> ERROR nodes disappear, keywords never appear in signal lists
+#
+# The helpers here should filter LEGITIMATE false positives (enum literals,
+# constants, loop variables), NOT work around parsing/extraction bugs.
+#
+# If you find yourself adding VHDL keywords here, STOP and fix the grammar.
+#
+# See: AGENTS.md "The Grammar Improvement Cycle"
+# =============================================================================
+
+# =============================================================================
 # Name Classification Helpers
 # =============================================================================
 
@@ -214,4 +234,29 @@ is_state_name(name) {
 signal_in_list(sig, list) {
     item := list[_]
     lower(item) == lower(sig)
+}
+
+# =============================================================================
+# Type System Filtering (Enum Literals / Constants)
+# =============================================================================
+# These helpers filter out false positives by checking if a name is actually
+# an enum literal or constant rather than a signal.
+
+# Check if name is an enum literal (extracted from type declarations)
+is_enum_literal(name) {
+    lit := input.enum_literals[_]
+    lower(lit) == lower(name)
+}
+
+# Check if name is a constant (extracted from constant declarations)
+is_constant(name) {
+    c := input.constants[_]
+    lower(c) == lower(name)
+}
+
+# Check if name is an actual signal (not enum/constant/keyword/function)
+is_actual_signal(name) {
+    not is_enum_literal(name)
+    not is_constant(name)
+    not is_skip_name(name)
 }

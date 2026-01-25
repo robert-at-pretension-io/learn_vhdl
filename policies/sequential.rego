@@ -1,5 +1,25 @@
 # Sequential Logic Rules
 # Rules for detecting issues in clocked processes
+#
+# =============================================================================
+# POLICY PHILOSOPHY: THESE RULES CHECK REAL HARDWARE BUGS
+# =============================================================================
+#
+# Sequential logic rules catch actual FPGA/ASIC problems:
+# - Missing clock in sensitivity list = simulation/synthesis mismatch
+# - Missing reset = undefined initial state
+# - Signal in both sequential and combinational = potential race condition
+#
+# If these rules fire false positives, the problem is upstream:
+# - Grammar can't parse the process correctly (ERROR nodes)
+# - Extractor misidentifies clock/reset patterns
+# - Signal read/write analysis is incomplete
+#
+# DON'T weaken these rules to reduce false positives.
+# DO fix the grammar and extractor so extraction is accurate.
+#
+# See: AGENTS.md "The Grammar Improvement Cycle"
+# =============================================================================
 package vhdl.sequential
 
 import data.vhdl.helpers
@@ -98,6 +118,8 @@ signal_in_seq_and_comb[violation] {
     assigned_seq := proc_seq.assigned_signals[_]
     assigned_comb := proc_comb.assigned_signals[_]
     lower(assigned_seq) == lower(assigned_comb)
+    # Filter out false positives: enum literals, constants, functions
+    helpers.is_actual_signal(assigned_seq)
     violation := {
         "rule": "signal_in_seq_and_comb",
         "severity": "error",

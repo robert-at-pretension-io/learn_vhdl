@@ -67,6 +67,9 @@ type FileFacts struct {
 	Processes      []Process
 	Instances      []Instance      // Component/entity instantiations
 	CaseStatements []CaseStatement // Case statements for latch detection
+	// Type system information (for filtering false positives)
+	EnumLiterals []string          // Enum literals from type declarations (e.g., S_IDLE, S_RUN)
+	Constants    []string          // Constants from constant declarations
 	// Concurrent statements (outside processes)
 	ConcurrentAssignments []ConcurrentAssignment // Concurrent signal assignments
 	// Semantic analysis
@@ -349,6 +352,17 @@ func (e *Extractor) walkTree(node *sitter.Node, source []byte, facts *FileFacts,
 	case "signal_declaration":
 		signals := e.extractSignals(node, source, context)
 		facts.Signals = append(facts.Signals, signals...)
+
+	case "type_declaration":
+		// Extract enum literals from enumeration type definitions
+		// These are used to filter out false positives in signal analysis
+		enumLits := e.extractEnumLiterals(node, source)
+		facts.EnumLiterals = append(facts.EnumLiterals, enumLits...)
+
+	case "constant_declaration":
+		// Extract constant names to filter out false positives
+		constNames := e.extractConstantNames(node, source)
+		facts.Constants = append(facts.Constants, constNames...)
 
 	case "component_declaration":
 		comp := e.extractComponentDecl(node, source)
@@ -710,8 +724,8 @@ func (e *Extractor) extractConcurrentAssignment(node *sitter.Node, source []byte
 				// After <=, all identifiers are read signals
 				readSet[childContent] = true
 			}
-		} else if childType == "selected_name" {
-			// Handle record field access (e.g., rec.field)
+		} else if childType == "selected_name" || childType == "indexed_name" {
+			// Handle record field access (e.g., rec.field) or array access (e.g., arr(i))
 			// Extract base signal name
 			baseSig := e.extractBaseSignal(child, source)
 			if baseSig != "" {
@@ -733,18 +747,77 @@ func (e *Extractor) extractConcurrentAssignment(node *sitter.Node, source []byte
 	return ca
 }
 
-// extractBaseSignal extracts the base signal from a selected_name (e.g., "rec" from "rec.field")
+// extractBaseSignal extracts the base signal from selected_name or indexed_name
+// For "rec.field" returns "rec"
+// For "arr(i)" returns "arr"
+// For "a.b.c" returns "a"
 func (e *Extractor) extractBaseSignal(node *sitter.Node, source []byte) string {
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
 		if child.Type() == "identifier" {
 			return child.Content(source)
 		}
-		if child.Type() == "selected_name" {
+		if child.Type() == "selected_name" || child.Type() == "indexed_name" {
 			return e.extractBaseSignal(child, source)
 		}
 	}
 	return ""
+}
+
+// extractEnumLiterals extracts enum literal names from a type_declaration with enumeration_type_definition
+// Example: type state_t is (S_IDLE, S_RUN, S_STOP); -> returns ["S_IDLE", "S_RUN", "S_STOP"]
+func (e *Extractor) extractEnumLiterals(node *sitter.Node, source []byte) []string {
+	var literals []string
+
+	// Find enumeration_type_definition child
+	var walkForEnum func(n *sitter.Node)
+	walkForEnum = func(n *sitter.Node) {
+		if n.Type() == "enumeration_type_definition" {
+			// Extract all identifier children as enum literals
+			for i := 0; i < int(n.ChildCount()); i++ {
+				child := n.Child(i)
+				if child.Type() == "identifier" {
+					literals = append(literals, child.Content(source))
+				}
+				// Also handle character literals in enums (like std_ulogic: '0', '1', etc.)
+				if child.Type() == "character_literal" {
+					literals = append(literals, child.Content(source))
+				}
+			}
+			return
+		}
+		for i := 0; i < int(n.ChildCount()); i++ {
+			walkForEnum(n.Child(i))
+		}
+	}
+	walkForEnum(node)
+
+	return literals
+}
+
+// extractConstantNames extracts constant names from a constant_declaration
+// Example: constant WIDTH : integer := 8; -> returns ["WIDTH"]
+func (e *Extractor) extractConstantNames(node *sitter.Node, source []byte) []string {
+	var names []string
+
+	// Constant declaration structure: constant name1, name2 : type := value;
+	sawColon := false
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		childType := child.Type()
+
+		if childType == ":" {
+			sawColon = true
+			continue
+		}
+
+		// Names come before the colon
+		if !sawColon && childType == "identifier" {
+			names = append(names, child.Content(source))
+		}
+	}
+
+	return names
 }
 
 func (e *Extractor) extractSignals(node *sitter.Node, source []byte, context string) []Signal {
@@ -962,16 +1035,36 @@ func (e *Extractor) analyzeProcessSemantics(node *sitter.Node, source []byte, pr
 
 		case "sequential_signal_assignment":
 			// Extract LHS (assigned signal) and RHS (read signals)
+			// LHS can be identifier, selected_name (record.field), or indexed_name (arr(i))
 			for i := 0; i < int(n.ChildCount()); i++ {
 				child := n.Child(i)
-				if child.Type() == "identifier" {
-					// First identifier is typically the target
+				childType := child.Type()
+				// Stop at the assignment operator - everything after is RHS
+				if childType == "<=" || childType == ":=" {
+					break
+				}
+				if childType == "identifier" {
+					// Simple signal assignment
 					sig := child.Content(source)
 					assignedSet[sig] = true
 					break
 				}
+				if childType == "selected_name" || childType == "indexed_name" {
+					// Record field or array element assignment
+					// Extract the base signal (first identifier in the chain)
+					sig := e.extractBaseSignal(child, source)
+					if sig != "" {
+						assignedSet[sig] = true
+					}
+					break
+				}
 			}
 			// Walk RHS for reads
+			e.extractReadsFromNode(n, source, readSet, true)
+
+		case "assignment_statement":
+			// Variable/generic assignments (tmp := expr) don't assign signals,
+			// but the RHS may read signals that we need to track
 			e.extractReadsFromNode(n, source, readSet, true)
 
 		case "if_statement":
@@ -1059,7 +1152,7 @@ func (e *Extractor) extractIfConditionReads(node *sitter.Node, source []byte, re
 			childType == "wait_statement" ||
 			childType == "assertion_statement" ||
 			childType == "report_statement" ||
-			childType == "variable_assignment" {
+			childType == "assignment_statement" {
 			break
 		}
 
@@ -1083,9 +1176,10 @@ func (e *Extractor) extractReadsFromNode(node *sitter.Node, source []byte, readS
 			return
 		}
 
-		// For selected_name (e.g., a_req_i.stb), only extract the first identifier (base signal)
-		// The field name (.stb) is not a signal read - the base signal (a_req_i) is
-		if n.Type() == "selected_name" {
+		// For selected_name (e.g., a_req_i.stb) or indexed_name (e.g., arr(i)),
+		// only extract the first identifier (base signal)
+		// The field name (.stb) or index (i) are not signals - the base signal is
+		if n.Type() == "selected_name" || n.Type() == "indexed_name" {
 			for i := 0; i < int(n.ChildCount()); i++ {
 				child := n.Child(i)
 				if child.Type() == "identifier" {
@@ -1096,13 +1190,13 @@ func (e *Extractor) extractReadsFromNode(node *sitter.Node, source []byte, readS
 					}
 					break // Only take the first identifier (base signal)
 				}
-				// If the first child is another selected_name, recurse
-				if child.Type() == "selected_name" {
+				// If the first child is another selected_name or indexed_name, recurse
+				if child.Type() == "selected_name" || child.Type() == "indexed_name" {
 					walk(child)
 					break
 				}
 			}
-			return // Don't recurse into children - we've handled the selected_name
+			return // Don't recurse into children - we've handled it
 		}
 
 		if n.Type() == "identifier" {

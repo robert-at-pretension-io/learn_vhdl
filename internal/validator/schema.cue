@@ -20,6 +20,9 @@ package schema
     case_statements:        [...#CaseStatement]
     processes:              [...#Process]
     concurrent_assignments: [...#ConcurrentAssignment]
+    // Type system info for filtering false positives
+    enum_literals:          [...string]  // Enum literals from type declarations (e.g., S_IDLE, S_RUN)
+    constants:              [...string]  // Constants from constant declarations
     // Advanced analysis for security/power/correctness
     comparisons:            [...#Comparison]
     arithmetic_ops:         [...#ArithmeticOp]

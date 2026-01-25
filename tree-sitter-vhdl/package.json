@@ -10,8 +10,8 @@
     "prebuildify": "prebuildify --napi --strip"
   },
   "devDependencies": {
-    "tree-sitter-cli": "^0.22.0",
-    "prebuildify": "^6.0.0"
+    "prebuildify": "^6.0.0",
+    "tree-sitter-cli": "^0.20.8"
   },
   "dependencies": {
     "node-gyp-build": "^4.8.0"
