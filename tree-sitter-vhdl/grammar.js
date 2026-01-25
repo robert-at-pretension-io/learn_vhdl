@@ -2009,12 +2009,14 @@ module.exports = grammar({
     // Character literal as explicit rule
     character_literal: _ => /'[^']'/,
 
-    // Literals (character, string)
+    // Literals (character, string, bit string)
     // Character literal: 'x' (single char) or ''' (apostrophe)
+    // Bit string literals handled by external scanner (src/scanner.c)
     _literal: $ => prec(10, choice(
       $.character_literal,    // Single character: 'a', '0', ' ', etc.
-      /'''/,       // Apostrophe character: '''
-      /"[^"]*"/    // String literal: "text", "" (can be empty)
+      /'''/,                  // Apostrophe character: '''
+      /"[^"]*"/,              // String literal: "text", "" (can be empty)
+      $.bit_string_literal    // X"1A", B"1010", O"17" (from external scanner)
     )),
 
     // Name with optional attribute: identifier['attribute]
