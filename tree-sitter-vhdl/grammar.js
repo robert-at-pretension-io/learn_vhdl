@@ -197,8 +197,11 @@ module.exports = grammar({
   conflicts: $ => [
     [$.package_declaration, $._package_declarative_item],
     [$._type_name, $._simple_name],
+    [$._type_name, $._function_call_in_expr, $._simple_name],
     [$._primary_expression, $._expression_term],
+    [$._index_spec, $._primary_expression],
     [$.association_element, $._index_expression_item],
+    [$.association_list, $._index_expression_unified],
     [$._index_spec, $._simple_name],
     [$._array_index_constraint, $._simple_name],
     [$._type_name, $._array_index_constraint, $._simple_name],
@@ -210,6 +213,7 @@ module.exports = grammar({
     [$.alias_declaration, $._simple_name],
     [$._type_mark, $._name, $._expression_term],
     [$._type_mark, $._primary_expression, $._expression_term],
+    [$._type_mark, $.report_statement, $._name],
     [$.physical_literal, $._expression_term],
     [$.physical_literal, $._primary_expression, $._expression_term],
     [$.physical_literal, $.arithmetic_operator],
@@ -596,10 +600,7 @@ module.exports = grammar({
     ),
 
     // Constant values can be various literals and expressions
-    _constant_value: $ => choice(
-      $._expression,
-      seq($.identifier, $._string_literal)  // e.g., x"AA" based literal
-    ),
+    _constant_value: $ => $._expression,
 
     // Constant argument - allow full expressions for nested function calls
     _constant_arg: $ => $._expression,
@@ -632,8 +633,8 @@ module.exports = grammar({
       seq(
         $.identifier,
         optional(choice(
-          seq('(', /[^)]+/, ')'),         // Constraint in parens
-          seq($._kw_range, /[^;]+/),          // Range constraint
+          $._index_constraint,             // Constraint in parens
+          seq($._kw_range, $._range_or_expression),  // Range constraint
           seq($._kw_of, $.identifier)         // For "file of X" types
         ))
       )
@@ -659,9 +660,18 @@ module.exports = grammar({
 
     // Single index specification
     _index_spec: $ => choice(
+      $._index_subtype_indication,  // integer range 1 to 3, enum range M1 to M5
       seq($._expression, choice($._kw_to, $._kw_downto), $._expression),  // 0 to 7, 7 downto 0
       $._name,  // type'Range, signal'Range
       $.identifier  // Just a type/subtype name
+    ),
+
+    // Subtype indication used in index/range contexts (e.g., integer range 1 to 3)
+    _index_subtype_indication: $ => seq(
+      choice($._type_name, $._name),
+      $._kw_range,
+      $._expression,
+      optional(seq(choice($._kw_to, $._kw_downto), $._expression))
     ),
 
     // Type name - simple identifier or selected name (work.pkg.Type)
@@ -811,8 +821,7 @@ module.exports = grammar({
       seq($.identifier, $._kw_range, $._expression, choice($._kw_to, $._kw_downto), $._expression),  // Type with range: integer range 1 to 8
       seq($.identifier, $._kw_range, $._expression),  // Attribute range: integer range t'range
       seq($._expression, choice($._kw_to, $._kw_downto), $._expression),  // Constrained: 1 to 10
-      $._expression,  // Attribute ranges: t'range(1)
-      $.identifier  // Just a type: integer
+      $._name  // Type or attribute name: integer, t'range(1)
     ),
 
     // -------------------------------------------------------------------------
@@ -1049,6 +1058,13 @@ module.exports = grammar({
       $.bit_string_literal,       // X"1A", B"1010", O"17" (from external scanner)
     ),
 
+    // Invalid prefixed strings like bx"00" (invalid base prefix)
+    // Tokenized to allow explicit error reporting in the driver.
+    invalid_prefixed_string_literal: _ => token(prec(1, choice(
+      /[A-Za-z][A-Za-z0-9_]+\"([^"]|"")*\"/,
+      /[0-9][0-9_]*[sSuU]?[A-Za-z_][A-Za-z0-9_]+\"([^"]|"")*\"/
+    ))),
+
     // bit_string_literal is declared in externals and handled by src/scanner.c
     // This gives it priority over the identifier rule, solving the X"..." tokenization issue
 
@@ -1198,6 +1214,7 @@ module.exports = grammar({
       seq('(', $._expression, ')'),
       $._string_literal,
       $.character_literal,
+      $.qualified_expression,
       $._name,
       seq($._function_call_in_expr, '.', choice($.identifier, $._kw_all)),
       $._function_call_in_expr,  // Function calls like to_hstring(x)
@@ -1806,7 +1823,7 @@ module.exports = grammar({
       $._kw_for,
       field('loop_var', $.identifier),
       $._kw_in,
-      field('range', $._range_or_expression),
+      field('range', $._discrete_range),
       $._kw_generate,
       optional($._generate_body),
       $._kw_end, $._kw_generate, optional($.identifier), ';'
@@ -1888,6 +1905,12 @@ module.exports = grammar({
     _range_or_expression: $ => choice(
       seq($._expression, choice($._kw_to, $._kw_downto), $._expression),  // Explicit range
       $._expression  // Attribute like vec'range
+    ),
+
+    // Discrete range: range or subtype indication (used in loops/slices)
+    _discrete_range: $ => choice(
+      $._index_subtype_indication,
+      $._range_or_expression
     ),
 
     // Block statement with optional generic/port interface
@@ -2392,6 +2415,8 @@ module.exports = grammar({
     ),
 
     _index_expression_item: $ => choice(
+      $._index_subtype_indication,
+      prec.right(1, seq($._expression, choice($._kw_to, $._kw_downto), $._name)),
       seq($._expression, choice($._kw_to, $._kw_downto), $._expression),
       $._expression
     ),
@@ -2426,7 +2451,7 @@ module.exports = grammar({
       optional(seq($.identifier, ':')),  // Optional label
       optional(choice(
         seq($._kw_while, $._expression),  // while loop
-        seq($._kw_for, $.identifier, $._kw_in, $._range_or_expression)  // for loop
+        seq($._kw_for, $.identifier, $._kw_in, $._discrete_range)  // for loop
       )),
       $._kw_loop,
       repeat($._sequential_statement),
@@ -2688,7 +2713,8 @@ module.exports = grammar({
     _literal: $ => prec(10, choice(
       $.character_literal,    // Single character: 'a', '0', ' ', etc.
       /'''/,                  // Apostrophe character: '''
-      $._string_literal       // Includes quoted, percent-delimited, and bit strings
+      $._string_literal,      // Includes quoted, percent-delimited, and bit strings
+      $.invalid_prefixed_string_literal
     )),
 
     // Procedure call statement - lower precedence than assignments

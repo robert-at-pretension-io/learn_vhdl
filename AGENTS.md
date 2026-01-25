@@ -73,6 +73,11 @@ npx tree-sitter parse file.vhd
 - If `npx tree-sitter generate` panics, run `npm run build` in `tree-sitter-vhdl/` (pinned CLI).
 - Prefer deferred decisions for VHDL "syntactic homonyms" like `name(0)`; unify names instead of guessing array vs call.
 - Avoid local-maximum hacks that only improve a narrow test set; aim for abstractions that generalize.
+- Discrete ranges appear in `for` loops, slices, and type constraints; accept subtype indications like `integer range 1 to 3`.
+- Qualified expressions often appear inside `report` strings (`string'("...")`); include them in report parsing.
+- Encoding failures are not grammar bugs; exclude non-UTF8 test files or re-encode them.
+- To reduce XPASS quickly, tighten broad fallbacks first (`_simple_expression`, `_simple_statement`) before adding targeted strictness.
+- Syntax-only negatives (e.g., `bug0100`, `synth/err*`) are best fixed in grammar; semantic negatives belong in extractor/OPA.
 
 #### AI-Assisted Grammar Improvement Workflow
 
