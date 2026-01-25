@@ -1693,11 +1693,11 @@ module.exports = grammar({
       $._signal_name  // Positional
     ),
 
-    // Name can be simple identifier, indexed/sliced, or attribute
-    // Supports chaining: arr(1)(2), arr(1 to 8)(7), V(2 to 4)'LOW
-    // Note: selected_name (pkg.name) is handled separately in procedure_call_statement
+    // Name can be simple identifier, indexed/sliced, selected, or attribute
+    // Supports chaining: arr(1)(2), arr(1 to 8)(7), V(2 to 4)'LOW, rec.field
     _name: $ => choice(
       $.indexed_name,   // Indexed/sliced name: foo(i), foo(1 to 8)
+      $.selected_name,  // Record field access: rec.field, ctrl_o.if_fence
       $.attribute_name, // Attribute: foo'attr
       $.external_name,  // VHDL-2008: << signal .path : type >>
       $.identifier      // Simple name
