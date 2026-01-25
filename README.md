@@ -716,31 +716,34 @@ Based on impact analysis, these are the highest-value improvements ranked by ROI
 
 Rules prioritized by customer value and implementation effort. Focus is on rules that catch real bugs and save engineering time.
 
-### Tier 1: Synthesis Correctness (Immediate Value)
+### Tier 1: Synthesis Correctness ✅ COMPLETE
 
-These rules catch bugs that break synthesis or cause hardware failures. **Status: Implementation in progress.**
+These rules catch bugs that break synthesis or cause hardware failures.
 
-| Rule | Severity | Description | Data Required |
-|------|----------|-------------|---------------|
-| `multi_driver` | Error | Two processes/assignments driving same signal | `processes.assigned_signals`, `concurrent_assignments` |
-| `floating_input` | Error | Input port not connected in instantiation | `instances.port_map`, `entities.ports` |
-| `dead_signal` | Warning | Signal declared but never read anywhere | `signals`, `processes.read_signals` |
-| `unregistered_output` | Warning | Output port driven by combinational logic | `ports`, `processes.is_sequential` |
-| `file_entity_mismatch` | Info | Filename doesn't match entity name | `entities.name`, `entities.file` |
+| Rule | Severity | Description | Status |
+|------|----------|-------------|--------|
+| `multi_driven_signal` | Error | Two processes/assignments driving same signal | ✅ |
+| `floating_instance_input` | Error | Input port not connected in instantiation | ✅ |
+| `unused_signal` | Warning | Signal declared but never used | ✅ |
+| `unregistered_output` | Warning | Output port driven by combinational logic | ✅ |
+| `file_entity_mismatch` | Info | Filename doesn't match entity name | ✅ |
 
-### Tier 2: Design Quality (Medium Effort, High Value)
+### Tier 2: Design Quality ✅ COMPLETE
 
-These rules improve design reliability and catch subtle bugs. **Status: Planned.**
+These rules improve design reliability and catch subtle bugs.
 
-| Rule | Severity | Description | Implementation Notes |
-|------|----------|-------------|---------------------|
-| `combinational_loop` | Error | Cycle in combinational logic (simulation hangs) | Build dependency graph from `signal_deps`, detect cycles using DFS |
-| `fsm_unreachable_state` | Warning | FSM state that can never be reached | Extract state transitions from case statements, build reachability graph |
-| `fsm_no_default_state` | Warning | FSM without default/others handler | Check case statements on enum-typed signals |
-| `fsm_deadlock` | Error | FSM state with no exit transitions | Analyze state transition graph for sink nodes |
-| `sequential_no_reset` | Warning | Sequential process without reset logic | Check `processes.is_sequential && !processes.has_reset` |
-| `async_reset_no_sync` | Warning | Async reset used without synchronizer | Cross-reference reset signals with CDC analysis |
-| `wide_bus_no_handshake` | Warning | Wide bus crossing clock domains | Combine CDC + bit width analysis |
+| Rule | Severity | Description | Status |
+|------|----------|-------------|--------|
+| `direct_combinational_loop` | Error | Signal depends on itself (A -> A) | ✅ |
+| `two_stage_combinational_loop` | Error | Two-stage loop (A -> B -> A) | ✅ |
+| `three_stage_combinational_loop` | Error | Three-stage loop (A -> B -> C -> A) | ✅ |
+| `cross_process_combinational_loop` | Error | Loop across processes | ✅ |
+| `fsm_missing_default_state` | Error | FSM case without "when others" | ✅ |
+| `fsm_unhandled_state` | Warning | Enum state not handled in case | ✅ |
+| `fsm_unreachable_state` | Warning | State never assigned (heuristic) | ✅ |
+| `missing_reset` | Warning | Sequential process without reset | ✅ |
+| `async_reset_unsynchronized` | Warning | Async reset not synchronized | ✅ |
+| `cdc_unsync_multi_bit` | Error | Multi-bit CDC (needs handshake) | ✅ |
 
 #### Tier 2 Implementation Details
 
@@ -797,21 +800,27 @@ For DO-254 (aerospace), ISO 26262 (automotive), IEC 62304 (medical). **Status: F
 ### Implementation Priority
 
 ```
-Week 1: Tier 1 (5 rules)
-  [x] multi_driver - catches synthesis errors
-  [x] dead_signal - code cleanup
-  [x] floating_input - catches wiring bugs
+Tier 1 ✅ COMPLETE (5 rules)
+  [x] multi_driven_signal - catches synthesis errors
+  [x] unused_signal - code cleanup
+  [x] floating_instance_input - catches wiring bugs
   [x] unregistered_output - timing closure
   [x] file_entity_mismatch - best practice
 
-Week 2-3: Tier 2 (7 rules)
-  [ ] combinational_loop - simulation hangs
-  [ ] fsm_unreachable_state - dead code
-  [ ] fsm_no_default_state - robustness
-  [ ] fsm_deadlock - lockup bugs
-  [ ] sequential_no_reset - reliability
-  [ ] async_reset_no_sync - metastability
-  [ ] wide_bus_no_handshake - CDC correctness
+Tier 2 ✅ COMPLETE (10 rules)
+  [x] combinational_loop (4 variants) - simulation hangs
+  [x] fsm_missing_default_state - robustness
+  [x] fsm_unhandled_state - dead code
+  [x] fsm_unreachable_state - dead code (heuristic)
+  [x] missing_reset - power-on state
+  [x] async_reset_unsynchronized - metastability
+  [x] cdc_unsync_multi_bit - CDC correctness
+
+Tier 3: FUTURE (enterprise features)
+  [ ] fsm_deadlock - requires transition extraction
+  [ ] DO-254 compliance pack
+  [ ] ISO 26262 compliance pack
+  [ ] Custom rule configuration
 ```
 
 ---
