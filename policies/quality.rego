@@ -174,12 +174,21 @@ buffer_port[violation] {
 # Rule: Architecture without any concurrent statements or processes
 trivial_architecture[violation] {
     arch := input.architectures[_]
+    # Count items directly in the architecture
     procs := count([p | p := input.processes[_]; p.in_arch == arch.name; p.file == arch.file])
     concurrents := count([c | c := input.concurrent_assignments[_]; c.in_arch == arch.name; c.file == arch.file])
     instances := count([i | i := input.instances[_]; i.in_arch == arch.name; i.file == arch.file])
-    procs == 0
-    concurrents == 0
-    instances == 0
+    # Count items inside generate blocks (in_arch contains arch.name with generate suffix like "rtl.genXXX")
+    gen_procs := count([p | p := input.processes[_]; startswith(p.in_arch, concat("", [arch.name, "."])); p.file == arch.file])
+    gen_concurrents := count([c | c := input.concurrent_assignments[_]; startswith(c.in_arch, concat("", [arch.name, "."])); c.file == arch.file])
+    gen_instances := count([i | i := input.instances[_]; startswith(i.in_arch, concat("", [arch.name, "."])); i.file == arch.file])
+    # Also count generate statements themselves
+    generates := count([g | g := input.generates[_]; g.in_arch == arch.name; g.file == arch.file])
+    # Architecture is trivial only if nothing at all
+    procs + gen_procs == 0
+    concurrents + gen_concurrents == 0
+    instances + gen_instances == 0
+    generates == 0
     violation := {
         "rule": "trivial_architecture",
         "severity": "warning",
@@ -213,8 +222,8 @@ file_entity_mismatch[violation] {
 extract_filename(path) = name {
     parts := split(path, "/")
     file_with_ext := parts[count(parts) - 1]
-    # Remove .vhd or .vhdl extension
-    name := trim_suffix(trim_suffix(file_with_ext, ".vhd"), "l")
+    # Remove .vhdl first (longer match), then .vhd
+    name := trim_suffix(trim_suffix(file_with_ext, ".vhdl"), ".vhd")
 } else = path
 
 # Aggregate quality violations

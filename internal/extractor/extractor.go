@@ -223,10 +223,12 @@ type GenerateStatement struct {
 	// If-generate specific
 	Condition string   // Condition expression (if-generate)
 	// Nested declarations (scoped to this generate block)
-	Signals   []Signal            // Signals declared inside
-	Instances []Instance          // Component instances inside
-	Processes []Process           // Processes inside
-	Generates []GenerateStatement // Nested generate statements
+	Signals               []Signal               // Signals declared inside
+	Instances             []Instance             // Component instances inside
+	Processes             []Process              // Processes inside
+	ConcurrentAssignments []ConcurrentAssignment // Concurrent signal assignments inside
+	SignalUsages          []SignalUsage          // Signal reads/writes tracked
+	Generates             []GenerateStatement    // Nested generate statements
 }
 
 // Entity represents a VHDL entity declaration
@@ -622,20 +624,8 @@ func (e *Extractor) walkTreeWithPkg(node *sitter.Node, source []byte, facts *Fil
 		// Extract generate statement with its nested declarations
 		gen := e.extractGenerateStatement(node, source, archContext)
 		facts.Generates = append(facts.Generates, gen)
-		// Add scoped signals to the main facts with generate context
-		// This allows policies to know which signals are inside generate blocks
-		for _, sig := range gen.Signals {
-			sig.InEntity = archContext + "." + gen.Label // Scope: arch.gen_label
-			facts.Signals = append(facts.Signals, sig)
-		}
-		for _, inst := range gen.Instances {
-			inst.InArch = archContext + "." + gen.Label
-			facts.Instances = append(facts.Instances, inst)
-		}
-		for _, proc := range gen.Processes {
-			proc.InArch = archContext + "." + gen.Label
-			facts.Processes = append(facts.Processes, proc)
-		}
+		// Recursively flatten all nested generate contents into facts
+		e.flattenGenerateToFacts(&gen, archContext, facts)
 		// Don't recurse manually - extractGenerateStatement handles nested content
 		return
 	}
@@ -643,6 +633,45 @@ func (e *Extractor) walkTreeWithPkg(node *sitter.Node, source []byte, facts *Fil
 	// Recurse into children
 	for i := 0; i < int(node.ChildCount()); i++ {
 		e.walkTreeWithPkg(node.Child(i), source, facts, pkgContext, archContext)
+	}
+}
+
+// flattenGenerateToFacts recursively extracts all contents from a generate statement
+// (and its nested generates) into the main facts structure. This ensures that signals,
+// instances, processes, and signal usages inside generate blocks are visible to policies.
+func (e *Extractor) flattenGenerateToFacts(gen *GenerateStatement, archContext string, facts *FileFacts) {
+	scope := archContext + "." + gen.Label
+
+	// Add signals with generate scope
+	for _, sig := range gen.Signals {
+		sig.InEntity = scope
+		facts.Signals = append(facts.Signals, sig)
+	}
+
+	// Add instances with generate scope
+	for _, inst := range gen.Instances {
+		inst.InArch = scope
+		facts.Instances = append(facts.Instances, inst)
+	}
+
+	// Add processes with generate scope
+	for _, proc := range gen.Processes {
+		proc.InArch = scope
+		facts.Processes = append(facts.Processes, proc)
+	}
+
+	// Add concurrent assignments with generate scope
+	for _, ca := range gen.ConcurrentAssignments {
+		ca.InArch = scope
+		facts.ConcurrentAssignments = append(facts.ConcurrentAssignments, ca)
+	}
+
+	// Add signal usages
+	facts.SignalUsages = append(facts.SignalUsages, gen.SignalUsages...)
+
+	// Recursively process nested generates
+	for i := range gen.Generates {
+		e.flattenGenerateToFacts(&gen.Generates[i], scope, facts)
 	}
 }
 
@@ -869,9 +898,12 @@ func (e *Extractor) extractConcurrentAssignment(node *sitter.Node, source []byte
 	}
 
 	// Determine kind based on content
+	// VHDL selected assignment: "with expr select target <= value when choice, ..."
+	// VHDL conditional assignment: "target <= value when condition else other"
 	content := strings.ToLower(node.Content(source))
-	isSelected := strings.Contains(content, "select")
-	if strings.Contains(content, " when ") && strings.Contains(content, " else ") {
+	// Selected assignments must start with "with" keyword (not just contain "select" in a signal name)
+	isSelected := strings.HasPrefix(strings.TrimSpace(content), "with ") && strings.Contains(content, " select ")
+	if strings.Contains(content, " when ") && strings.Contains(content, " else ") && !isSelected {
 		ca.Kind = "conditional"
 	} else if isSelected {
 		ca.Kind = "selected"
@@ -1362,16 +1394,38 @@ func (e *Extractor) analyzeProcessSemantics(node *sitter.Node, source []byte, pr
 		case "if_statement":
 			// Check for clock edge pattern in elsif clause
 			// Grammar parses "elsif rising_edge(clk)" with prefix/content fields
-			if prefixNode := n.ChildByFieldName("prefix"); prefixNode != nil {
-				funcName := strings.ToLower(prefixNode.Content(source))
-				if contentNode := n.ChildByFieldName("content"); contentNode != nil {
-					argName := contentNode.Content(source)
-					if funcName == "rising_edge" && argName != "" && proc.ClockSignal == "" {
-						proc.ClockSignal = argName
-						proc.ClockEdge = "rising"
-					} else if funcName == "falling_edge" && argName != "" && proc.ClockSignal == "" {
-						proc.ClockSignal = argName
-						proc.ClockEdge = "falling"
+			// NOTE: ChildByFieldName returns the first match, but there may be many
+			// prefix/content fields from record assignments (ctrl.enable, etc.)
+			// We need to look for rising_edge/falling_edge specifically
+			if proc.ClockSignal == "" {
+				// Iterate through children looking for clock edge pattern
+				for i := 0; i < int(n.ChildCount()); i++ {
+					child := n.Child(i)
+					if child.Type() == "identifier" {
+						funcName := strings.ToLower(child.Content(source))
+						if funcName == "rising_edge" || funcName == "falling_edge" {
+							// Found clock edge function, look for next identifier (clock signal)
+							for j := i + 1; j < int(n.ChildCount()); j++ {
+								nextChild := n.Child(j)
+								if nextChild.Type() == "identifier" {
+									argName := nextChild.Content(source)
+									if funcName == "rising_edge" {
+										proc.ClockSignal = argName
+										proc.ClockEdge = "rising"
+									} else {
+										proc.ClockSignal = argName
+										proc.ClockEdge = "falling"
+									}
+									break
+								}
+								// Skip non-identifier nodes but stop at statements
+								if strings.Contains(nextChild.Type(), "statement") ||
+									strings.Contains(nextChild.Type(), "assignment") {
+									break
+								}
+							}
+							break
+						}
 					}
 				}
 			}
@@ -2286,6 +2340,27 @@ func (e *Extractor) extractGenerateBody(node *sitter.Node, source []byte, gen *G
 			proc := e.extractProcess(n, source, gen.Label)
 			gen.Processes = append(gen.Processes, proc)
 			return // Don't recurse into process
+
+		case "signal_assignment":
+			// Concurrent signal assignment inside generate block
+			ca := e.extractConcurrentAssignment(n, source, gen.InArch+"."+gen.Label)
+			gen.ConcurrentAssignments = append(gen.ConcurrentAssignments, ca)
+			// Track signal usages
+			gen.SignalUsages = append(gen.SignalUsages, SignalUsage{
+				Signal:    ca.Target,
+				IsWritten: true,
+				InProcess: "", // Empty = concurrent
+				Line:      ca.Line,
+			})
+			for _, sig := range ca.ReadSignals {
+				gen.SignalUsages = append(gen.SignalUsages, SignalUsage{
+					Signal:    sig,
+					IsRead:    true,
+					InProcess: "", // Empty = concurrent
+					Line:      ca.Line,
+				})
+			}
+			return // Don't recurse into assignment
 
 		case "generate_statement":
 			// Nested generate - extract recursively
