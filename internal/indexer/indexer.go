@@ -276,6 +276,26 @@ func (idx *Indexer) Run(rootPath string) error {
 		idx.Facts = append(idx.Facts, facts)
 	}
 
+	// Elaborate generate statements using constant values
+	// Build a global constant map from all extracted constants
+	globalConstants := make(map[string]int)
+	for _, facts := range idx.Facts {
+		constMap := extractor.BuildConstantMap(facts.ConstantDecls)
+		for k, v := range constMap {
+			globalConstants[k] = v
+		}
+	}
+
+	// Elaborate generates in all files
+	elaboratedCount := 0
+	for i := range idx.Facts {
+		elaboratedCount += extractor.ElaborateGenerates(idx.Facts[i].Generates, globalConstants)
+	}
+	if elaboratedCount > 0 && idx.Verbose {
+		fmt.Printf("\n=== Verbose: Generate Elaboration ===\n")
+		fmt.Printf("  Elaborated %d for-generates using %d constants\n", elaboratedCount, len(globalConstants))
+	}
+
 	// Verbose output for debugging
 	if idx.Verbose {
 		fmt.Printf("\n=== Verbose: Extracted Ports ===\n")
@@ -482,6 +502,30 @@ func (idx *Indexer) Run(rootPath string) error {
 					value = fmt.Sprintf(" := %s", c.Value)
 				}
 				fmt.Printf("  %s.%s: %s%s\n", scope, c.Name, c.Type, value)
+			}
+		}
+		fmt.Printf("\n=== Verbose: Generate Statements ===\n")
+		for _, facts := range idx.Facts {
+			for _, gen := range facts.Generates {
+				switch gen.Kind {
+				case "for":
+					elaboration := "cannot elaborate"
+					if gen.CanElaborate {
+						elaboration = fmt.Sprintf("%d iterations", gen.IterationCount)
+					}
+					fmt.Printf("  %s: for %s in %s %s %s (%s)\n",
+						gen.Label, gen.LoopVar, gen.RangeLow, gen.RangeDir, gen.RangeHigh, elaboration)
+				case "if":
+					fmt.Printf("  %s: if %s\n", gen.Label, gen.Condition)
+				case "case":
+					fmt.Printf("  %s: case %s\n", gen.Label, gen.Condition)
+				default:
+					fmt.Printf("  %s: %s\n", gen.Label, gen.Kind)
+				}
+				if len(gen.Signals) > 0 || len(gen.Instances) > 0 || len(gen.Processes) > 0 {
+					fmt.Printf("    contains: %d signals, %d instances, %d processes\n",
+						len(gen.Signals), len(gen.Instances), len(gen.Processes))
+				}
 			}
 		}
 	}
@@ -855,19 +899,21 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 		// Generate statements (for-generate, if-generate, case-generate)
 		for _, gen := range facts.Generates {
 			input.Generates = append(input.Generates, policy.GenerateStatement{
-				Label:         gen.Label,
-				Kind:          gen.Kind,
-				File:          facts.File,
-				Line:          gen.Line,
-				InArch:        gen.InArch,
-				LoopVar:       gen.LoopVar,
-				RangeLow:      gen.RangeLow,
-				RangeHigh:     gen.RangeHigh,
-				RangeDir:      gen.RangeDir,
-				Condition:     gen.Condition,
-				SignalCount:   len(gen.Signals),
-				InstanceCount: len(gen.Instances),
-				ProcessCount:  len(gen.Processes),
+				Label:          gen.Label,
+				Kind:           gen.Kind,
+				File:           facts.File,
+				Line:           gen.Line,
+				InArch:         gen.InArch,
+				LoopVar:        gen.LoopVar,
+				RangeLow:       gen.RangeLow,
+				RangeHigh:      gen.RangeHigh,
+				RangeDir:       gen.RangeDir,
+				IterationCount: gen.IterationCount,
+				CanElaborate:   gen.CanElaborate,
+				Condition:      gen.Condition,
+				SignalCount:    len(gen.Signals),
+				InstanceCount:  len(gen.Instances),
+				ProcessCount:   len(gen.Processes),
 			})
 		}
 

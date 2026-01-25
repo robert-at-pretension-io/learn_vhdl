@@ -242,6 +242,9 @@ type GenerateStatement struct {
 	RangeLow  string `json:"range_low,omitempty"`  // Range low bound (for-generate)
 	RangeHigh string `json:"range_high,omitempty"` // Range high bound (for-generate)
 	RangeDir  string `json:"range_dir,omitempty"`  // "to" or "downto" (for-generate)
+	// Elaboration results (for-generate)
+	IterationCount int  `json:"iteration_count"`           // Number of iterations (-1 if cannot evaluate)
+	CanElaborate   bool `json:"can_elaborate,omitempty"`   // True if range was successfully evaluated
 	// If-generate specific
 	Condition string `json:"condition,omitempty"` // Condition expression (if-generate)
 	// Nested content counts (actual content is flattened to main lists)

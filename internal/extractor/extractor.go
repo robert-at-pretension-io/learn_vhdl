@@ -198,6 +198,9 @@ type GenerateStatement struct {
 	RangeLow  string   // Range low bound (for-generate)
 	RangeHigh string   // Range high bound (for-generate)
 	RangeDir  string   // "to" or "downto" (for-generate)
+	// Elaboration results (for-generate)
+	IterationCount int  // Number of iterations (-1 if cannot evaluate)
+	CanElaborate   bool // True if range was successfully evaluated
 	// If-generate specific
 	Condition string   // Condition expression (if-generate)
 	// Nested declarations (scoped to this generate block)
@@ -2154,25 +2157,62 @@ func (e *Extractor) extractForGenerateDetails(node *sitter.Node, source []byte, 
 		gen.LoopVar = loopVarNode.Content(source)
 	}
 
-	// Extract range info from content
-	// Grammar combines range into one field, but we need to parse low/high/dir
-	// For now, store the full range expression
-	if rangeNode := node.ChildByFieldName("range"); rangeNode != nil {
-		gen.RangeLow = rangeNode.Content(source)
+	// Extract range info from the full for_generate content
+	// The grammar hides "to"/"downto" keywords, so we parse from text
+	// Pattern: for LOOP_VAR in LOW to/downto HIGH generate
+	content := node.Content(source)
+	e.parseForGenerateRange(content, gen)
+
+	// Initialize elaboration fields
+	gen.IterationCount = -1
+	gen.CanElaborate = false
+}
+
+// parseForGenerateRange extracts low/high/dir from for-generate text
+// Handles patterns like: "for i in 0 to 7 generate", "for i in WIDTH-1 downto 0 generate"
+func (e *Extractor) parseForGenerateRange(content string, gen *GenerateStatement) {
+	contentLower := strings.ToLower(content)
+
+	// Find the "in" keyword to get the start of the range
+	inIdx := strings.Index(contentLower, " in ")
+	if inIdx == -1 {
+		return
+	}
+	rangeStart := inIdx + 4 // Skip " in "
+
+	// Find "generate" to get the end of the range
+	genIdx := strings.Index(contentLower[rangeStart:], " generate")
+	if genIdx == -1 {
+		genIdx = strings.Index(contentLower[rangeStart:], "\ngenerate")
+	}
+	if genIdx == -1 {
+		return
 	}
 
-	// Look for "to" or "downto" in children to determine direction
-	for i := 0; i < int(node.ChildCount()); i++ {
-		child := node.Child(i)
-		content := strings.ToLower(child.Content(source))
-		if content == "to" {
-			gen.RangeDir = "to"
-			break
-		} else if content == "downto" {
-			gen.RangeDir = "downto"
-			break
-		}
+	// Extract the range expression
+	rangeExpr := strings.TrimSpace(content[rangeStart : rangeStart+genIdx])
+
+	// Find "to" or "downto" (case insensitive)
+	rangeLower := strings.ToLower(rangeExpr)
+
+	// Check for "downto" first (it contains "to")
+	if downtoIdx := strings.Index(rangeLower, " downto "); downtoIdx != -1 {
+		gen.RangeLow = strings.TrimSpace(rangeExpr[:downtoIdx])
+		gen.RangeHigh = strings.TrimSpace(rangeExpr[downtoIdx+8:])
+		gen.RangeDir = "downto"
+		return
 	}
+
+	// Check for "to"
+	if toIdx := strings.Index(rangeLower, " to "); toIdx != -1 {
+		gen.RangeLow = strings.TrimSpace(rangeExpr[:toIdx])
+		gen.RangeHigh = strings.TrimSpace(rangeExpr[toIdx+4:])
+		gen.RangeDir = "to"
+		return
+	}
+
+	// No direction found - might be an attribute like vec'range
+	gen.RangeLow = rangeExpr
 }
 
 // extractIfGenerateDetails extracts if-generate specific info (condition)
@@ -2707,4 +2747,180 @@ func splitLines(s string) []string {
 		lines = append(lines, s[start:])
 	}
 	return lines
+}
+
+// =============================================================================
+// GENERATE ELABORATION
+// =============================================================================
+// Evaluates for-generate ranges to determine iteration counts.
+// This is called after extraction when constants are available.
+
+// ElaborateGenerates evaluates for-generate ranges using available constants
+// Returns the number of generates that were successfully elaborated
+func ElaborateGenerates(generates []GenerateStatement, constants map[string]int) int {
+	count := 0
+	for i := range generates {
+		if elaborateGenerate(&generates[i], constants) {
+			count++
+		}
+		// Recursively elaborate nested generates
+		count += ElaborateGenerates(generates[i].Generates, constants)
+	}
+	return count
+}
+
+// elaborateGenerate evaluates a single for-generate's range
+func elaborateGenerate(gen *GenerateStatement, constants map[string]int) bool {
+	if gen.Kind != "for" {
+		return false
+	}
+
+	// Try to evaluate low and high bounds
+	low, okLow := evaluateRangeExpr(gen.RangeLow, constants)
+	high, okHigh := evaluateRangeExpr(gen.RangeHigh, constants)
+
+	if !okLow || !okHigh {
+		gen.IterationCount = -1
+		gen.CanElaborate = false
+		return false
+	}
+
+	// Calculate iteration count based on direction
+	switch gen.RangeDir {
+	case "to":
+		gen.IterationCount = high - low + 1
+	case "downto":
+		gen.IterationCount = low - high + 1
+	default:
+		gen.IterationCount = -1
+		gen.CanElaborate = false
+		return false
+	}
+
+	// Sanity check - iteration count should be positive
+	if gen.IterationCount < 0 {
+		gen.IterationCount = -1
+		gen.CanElaborate = false
+		return false
+	}
+
+	gen.CanElaborate = true
+	return true
+}
+
+// evaluateRangeExpr evaluates a simple range expression
+// Handles: integer literals, identifiers (from constants), simple arithmetic
+func evaluateRangeExpr(expr string, constants map[string]int) (int, bool) {
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return 0, false
+	}
+
+	// Try to parse as integer literal
+	if val, err := parseIntLiteral(expr); err == nil {
+		return val, true
+	}
+
+	// Try to look up as constant (case-insensitive)
+	if val, ok := constants[strings.ToLower(expr)]; ok {
+		return val, true
+	}
+
+	// Try to evaluate simple arithmetic expressions
+	// Handle: CONST - 1, CONST + 1, CONST * 2, CONST / 2
+	return evaluateSimpleArithmetic(expr, constants)
+}
+
+// parseIntLiteral parses an integer literal (decimal, hex, binary, octal)
+func parseIntLiteral(s string) (int, error) {
+	s = strings.TrimSpace(s)
+
+	// Handle VHDL-style based literals: 16#FF#, 2#1010#, 8#77#
+	if strings.Contains(s, "#") {
+		return parseBasedLiteral(s)
+	}
+
+	// Standard Go parsing handles decimal
+	var val int
+	_, err := fmt.Sscanf(s, "%d", &val)
+	return val, err
+}
+
+// parseBasedLiteral parses VHDL based literals like 16#FF#, 2#1010#
+func parseBasedLiteral(s string) (int, error) {
+	parts := strings.Split(s, "#")
+	if len(parts) < 2 {
+		return 0, fmt.Errorf("invalid based literal: %s", s)
+	}
+
+	base, err := fmt.Sscanf(parts[0], "%d", new(int))
+	if err != nil || base == 0 {
+		return 0, fmt.Errorf("invalid base: %s", parts[0])
+	}
+
+	var baseVal int
+	fmt.Sscanf(parts[0], "%d", &baseVal)
+
+	// Parse the value part in the given base
+	valueStr := strings.ToLower(parts[1])
+	var result int
+	for _, c := range valueStr {
+		var digit int
+		if c >= '0' && c <= '9' {
+			digit = int(c - '0')
+		} else if c >= 'a' && c <= 'f' {
+			digit = int(c - 'a' + 10)
+		} else {
+			continue // Skip underscores
+		}
+		result = result*baseVal + digit
+	}
+
+	return result, nil
+}
+
+// evaluateSimpleArithmetic handles simple expressions like "WIDTH - 1"
+func evaluateSimpleArithmetic(expr string, constants map[string]int) (int, bool) {
+	// Try common patterns: X - N, X + N, X * N, X / N
+	operators := []string{" - ", " + ", " * ", " / ", "-", "+", "*", "/"}
+
+	for _, op := range operators {
+		if idx := strings.Index(expr, op); idx > 0 {
+			left := strings.TrimSpace(expr[:idx])
+			right := strings.TrimSpace(expr[idx+len(op):])
+
+			leftVal, okLeft := evaluateRangeExpr(left, constants)
+			rightVal, okRight := evaluateRangeExpr(right, constants)
+
+			if okLeft && okRight {
+				opChar := strings.TrimSpace(op)
+				switch opChar {
+				case "-":
+					return leftVal - rightVal, true
+				case "+":
+					return leftVal + rightVal, true
+				case "*":
+					return leftVal * rightVal, true
+				case "/":
+					if rightVal != 0 {
+						return leftVal / rightVal, true
+					}
+				}
+			}
+		}
+	}
+
+	return 0, false
+}
+
+// BuildConstantMap creates a map of constant names to integer values
+// Used for generate elaboration
+func BuildConstantMap(constants []ConstantDeclaration) map[string]int {
+	result := make(map[string]int)
+	for _, c := range constants {
+		if val, err := parseIntLiteral(c.Value); err == nil {
+			result[strings.ToLower(c.Name)] = val
+		}
+	}
+	return result
 }

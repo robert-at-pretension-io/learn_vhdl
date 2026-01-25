@@ -217,6 +217,9 @@ package schema
     range_low?:     string                              // Range low bound
     range_high?:    string                              // Range high bound
     range_dir?:     "to" | "downto" | ""                // Range direction
+    // Elaboration results (for-generate)
+    iteration_count: int                                // Number of iterations (-1 if cannot evaluate)
+    can_elaborate?:  bool                               // True if range was successfully evaluated
     // If-generate specific (optional)
     condition?:     string                              // Condition expression
     // Nested content counts

@@ -103,6 +103,7 @@ This stack transforms VHDL from "text files" into a "queryable database," enabli
 - Discrete ranges show up in loops, slices, and type constraints; handle subtype indications like `natural range 0 to ...`.
 - Report strings can be qualified expressions (`string'("...")`); treat them as first-class expressions.
 - Non-UTF8 test files are a data issue, not a grammar issue; exclude or re-encode rather than loosening the grammar.
+- XPASS reduction is usually best served by tightening broad regex fallbacks before adding lots of tiny exceptions.
 
 ### 2. Go Extractor (`internal/extractor/`)
 
@@ -621,7 +622,7 @@ Based on impact analysis, these are the highest-value improvements ranked by ROI
 | **#1** | **Type System & Function Extraction** | Enables type-aware rules, width checking | ✅ IMPLEMENTED |
 | **#2** | **Latch Inference Detection** | Critical synthesis rule | ✅ IMPLEMENTED |
 | **#3** | **Package Contents Indexing** | Complete cross-file resolution | ✅ IMPLEMENTED |
-| **#4** | **Generate Elaboration** | Evaluate for-generate ranges | Pending |
+| **#4** | **Generate Elaboration** | Evaluate for-generate ranges | ✅ IMPLEMENTED |
 | **#5** | **CDC Enhancement** | Clock domain crossing analysis | Pending |
 
 ### Phase 1: Grammar Completion (Current Focus)
@@ -652,6 +653,10 @@ Based on impact analysis, these are the highest-value improvements ranked by ROI
   - Enum case without full coverage (uses type system!)
   - Combinational process feedback detection
   - FSM state signals without reset
+- [x] Generate elaboration ✅ IMPLEMENTED
+  - Evaluate for-generate ranges (0 to 7, WIDTH-1 downto 0)
+  - Simple constant expression evaluation (+, -, *, /)
+  - Tracks iteration counts for instance counting
 - [ ] Clock domain crossing analysis
 - [ ] Multi-driver detection
 - [ ] FSM extraction and completeness checking
@@ -662,7 +667,7 @@ Based on impact analysis, these are the highest-value improvements ranked by ROI
 ## Future Work (Detailed)
 
 ### Grammar
-- [ ] Generate statements (if/for/case generate)
+- [x] Generate statements (if/for/case generate)
 - [ ] Group declarations and group templates
 - [ ] Generic packages with `generic (type T)`
 - [ ] Package instantiation `package p is new pkg generic map (...)`
