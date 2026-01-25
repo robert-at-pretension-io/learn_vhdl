@@ -8,17 +8,22 @@ package schema
 // Input is the root structure passed to OPA
 // This MUST match policy.Input in Go exactly
 #Input: {
-    entities:        [...#Entity]
-    architectures:   [...#Architecture]
-    packages:        [...#Package]
-    components:      [...#Component]
-    signals:         [...#Signal]
-    ports:           [...#Port]
-    dependencies:    [...#Dependency]
-    symbols:         [...#Symbol]
-    instances:       [...#Instance]
-    case_statements: [...#CaseStatement]
-    processes:       [...#Process]
+    entities:               [...#Entity]
+    architectures:          [...#Architecture]
+    packages:               [...#Package]
+    components:             [...#Component]
+    signals:                [...#Signal]
+    ports:                  [...#Port]
+    dependencies:           [...#Dependency]
+    symbols:                [...#Symbol]
+    instances:              [...#Instance]
+    case_statements:        [...#CaseStatement]
+    processes:              [...#Process]
+    concurrent_assignments: [...#ConcurrentAssignment]
+    // Advanced analysis for security/power/correctness
+    comparisons:            [...#Comparison]
+    arithmetic_ops:         [...#ArithmeticOp]
+    signal_deps:            [...#SignalDep]
 }
 
 // Entity declaration
@@ -128,4 +133,55 @@ package schema
     file:             string & =~".+\\.(vhd|vhdl)$"
     line:             int & >=1
     in_arch:          string                            // Containing architecture
+}
+
+// ConcurrentAssignment represents a concurrent signal assignment (outside processes)
+// Enables detection of undriven/multi-driven signals that were previously missed
+#ConcurrentAssignment: {
+    target:       string & =~"^[a-zA-Z_][a-zA-Z0-9_]*$"  // Signal being assigned
+    read_signals: [...string]                            // Signals being read
+    file:         string & =~".+\\.(vhd|vhdl)$"
+    line:         int & >=1
+    in_arch:      string                                 // Containing architecture
+    kind:         "simple" | "conditional" | "selected"  // Assignment type
+}
+
+// Comparison represents a comparison operation for trojan/trigger detection
+// Tracks comparisons against literals, especially large "magic" values
+#Comparison: {
+    left_operand:  string                               // Signal or expression on left
+    operator:      string                               // =, /=, <, >, <=, >=
+    right_operand: string                               // Signal, literal, or expression
+    is_literal:    bool                                 // True if right operand is a literal
+    literal_value: string                               // The literal value if is_literal
+    literal_bits:  int & >=0                            // Estimated bit width of literal
+    result_drives: string                               // What signal this comparison drives
+    file:          string & =~".+\\.(vhd|vhdl)$"
+    line:          int & >=1
+    in_process:    string                               // Which process contains this
+    in_arch:       string                               // Which architecture
+}
+
+// ArithmeticOp represents an expensive arithmetic operation for power analysis
+#ArithmeticOp: {
+    operator:     string                                // *, /, mod, rem, **
+    operands:     [...string]                           // Input signals/expressions
+    result:       string                                // Output signal
+    is_guarded:   bool                                  // True if gated by enable
+    guard_signal: string                                // The enable/valid signal
+    file:         string & =~".+\\.(vhd|vhdl)$"
+    line:         int & >=1
+    in_process:   string                                // Which process
+    in_arch:      string                                // Which architecture
+}
+
+// SignalDep represents a signal dependency for combinational loop detection
+#SignalDep: {
+    source:        string                               // Signal being read
+    target:        string                               // Signal being assigned
+    in_process:    string                               // Which process (empty if concurrent)
+    is_sequential: bool                                 // True if crosses clock boundary
+    file:          string & =~".+\\.(vhd|vhdl)$"
+    line:          int & >=1
+    in_arch:       string                               // Which architecture
 }

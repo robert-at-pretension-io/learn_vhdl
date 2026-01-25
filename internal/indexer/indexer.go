@@ -156,6 +156,68 @@ func (idx *Indexer) Run(rootPath string) error {
 				fmt.Printf("  %s (%s): drives %v\n", cd.Clock, cd.Edge, cd.Registers)
 			}
 		}
+		fmt.Printf("\n=== Verbose: Instances ===\n")
+		for _, facts := range idx.Facts {
+			for _, inst := range facts.Instances {
+				fmt.Printf("  %s: %s\n", inst.Name, inst.Target)
+				if len(inst.GenericMap) > 0 {
+					fmt.Printf("    generics: %v\n", inst.GenericMap)
+				}
+				if len(inst.PortMap) > 0 {
+					fmt.Printf("    ports: %v\n", inst.PortMap)
+				}
+			}
+		}
+		fmt.Printf("\n=== Verbose: Case Statements ===\n")
+		for _, facts := range idx.Facts {
+			for _, cs := range facts.CaseStatements {
+				status := "INCOMPLETE (potential latch)"
+				if cs.HasOthers {
+					status = "complete (has others)"
+				}
+				fmt.Printf("  case %s [%s] line %d\n", cs.Expression, status, cs.Line)
+				if cs.InProcess != "" {
+					fmt.Printf("    in process: %s\n", cs.InProcess)
+				}
+				fmt.Printf("    choices: %v\n", cs.Choices)
+			}
+		}
+		fmt.Printf("\n=== Verbose: Concurrent Assignments ===\n")
+		for _, facts := range idx.Facts {
+			for _, ca := range facts.ConcurrentAssignments {
+				fmt.Printf("  %s <= [%s] (kind: %s, line %d)\n", ca.Target, strings.Join(ca.ReadSignals, ", "), ca.Kind, ca.Line)
+			}
+		}
+		fmt.Printf("\n=== Verbose: Comparisons (Security Analysis) ===\n")
+		for _, facts := range idx.Facts {
+			for _, comp := range facts.Comparisons {
+				litInfo := ""
+				if comp.IsLiteral {
+					litInfo = fmt.Sprintf(" [LITERAL: %s, %d bits]", comp.LiteralValue, comp.LiteralBits)
+				}
+				fmt.Printf("  %s %s %s%s (line %d, drives: %s)\n", comp.LeftOperand, comp.Operator, comp.RightOperand, litInfo, comp.Line, comp.ResultDrives)
+			}
+		}
+		fmt.Printf("\n=== Verbose: Arithmetic Ops (Power Analysis) ===\n")
+		for _, facts := range idx.Facts {
+			for _, op := range facts.ArithmeticOps {
+				guardInfo := "unguarded"
+				if op.IsGuarded {
+					guardInfo = fmt.Sprintf("guarded by %s", op.GuardSignal)
+				}
+				fmt.Printf("  %s: %s (%s, line %d)\n", op.Operator, strings.Join(op.Operands, ", "), guardInfo, op.Line)
+			}
+		}
+		fmt.Printf("\n=== Verbose: Signal Dependencies (Loop Detection) ===\n")
+		for _, facts := range idx.Facts {
+			for _, dep := range facts.SignalDeps {
+				seqInfo := "combinational"
+				if dep.IsSequential {
+					seqInfo = "sequential"
+				}
+				fmt.Printf("  %s -> %s (%s, line %d)\n", dep.Source, dep.Target, seqInfo, dep.Line)
+			}
+		}
 	}
 
 	// 3. Pass 2: Resolution (check imports)
@@ -172,10 +234,13 @@ func (idx *Indexer) Run(rootPath string) error {
 	// 4. Build OPA input
 	opaInput := idx.buildPolicyInput()
 
-	// 5. Validate data structure before policy evaluation
-	v := validator.New()
+	// 5. Validate data structure before policy evaluation (CUE contract enforcement)
+	v, err := validator.New()
+	if err != nil {
+		return fmt.Errorf("CRITICAL: Failed to initialize CUE validator: %w", err)
+	}
 	if err := v.Validate(opaInput); err != nil {
-		return fmt.Errorf("CRITICAL: Invalid data structure: %w", err)
+		return fmt.Errorf("CRITICAL: Data contract violation (Go -> OPA mismatch): %w", err)
 	}
 
 	// 6. Run policy evaluation
@@ -229,13 +294,32 @@ func (idx *Indexer) Run(rootPath string) error {
 
 // buildPolicyInput converts extracted facts to OPA input format
 func (idx *Indexer) buildPolicyInput() policy.Input {
-	input := policy.Input{}
+	// Initialize all slices to empty (not nil) to ensure JSON serialization
+	// produces [] instead of null - the CUE contract requires arrays
+	input := policy.Input{
+		Entities:              []policy.Entity{},
+		Architectures:         []policy.Architecture{},
+		Packages:              []policy.Package{},
+		Components:            []policy.Component{},
+		Signals:               []policy.Signal{},
+		Ports:                 []policy.Port{},
+		Dependencies:          []policy.Dependency{},
+		Symbols:               []policy.Symbol{},
+		Instances:             []policy.Instance{},
+		CaseStatements:        []policy.CaseStatement{},
+		Processes:             []policy.Process{},
+		ConcurrentAssignments: []policy.ConcurrentAssignment{},
+		// Advanced analysis
+		Comparisons:   []policy.Comparison{},
+		ArithmeticOps: []policy.ArithmeticOp{},
+		SignalDeps:    []policy.SignalDep{},
+	}
 
 	// Aggregate facts from all files
 	for _, facts := range idx.Facts {
 		for _, e := range facts.Entities {
-			// Find ports for this entity
-			var ports []policy.Port
+			// Find ports for this entity (initialize to empty, not nil)
+			ports := []policy.Port{}
 			for _, p := range facts.Ports {
 				if p.InEntity == e.Name {
 					ports = append(ports, policy.Port{
@@ -283,6 +367,10 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 		}
 
 		for _, s := range facts.Signals {
+			// Skip signals with empty types (e.g., malformed declarations like "signal x: (range)")
+			if s.Type == "" {
+				continue
+			}
 			input.Signals = append(input.Signals, policy.Signal{
 				Name:     s.Name,
 				Type:     s.Type,
@@ -310,6 +398,145 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 				Kind:     d.Kind,
 				Line:     d.Line,
 				Resolved: resolved,
+			})
+		}
+
+		for _, inst := range facts.Instances {
+			// Ensure maps are not nil (CUE requires objects, not null)
+			portMap := inst.PortMap
+			if portMap == nil {
+				portMap = make(map[string]string)
+			}
+			genericMap := inst.GenericMap
+			if genericMap == nil {
+				genericMap = make(map[string]string)
+			}
+			input.Instances = append(input.Instances, policy.Instance{
+				Name:       inst.Name,
+				Target:     inst.Target,
+				PortMap:    portMap,
+				GenericMap: genericMap,
+				File:       facts.File,
+				Line:       inst.Line,
+				InArch:     inst.InArch,
+			})
+		}
+
+		for _, cs := range facts.CaseStatements {
+			// Ensure choices is not nil
+			choices := cs.Choices
+			if choices == nil {
+				choices = []string{}
+			}
+			input.CaseStatements = append(input.CaseStatements, policy.CaseStatement{
+				Expression: cs.Expression,
+				Choices:    choices,
+				HasOthers:  cs.HasOthers,
+				File:       facts.File,
+				Line:       cs.Line,
+				InProcess:  cs.InProcess,
+				InArch:     cs.InArch,
+				IsComplete: cs.IsComplete,
+			})
+		}
+
+		for _, proc := range facts.Processes {
+			// Ensure slices are not nil
+			sensList := proc.SensitivityList
+			if sensList == nil {
+				sensList = []string{}
+			}
+			assigned := proc.AssignedSignals
+			if assigned == nil {
+				assigned = []string{}
+			}
+			read := proc.ReadSignals
+			if read == nil {
+				read = []string{}
+			}
+			input.Processes = append(input.Processes, policy.Process{
+				Label:           proc.Label,
+				SensitivityList: sensList,
+				IsSequential:    proc.IsSequential,
+				IsCombinational: proc.IsCombinational,
+				ClockSignal:     proc.ClockSignal,
+				HasReset:        proc.HasReset,
+				ResetSignal:     proc.ResetSignal,
+				AssignedSignals: assigned,
+				ReadSignals:     read,
+				File:            facts.File,
+				Line:            proc.Line,
+				InArch:          proc.InArch,
+			})
+		}
+
+		for _, ca := range facts.ConcurrentAssignments {
+			// Skip assignments with empty targets (edge cases from parsing errors)
+			if ca.Target == "" {
+				continue
+			}
+			// Ensure ReadSignals is not nil
+			readSigs := ca.ReadSignals
+			if readSigs == nil {
+				readSigs = []string{}
+			}
+			input.ConcurrentAssignments = append(input.ConcurrentAssignments, policy.ConcurrentAssignment{
+				Target:      ca.Target,
+				ReadSignals: readSigs,
+				File:        facts.File,
+				Line:        ca.Line,
+				InArch:      ca.InArch,
+				Kind:        ca.Kind,
+			})
+		}
+
+		// Advanced analysis: Comparisons for trojan/trigger detection
+		for _, comp := range facts.Comparisons {
+			input.Comparisons = append(input.Comparisons, policy.Comparison{
+				LeftOperand:  comp.LeftOperand,
+				Operator:     comp.Operator,
+				RightOperand: comp.RightOperand,
+				IsLiteral:    comp.IsLiteral,
+				LiteralValue: comp.LiteralValue,
+				LiteralBits:  comp.LiteralBits,
+				ResultDrives: comp.ResultDrives,
+				File:         facts.File,
+				Line:         comp.Line,
+				InProcess:    comp.InProcess,
+				InArch:       comp.InArch,
+			})
+		}
+
+		// Advanced analysis: Arithmetic operations for power analysis
+		for _, arith := range facts.ArithmeticOps {
+			// Ensure operands is not nil
+			operands := arith.Operands
+			if operands == nil {
+				operands = []string{}
+			}
+			input.ArithmeticOps = append(input.ArithmeticOps, policy.ArithmeticOp{
+				Operator:    arith.Operator,
+				Operands:    operands,
+				Result:      arith.Result,
+				IsGuarded:   arith.IsGuarded,
+				GuardSignal: arith.GuardSignal,
+				File:        facts.File,
+				Line:        arith.Line,
+				InProcess:   arith.InProcess,
+				InArch:      arith.InArch,
+			})
+		}
+
+		// Advanced analysis: Signal dependencies for loop detection
+		for _, dep := range facts.SignalDeps {
+			input.SignalDeps = append(input.SignalDeps, policy.SignalDep{
+				Source:       dep.Source,
+				Target:       dep.Target,
+				InProcess:    dep.InProcess,
+				IsSequential: dep.IsSequential,
+				File:         facts.File,
+				Line:         dep.Line,
+				InArch:       dep.InArch,
 			})
 		}
 	}

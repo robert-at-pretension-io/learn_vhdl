@@ -40,14 +40,38 @@ type Summary struct {
 
 // Input is the data structure passed to OPA
 type Input struct {
-	Entities      []Entity      `json:"entities"`
-	Architectures []Architecture `json:"architectures"`
-	Packages      []Package     `json:"packages"`
-	Components    []Component   `json:"components"`
-	Signals       []Signal      `json:"signals"`
-	Ports         []Port        `json:"ports"`
-	Dependencies  []Dependency  `json:"dependencies"`
-	Symbols       []Symbol      `json:"symbols"`
+	Entities              []Entity               `json:"entities"`
+	Architectures         []Architecture         `json:"architectures"`
+	Packages              []Package              `json:"packages"`
+	Components            []Component            `json:"components"`
+	Signals               []Signal               `json:"signals"`
+	Ports                 []Port                 `json:"ports"`
+	Dependencies          []Dependency           `json:"dependencies"`
+	Symbols               []Symbol               `json:"symbols"`
+	Instances             []Instance             `json:"instances"`              // Component/entity instantiations with port maps
+	CaseStatements        []CaseStatement        `json:"case_statements"`        // Case statements for latch detection
+	Processes             []Process              `json:"processes"`              // Process statements for sensitivity/clock analysis
+	ConcurrentAssignments []ConcurrentAssignment `json:"concurrent_assignments"` // Concurrent signal assignments (outside processes)
+	// Advanced analysis for security/power/correctness
+	Comparisons   []Comparison   `json:"comparisons"`    // Comparisons for trojan/trigger detection
+	ArithmeticOps []ArithmeticOp `json:"arithmetic_ops"` // Expensive operations for power analysis
+	SignalDeps    []SignalDep    `json:"signal_deps"`    // Signal dependencies for loop detection
+}
+
+// Process represents a VHDL process for policy analysis
+type Process struct {
+	Label           string   `json:"label"`
+	SensitivityList []string `json:"sensitivity_list"`
+	IsSequential    bool     `json:"is_sequential"`
+	IsCombinational bool     `json:"is_combinational"`
+	ClockSignal     string   `json:"clock_signal"`
+	HasReset        bool     `json:"has_reset"`
+	ResetSignal     string   `json:"reset_signal"`
+	AssignedSignals []string `json:"assigned_signals"`
+	ReadSignals     []string `json:"read_signals"`
+	File            string   `json:"file"`
+	Line            int      `json:"line"`
+	InArch          string   `json:"in_arch"`
 }
 
 // Simplified types for OPA input (mirrors extractor types)
@@ -108,6 +132,82 @@ type Symbol struct {
 	Kind string `json:"kind"`
 	File string `json:"file"`
 	Line int    `json:"line"`
+}
+
+// Instance represents a component/entity instantiation with port/generic mappings
+// Enables system-level analysis (cross-module signal tracing, clock mismatch detection)
+type Instance struct {
+	Name       string            `json:"name"`        // Instance label (e.g., "u_cpu")
+	Target     string            `json:"target"`      // Target entity/component (e.g., "work.cpu")
+	PortMap    map[string]string `json:"port_map"`    // Formal port -> actual signal
+	GenericMap map[string]string `json:"generic_map"` // Formal generic -> actual value
+	File       string            `json:"file"`
+	Line       int               `json:"line"`
+	InArch     string            `json:"in_arch"` // Which architecture contains this instance
+}
+
+// CaseStatement represents a VHDL case statement for latch detection
+// A case statement without "others" can infer a latch in combinational logic
+type CaseStatement struct {
+	Expression string   `json:"expression"`  // The case expression (e.g., "state")
+	Choices    []string `json:"choices"`     // All explicit choices
+	HasOthers  bool     `json:"has_others"`  // true if "when others =>" is present
+	File       string   `json:"file"`
+	Line       int      `json:"line"`
+	InProcess  string   `json:"in_process"`  // Which process contains this case statement
+	InArch     string   `json:"in_arch"`     // Which architecture
+	IsComplete bool     `json:"is_complete"` // true if HasOthers or all values covered
+}
+
+// ConcurrentAssignment represents a concurrent signal assignment (outside processes)
+// Enables detection of undriven/multi-driven signals that were previously missed
+type ConcurrentAssignment struct {
+	Target      string   `json:"target"`       // Signal being assigned (LHS)
+	ReadSignals []string `json:"read_signals"` // Signals being read (RHS)
+	File        string   `json:"file"`
+	Line        int      `json:"line"`
+	InArch      string   `json:"in_arch"` // Which architecture contains this assignment
+	Kind        string   `json:"kind"`    // "simple", "conditional", "selected"
+}
+
+// Comparison represents a comparison operation for trojan/trigger detection
+// Tracks comparisons against literals, especially large "magic" values
+type Comparison struct {
+	LeftOperand  string `json:"left_operand"`  // Signal or expression on left
+	Operator     string `json:"operator"`      // =, /=, <, >, <=, >=
+	RightOperand string `json:"right_operand"` // Signal, literal, or expression on right
+	IsLiteral    bool   `json:"is_literal"`    // True if right operand is a literal
+	LiteralValue string `json:"literal_value"` // The literal value if IsLiteral
+	LiteralBits  int    `json:"literal_bits"`  // Estimated bit width of literal
+	ResultDrives string `json:"result_drives"` // What signal does this comparison drive
+	File         string `json:"file"`
+	Line         int    `json:"line"`
+	InProcess    string `json:"in_process"`
+	InArch       string `json:"in_arch"`
+}
+
+// ArithmeticOp represents an expensive arithmetic operation for power analysis
+type ArithmeticOp struct {
+	Operator    string   `json:"operator"`     // *, /, mod, rem, **
+	Operands    []string `json:"operands"`     // Input signals/expressions
+	Result      string   `json:"result"`       // Output signal
+	IsGuarded   bool     `json:"is_guarded"`   // True if inputs are gated by enable
+	GuardSignal string   `json:"guard_signal"` // The enable/valid signal if guarded
+	File        string   `json:"file"`
+	Line        int      `json:"line"`
+	InProcess   string   `json:"in_process"`
+	InArch      string   `json:"in_arch"`
+}
+
+// SignalDep represents a signal dependency for combinational loop detection
+type SignalDep struct {
+	Source       string `json:"source"`        // Signal being read
+	Target       string `json:"target"`        // Signal being assigned
+	InProcess    string `json:"in_process"`    // Which process (empty if concurrent)
+	IsSequential bool   `json:"is_sequential"` // True if crosses a clock boundary
+	File         string `json:"file"`
+	Line         int    `json:"line"`
+	InArch       string `json:"in_arch"`
 }
 
 // New creates a new policy engine, loading policies from the given directory

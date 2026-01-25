@@ -8,9 +8,12 @@
 
 # Tree-sitter generated files
 /tree-sitter-vhdl/node_modules
-/tree-sitter-vhdl/src
 /tree-sitter-vhdl/build
 /tree-sitter-vhdl/package-lock.json
+
+# Tree-sitter src - ignore generated files, keep hand-written scanner.c
+/tree-sitter-vhdl/src/*
+!/tree-sitter-vhdl/src/scanner.c
 
 # Tree-sitter generated bindings (keep go, ignore others)
 /tree-sitter-vhdl/.editorconfig

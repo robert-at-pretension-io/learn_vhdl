@@ -112,6 +112,21 @@ module.exports = grammar({
   name: 'vhdl',
 
   // ===========================================================================
+  // EXTERNAL SCANNER
+  // ===========================================================================
+  // Some tokens can't be handled cleanly by grammar rules because the lexer
+  // tokenizes greedily. For example, X"DEADBEEF" would be tokenized as:
+  //   identifier("X") + string_literal("DEADBEEF")
+  // instead of a single bit_string_literal.
+  //
+  // External scanners (written in C) run BEFORE the normal lexer, giving us
+  // first crack at recognizing these tokens. See src/scanner.c for details.
+  // ===========================================================================
+  externals: $ => [
+    $.bit_string_literal,  // X"...", B"...", O"..." - handled by scanner.c
+  ],
+
+  // ===========================================================================
   // WORD - helps tree-sitter handle keyword boundaries
   // ===========================================================================
   word: $ => $.identifier,
@@ -146,7 +161,7 @@ module.exports = grammar({
   conflicts: $ => [
     [$.package_declaration, $._package_declarative_item],
     [$._block_declarative_item, $._concurrent_statement],
-    [$._conditional_signal_assignment, $._force_release_assignment, $._name],
+    [$._conditional_signal_assignment, $._force_release_assignment, $._name, $._simple_signal_assignment, $._selected_signal_assignment],
     [$._block_configuration, $._component_configuration],  // for identifier...
     [$.subprogram_declaration, $.subprogram_body],  // both start with procedure/function
     [$.indexed_name, $._name_or_attribute],  // identifier followed by ( - is it index or part of attr?
@@ -154,10 +169,15 @@ module.exports = grammar({
     [$.indexed_name, $._type_name],  // identifier( in alias: indexed_name vs type constraint
     [$.concurrent_procedure_call, $.component_instantiation],  // label: identifier; ambiguity
     [$._index_primary, $._procedure_arg_value],  // identifier in index vs procedure arg
+    [$._constant_arg, $._index_primary],  // identifier in constant arg vs index
     [$._index_primary, $._literal],  // character literal in index
     [$._index_primary, $.character_literal],  // explicit character literal in index
     [$._index_primary, $._name_or_attribute],  // identifier in index
-    [$._index_primary, $._expression_term]  // number/identifier in index
+    [$._index_primary, $._expression_term],  // number/identifier in index
+    [$._primary_expression, $._expression_term],  // Both include _kw_always, psl_next_expression
+    [$.indexed_name, $._primary_expression],  // identifier( in expression context
+    [$._index_primary, $._primary_expression, $._expression_term],  // number in index/expression
+    [$._index_primary, $._primary_expression]  // number/identifier in index vs expression
   ],
 
   // ===========================================================================
@@ -360,7 +380,7 @@ module.exports = grammar({
       $._kw_is,
       $._kw_new,
       $._selected_name,  // The uninstantiated package (lib.pkg)
-      optional(seq($._kw_generic, $._kw_map, '(', optional($._association_list), ')')),
+      optional(seq($._kw_generic, $._kw_map, '(', optional($.association_list), ')')),
       ';'
     ),
 
@@ -379,7 +399,7 @@ module.exports = grammar({
       seq($._kw_type, $.identifier),  // Generic type parameter
       seq($._kw_function, $.identifier, $._parameter_list, $._kw_return, $.identifier),  // Generic function
       seq($._kw_package, $.identifier, $._kw_is, $._kw_new, $._selected_name,  // Generic package instantiation
-          optional(seq($._kw_generic, $._kw_map, '(', optional($._association_list), ')'))),
+          optional(seq($._kw_generic, $._kw_map, '(', optional($.association_list), ')'))),
       $.parameter  // Generic constant (like normal parameter)
     ),
 
@@ -419,17 +439,33 @@ module.exports = grammar({
     // Constant values can be various literals and expressions
     _constant_value: $ => choice(
       $.allocator_expression,  // new Type'(value)
+      // Arithmetic with function calls: 2**index_size_f(N), func(x/4)
+      seq(optional(choice('+', '-')), $.number, repeat1(seq(/[+\-*/<>=]+/, choice(
+        seq($.identifier, '(', optional(seq($._constant_arg, repeat(seq(',', $._constant_arg)))), ')'),  // function call
+        $.number,
+        $._parenthesized_expression,
+        $.identifier
+      )))),
       seq(optional(choice('+', '-')), $.number, optional($.identifier), repeat(seq(/[+\-*/]+/, optional(choice('+', '-')), choice($.number, $._parenthesized_expression), optional($.identifier)))),  // Arithmetic: 3.0 + 2.0, -10 ns, 2 ** 5, -9.0 * (-3.0)
       seq(choice('+', '-'), $.identifier),  // Unary: - p2
       seq($._kw_not, $.identifier),  // Logical not: not C1
+      // Logical expression with type conversion: X and boolean(Y >= 8)
+      seq($.identifier, $._kw_and, $.identifier, '(', $._constant_arg, ')'),
       seq($.attribute_name, repeat(seq(/[+\-*/]+/, choice($.number, $.identifier)))),  // attr expr: c'LENGTH - 1
       seq($._parenthesized_expression, repeat1(seq(/[+\-*/]+/, $._parenthesized_expression))),  // (expr) / (expr), (1-4)/(1-4)
       seq($.identifier, repeat1(seq(/[+\-*/&]+/, $.identifier))),  // identifier op identifier: a / b, x * y, a & b
-      seq($.identifier, '(', optional(seq($._procedure_argument, repeat(seq(',', $._procedure_argument)))), ')'),  // Function call: F(x, y)
+      // Function call with arithmetic args: index_size_f(block_size_c/4)
+      seq($.identifier, '(', optional(seq($._constant_arg, repeat(seq(',', $._constant_arg)))), ')'),
       $.identifier,
       $._string_literal,
       seq($.identifier, $._string_literal),  // e.g., x"AA" based literal
       $._parenthesized_expression  // Aggregate with nested parens supported
+    ),
+
+    // Constant argument - allows relational expressions like X >= 8
+    _constant_arg: $ => seq(
+      choice($.identifier, $.number, $._parenthesized_expression),
+      optional(seq(/[+\-*/<>=]+/, choice($.identifier, $.number, $._parenthesized_expression)))
     ),
 
     // Allocator expression: new type or new type'(value)
@@ -773,14 +809,17 @@ module.exports = grammar({
     number: _ => /[0-9][0-9_]*(\.[0-9][0-9_]*)?/,  // Integer or floating point (underscores allowed)
 
     // String literals including VHDL-specific formats
-    _string_literal: _ => choice(
-      /"[^"]*"/,              // Regular string "text"
-      /x"[0-9a-fA-F_]*"/,     // Hex string x"1A"
-      /o"[0-7_]*"/,           // Octal string o"17"
-      /b"[01_]*"/,            // Binary string b"1010"
-      /'[^']'/,               // Character literal: 'a', '0', etc.
-      /'''/                   // Apostrophe character: '''
+    // Bit string literals (X"...", B"...", O"...") are handled by external scanner
+    // (see src/scanner.c) because Tree-sitter's lexer would otherwise grab "X" as identifier
+    _string_literal: $ => choice(
+      /"[^"]*"/,                  // Regular string "text"
+      $.bit_string_literal,       // X"1A", B"1010", O"17" (from external scanner)
+      /'[^']'/,                   // Character literal: 'a', '0', etc.
+      /'''/                       // Apostrophe character: '''
     ),
+
+    // bit_string_literal is declared in externals and handled by src/scanner.c
+    // This gives it priority over the identifier rule, solving the X"..." tokenization issue
 
     // Type in parameter context - allow identifiers with optional constraints
     // Examples: "integer", "std_logic", "std_logic_vector(7 downto 0)"
@@ -788,7 +827,10 @@ module.exports = grammar({
     _parameter_type: $ => seq(
       $.identifier,
       repeat(seq('.', $.identifier)),  // Optional selected name: pkg.type
-      optional(seq('(', $._simple_expression, ')'))
+      optional(choice(
+        seq('(', $._simple_expression, ')'),  // Parenthesized constraint: (7 downto 0)
+        seq($._kw_range, $._expression, choice($._kw_to, $._kw_downto), $._expression)  // Range constraint: range 0 to 1023
+      ))
     ),
 
     // -------------------------------------------------------------------------
@@ -1299,9 +1341,9 @@ module.exports = grammar({
       optional(seq('(', $._expression, ')')),  // Guard condition
       optional($._kw_is),
       optional(seq($._kw_generic, $._parameter_list, ';')),  // Generic interface
-      optional(seq($._kw_generic, $._kw_map, '(', $._association_list, ')', ';')),  // Generic map
+      optional(seq($._kw_generic, $._kw_map, '(', $.association_list, ')', ';')),  // Generic map
       optional(seq($._kw_port, $._parameter_list, ';')),  // Port interface
-      optional(seq($._kw_port, $._kw_map, '(', $._association_list, ')', ';')),  // Port map
+      optional(seq($._kw_port, $._kw_map, '(', $.association_list, ')', ';')),  // Port map
       repeat($._block_declarative_item),
       $._kw_begin,
       repeat($._concurrent_statement),
@@ -1347,8 +1389,8 @@ module.exports = grammar({
     _kw_transport: _ => /[tT][rR][aA][nN][sS][pP][oO][rR][tT]/,
 
     // target <= expr [after time] when cond else expr [after time] when cond else expr [after time];
-    _conditional_signal_assignment: $ => seq(
-      $.identifier,
+    _conditional_signal_assignment: $ => prec.dynamic(5, seq(
+      $._name,  // Can be indexed: data(i) <= '1' when ...
       '<=',
       optional($._kw_transport),
       $._waveform_element,
@@ -1356,14 +1398,14 @@ module.exports = grammar({
       $._expression,
       repeat(seq($._kw_else, $._waveform_element, optional(seq($._kw_when, $._expression)))),
       ';'
-    ),
+    )),
 
     // with selector select target <= value [after time] when choice, value when others;
     _selected_signal_assignment: $ => seq(
       $._kw_with,
       $._expression,
       $._kw_select,
-      $.identifier,
+      $._name,  // Can be indexed: with sel select data(i) <= ...
       '<=',
       optional($._kw_transport),
       $._waveform_element,
@@ -1381,14 +1423,14 @@ module.exports = grammar({
     ),
 
     // VHDL-2008 force/release
-    _force_release_assignment: $ => seq(
-      $.identifier,
+    _force_release_assignment: $ => prec.dynamic(1, seq(
+      $._name,  // Can be indexed: data(i) <= force ...
       '<=',
       choice($._kw_force, $._kw_release),
       optional($._expression),
       optional(seq($._kw_when, $._expression)),
       ';'
-    ),
+    )),
 
     process_statement: $ => seq(
       optional(seq($.identifier, ':')),  // Optional label
@@ -1434,27 +1476,44 @@ module.exports = grammar({
         // Direct entity instantiation: entity lib.entity(arch)
         seq(
           $._kw_entity,
-          $.identifier,  // library
+          field('library', $.identifier),
           '.',
-          $.identifier,  // entity
-          optional(seq('(', $.identifier, ')'))  // Optional architecture
+          field('entity', $.identifier),
+          optional(seq('(', field('architecture', $.identifier), ')'))
         ),
         // Component instantiation: component_name
         field('component', $.identifier)
       ),
-      optional(seq($._kw_generic, $._kw_map, '(', $._association_list, ')')),
-      optional(seq($._kw_port, $._kw_map, '(', $._association_list, ')')),
+      optional($.generic_map_aspect),
+      optional($.port_map_aspect),
       ';'
     ),
 
-    _association_list: $ => seq(
-      $._association_element,
-      repeat(seq(',', $._association_element))
+    // Visible wrapper nodes for map aspects - enables extraction
+    generic_map_aspect: $ => seq(
+      $._kw_generic, $._kw_map, '(', $.association_list, ')'
     ),
 
-    _association_element: $ => choice(
-      seq($.identifier, '=>', $._expression),  // Named association
-      $._expression  // Positional association
+    port_map_aspect: $ => seq(
+      $._kw_port, $._kw_map, '(', $.association_list, ')'
+    ),
+
+    // Association list for port/generic maps
+    association_list: $ => seq(
+      $.association_element,
+      repeat(seq(',', $.association_element))
+    ),
+
+    // Association element in port/generic maps - visible for extraction
+    association_element: $ => choice(
+      // Named association: port_name => signal_name
+      seq(
+        field('formal', $.identifier),
+        '=>',
+        field('actual', choice($._expression, $._kw_open))
+      ),
+      // Positional association: just the signal/expression
+      field('actual', $._expression)
     ),
 
 
@@ -1551,18 +1610,32 @@ module.exports = grammar({
     // Case statement (regular and VHDL-2008 matching case?)
     case_statement: $ => seq(
       choice($._kw_case, seq($._kw_case, '?')),  // case or case?
-      $._expression,
+      field('expression', $._expression),
       $._kw_is,
-      repeat1($._case_alternative),
+      repeat1($.case_alternative),
       $._kw_end,
       choice($._kw_case, seq($._kw_case, '?')),  // end case or end case?
       ';'
     ),
 
-    _case_alternative: $ => seq(
-      $._kw_when, $._expression, '=>',
+    // Visible case alternative for extraction (enables latch detection)
+    case_alternative: $ => seq(
+      $._kw_when,
+      $.case_choice,
+      repeat(seq('|', $.case_choice)),  // Multiple choices: when A | B | C =>
+      '=>',
       repeat($._sequential_statement)
     ),
+
+    // Case choice - visible to detect 'others' for latch analysis
+    case_choice: $ => choice(
+      $.others_choice,  // others keyword
+      seq($._expression, choice($._kw_to, $._kw_downto), $._expression),  // Range
+      $._expression  // Simple value
+    ),
+
+    // Explicit 'others' node for easy detection
+    others_choice: _ => /[oO][tT][hH][eE][rR][sS]/,
 
     // Wait statement: wait [on signal_list] [until condition] [for time_expression];
     wait_statement: $ => seq(
@@ -1730,11 +1803,119 @@ module.exports = grammar({
       ';'
     ),
 
-    // Expression - structured to avoid consuming keywords
-    // Uses repeat of terms to stop at keywords properly
-    _expression: $ => prec(-1, repeat1($._expression_term)),
+    // =========================================================================
+    // EXPRESSION HIERARCHY
+    // =========================================================================
+    // VHDL expressions have precedence (highest to lowest):
+    //   1. Primary (literals, names, function calls, aggregates)
+    //   2. Exponential (**)
+    //   3. Multiplicative (*, /, mod, rem)
+    //   4. Sign (+, - unary)
+    //   5. Additive (+, -, &)
+    //   6. Shift (sll, srl, sla, sra, rol, ror)
+    //   7. Relational (=, /=, <, <=, >, >=)
+    //   8. Logical (and, or, xor, nand, nor, xnor)
+    //
+    // We create VISIBLE nodes for expressions we want to analyze:
+    //   - relational_expression: for trojan/trigger detection
+    //   - multiplicative_expression: for power analysis
+    //   - exponential_expression: for power analysis
+    //
+    // This structured approach lets the extractor simply walk these nodes
+    // instead of trying to reconstruct expression structure from flat tokens.
+    // =========================================================================
 
-    // Single term in an expression - identifier, number, operator, or grouped expression
+    // Expression entry point - try structured expressions first, fall back to flat
+    _expression: $ => choice(
+      $._logical_expression,
+      prec(-1, repeat1($._expression_term))  // Fallback for edge cases
+    ),
+
+    // Logical expression (lowest precedence) - can contain relational
+    _logical_expression: $ => choice(
+      prec.left(1, seq($._logical_expression, $.logical_operator, $._relational_expression)),
+      $._relational_expression
+    ),
+
+    // Relational expression - VISIBLE NODE for security analysis (trojan detection)
+    // Captures: left_operand COMPARE right_operand
+    _relational_expression: $ => choice(
+      $.relational_expression,  // Use the visible node
+      $._shift_expression
+    ),
+
+    // Visible relational expression node for extraction
+    relational_expression: $ => prec.left(2, seq(
+      field('left', $._shift_expression),
+      field('operator', $.relational_operator),
+      field('right', $._shift_expression)
+    )),
+
+    // Shift expression
+    _shift_expression: $ => choice(
+      prec.left(3, seq($._shift_expression, $.shift_operator, $._additive_expression)),
+      $._additive_expression
+    ),
+
+    // Additive expression (+, -, &)
+    _additive_expression: $ => choice(
+      prec.left(4, seq($._additive_expression, $.additive_operator, $._multiplicative_expression)),
+      $._multiplicative_expression
+    ),
+
+    // Multiplicative expression - VISIBLE NODE for power analysis
+    // Captures: left_operand * right_operand (expensive in hardware!)
+    _multiplicative_expression: $ => choice(
+      $.multiplicative_expression,  // Use the visible node
+      $._exponential_expression
+    ),
+
+    // Visible multiplicative expression node for extraction (*, /, mod, rem)
+    multiplicative_expression: $ => prec.left(5, seq(
+      field('left', $._exponential_expression),
+      field('operator', $.multiplicative_operator),
+      field('right', $._exponential_expression)
+    )),
+
+    // Exponential expression - VISIBLE NODE for power analysis
+    // Captures: base ** exponent (even more expensive!)
+    _exponential_expression: $ => choice(
+      $.exponential_expression,  // Use the visible node
+      $._unary_expression
+    ),
+
+    // Visible exponential expression node for extraction
+    exponential_expression: $ => prec.right(6, seq(
+      field('base', $._unary_expression),
+      '**',
+      field('exponent', $._unary_expression)
+    )),
+
+    // Unary expression (not, abs, +, -)
+    _unary_expression: $ => choice(
+      prec(7, seq($._kw_not, $._unary_expression)),
+      prec(7, seq($._kw_abs, $._unary_expression)),
+      prec(7, seq(choice('+', '-'), $._unary_expression)),
+      $._primary_expression
+    ),
+
+    // Primary expressions (highest precedence)
+    _primary_expression: $ => choice(
+      prec(10, $._literal),
+      $.allocator_expression,
+      $.qualified_expression,
+      prec(5, $.attribute_name),
+      $.indexed_name,
+      $.selected_name,
+      $._name_or_attribute,
+      $.external_name,
+      $.number,
+      $._kw_always,
+      $.psl_next_expression,
+      $._parenthesized_expression
+    ),
+
+    // Keep _expression_term for backward compatibility (some rules use it directly)
     _expression_term: $ => choice(
       prec(10, $._literal),  // Must be early and high precedence to catch char literals
       $.allocator_expression,  // new Type or new Type'(value)
@@ -1759,6 +1940,10 @@ module.exports = grammar({
     // Visible operator nodes for semantic analysis
     relational_operator: _ => choice('=', '/=', '<', '>', '<=', '>=', '?=', '?/=', '?<', '?>', '?<=', '?>='),
     logical_operator: _ => choice(/[aA][nN][dD]/, /[oO][rR]/, /[xX][oO][rR]/, /[nN][aA][nN][dD]/, /[nN][oO][rR]/, /[xX][nN][oO][rR]/),
+    // Split arithmetic into additive and multiplicative for proper precedence
+    additive_operator: _ => choice('+', '-', '&'),
+    multiplicative_operator: _ => choice('*', '/', /[mM][oO][dD]/, /[rR][eE][mM]/),
+    // Keep combined arithmetic_operator for backward compatibility
     arithmetic_operator: _ => choice('+', '-', '*', '/', '**', '&', /[mM][oO][dD]/, /[rR][eE][mM]/),
     shift_operator: _ => choice(/[sS][lL][lL]/, /[sS][rR][lL]/, /[sS][lL][aA]/, /[sS][rR][aA]/, /[rR][oO][lL]/, /[rR][oO][rR]/),
 
