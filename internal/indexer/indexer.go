@@ -335,6 +335,98 @@ func (idx *Indexer) Run(rootPath string) error {
 				fmt.Printf("  %s -> %s (%s, line %d)\n", dep.Source, dep.Target, seqInfo, dep.Line)
 			}
 		}
+		fmt.Printf("\n=== Verbose: Type Declarations ===\n")
+		for _, facts := range idx.Facts {
+			for _, t := range facts.Types {
+				scope := t.InPackage
+				if scope == "" {
+					scope = t.InArch
+				}
+				fmt.Printf("  %s.%s: kind=%s line=%d\n", scope, t.Name, t.Kind, t.Line)
+				if t.Kind == "enum" && len(t.EnumLiterals) > 0 {
+					fmt.Printf("    literals: %v\n", t.EnumLiterals)
+				}
+				if t.Kind == "record" && len(t.Fields) > 0 {
+					fmt.Printf("    fields:\n")
+					for _, f := range t.Fields {
+						fmt.Printf("      %s: %s\n", f.Name, f.Type)
+					}
+				}
+				if t.Kind == "array" {
+					unc := ""
+					if t.Unconstrained {
+						unc = " (unconstrained)"
+					}
+					fmt.Printf("    element: %s%s\n", t.ElementType, unc)
+				}
+			}
+		}
+		fmt.Printf("\n=== Verbose: Subtype Declarations ===\n")
+		for _, facts := range idx.Facts {
+			for _, st := range facts.Subtypes {
+				scope := st.InPackage
+				if scope == "" {
+					scope = st.InArch
+				}
+				constraint := ""
+				if st.Constraint != "" {
+					constraint = " " + st.Constraint
+				}
+				fmt.Printf("  %s.%s: %s%s\n", scope, st.Name, st.BaseType, constraint)
+			}
+		}
+		fmt.Printf("\n=== Verbose: Function Declarations ===\n")
+		for _, facts := range idx.Facts {
+			for _, fn := range facts.Functions {
+				scope := fn.InPackage
+				if scope == "" {
+					scope = fn.InArch
+				}
+				purity := "pure"
+				if !fn.IsPure {
+					purity = "impure"
+				}
+				hasBody := ""
+				if fn.HasBody {
+					hasBody = " [body]"
+				}
+				fmt.Printf("  %s.%s: %s returns %s%s\n", scope, fn.Name, purity, fn.ReturnType, hasBody)
+				if len(fn.Parameters) > 0 {
+					fmt.Printf("    params:\n")
+					for _, p := range fn.Parameters {
+						dir := p.Direction
+						if dir == "" {
+							dir = "in"
+						}
+						fmt.Printf("      %s: %s %s\n", p.Name, dir, p.Type)
+					}
+				}
+			}
+		}
+		fmt.Printf("\n=== Verbose: Procedure Declarations ===\n")
+		for _, facts := range idx.Facts {
+			for _, pr := range facts.Procedures {
+				scope := pr.InPackage
+				if scope == "" {
+					scope = pr.InArch
+				}
+				hasBody := ""
+				if pr.HasBody {
+					hasBody = " [body]"
+				}
+				fmt.Printf("  %s.%s%s\n", scope, pr.Name, hasBody)
+				if len(pr.Parameters) > 0 {
+					fmt.Printf("    params:\n")
+					for _, p := range pr.Parameters {
+						dir := p.Direction
+						if dir == "" {
+							dir = "in"
+						}
+						fmt.Printf("      %s: %s %s\n", p.Name, dir, p.Type)
+					}
+				}
+			}
+		}
 	}
 
 	// 3. Pass 2: Resolution (check imports)
@@ -441,7 +533,12 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 		Processes:             []policy.Process{},
 		ConcurrentAssignments: []policy.ConcurrentAssignment{},
 		Generates:             []policy.GenerateStatement{},
-		// Type system info for filtering
+		// Type system
+		Types:      []policy.TypeDeclaration{},
+		Subtypes:   []policy.SubtypeDeclaration{},
+		Functions:  []policy.FunctionDeclaration{},
+		Procedures: []policy.ProcedureDeclaration{},
+		// Type system info for filtering (LEGACY)
 		EnumLiterals: []string{},
 		Constants:    []string{},
 		// Advanced analysis
@@ -716,7 +813,122 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 			})
 		}
 
-		// Type system info: collect enum literals and constants for filtering
+		// Type system: Types
+		for _, t := range facts.Types {
+			// Convert enum literals (ensure not nil)
+			enumLits := t.EnumLiterals
+			if enumLits == nil {
+				enumLits = []string{}
+			}
+			// Convert record fields (ensure not nil)
+			var fields []policy.RecordField
+			for _, f := range t.Fields {
+				fields = append(fields, policy.RecordField{
+					Name: f.Name,
+					Type: f.Type,
+					Line: f.Line,
+				})
+			}
+			if fields == nil {
+				fields = []policy.RecordField{}
+			}
+			// Convert index types (ensure not nil)
+			indexTypes := t.IndexTypes
+			if indexTypes == nil {
+				indexTypes = []string{}
+			}
+			input.Types = append(input.Types, policy.TypeDeclaration{
+				Name:          t.Name,
+				Kind:          t.Kind,
+				File:          facts.File,
+				Line:          t.Line,
+				InPackage:     t.InPackage,
+				InArch:        t.InArch,
+				EnumLiterals:  enumLits,
+				Fields:        fields,
+				ElementType:   t.ElementType,
+				IndexTypes:    indexTypes,
+				Unconstrained: t.Unconstrained,
+				BaseUnit:      t.BaseUnit,
+				RangeLow:      t.RangeLow,
+				RangeHigh:     t.RangeHigh,
+				RangeDir:      t.RangeDir,
+			})
+		}
+
+		// Type system: Subtypes
+		for _, st := range facts.Subtypes {
+			input.Subtypes = append(input.Subtypes, policy.SubtypeDeclaration{
+				Name:       st.Name,
+				BaseType:   st.BaseType,
+				Constraint: st.Constraint,
+				Resolution: st.Resolution,
+				File:       facts.File,
+				Line:       st.Line,
+				InPackage:  st.InPackage,
+				InArch:     st.InArch,
+			})
+		}
+
+		// Type system: Functions
+		for _, fn := range facts.Functions {
+			// Convert parameters (ensure not nil)
+			var params []policy.SubprogramParameter
+			for _, p := range fn.Parameters {
+				params = append(params, policy.SubprogramParameter{
+					Name:      p.Name,
+					Direction: p.Direction,
+					Type:      p.Type,
+					Class:     p.Class,
+					Default:   p.Default,
+					Line:      p.Line,
+				})
+			}
+			if params == nil {
+				params = []policy.SubprogramParameter{}
+			}
+			input.Functions = append(input.Functions, policy.FunctionDeclaration{
+				Name:       fn.Name,
+				ReturnType: fn.ReturnType,
+				Parameters: params,
+				IsPure:     fn.IsPure,
+				HasBody:    fn.HasBody,
+				File:       facts.File,
+				Line:       fn.Line,
+				InPackage:  fn.InPackage,
+				InArch:     fn.InArch,
+			})
+		}
+
+		// Type system: Procedures
+		for _, pr := range facts.Procedures {
+			// Convert parameters (ensure not nil)
+			var params []policy.SubprogramParameter
+			for _, p := range pr.Parameters {
+				params = append(params, policy.SubprogramParameter{
+					Name:      p.Name,
+					Direction: p.Direction,
+					Type:      p.Type,
+					Class:     p.Class,
+					Default:   p.Default,
+					Line:      p.Line,
+				})
+			}
+			if params == nil {
+				params = []policy.SubprogramParameter{}
+			}
+			input.Procedures = append(input.Procedures, policy.ProcedureDeclaration{
+				Name:       pr.Name,
+				Parameters: params,
+				HasBody:    pr.HasBody,
+				File:       facts.File,
+				Line:       pr.Line,
+				InPackage:  pr.InPackage,
+				InArch:     pr.InArch,
+			})
+		}
+
+		// Type system info (LEGACY): collect enum literals and constants for filtering
 		input.EnumLiterals = append(input.EnumLiterals, facts.EnumLiterals...)
 		input.Constants = append(input.Constants, facts.Constants...)
 	}

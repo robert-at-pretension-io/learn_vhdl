@@ -21,7 +21,12 @@ package schema
     processes:              [...#Process]
     concurrent_assignments: [...#ConcurrentAssignment]
     generates:              [...#GenerateStatement]
-    // Type system info for filtering false positives
+    // Type system
+    types:                  [...#TypeDeclaration]
+    subtypes:               [...#SubtypeDeclaration]
+    functions:              [...#FunctionDeclaration]
+    procedures:             [...#ProcedureDeclaration]
+    // Type system info for filtering false positives (LEGACY - use types instead)
     enum_literals:          [...string]  // Enum literals from type declarations (e.g., S_IDLE, S_RUN)
     constants:              [...string]  // Constants from constant declarations
     // Advanced analysis for security/power/correctness
@@ -217,4 +222,85 @@ package schema
     signal_count:   int & >=0                           // Signals declared inside
     instance_count: int & >=0                           // Instances inside
     process_count:  int & >=0                           // Processes inside
+}
+
+// =========================================================================
+// TYPE SYSTEM DEFINITIONS
+// =========================================================================
+
+// TypeDeclaration represents a VHDL type declaration
+#TypeDeclaration: {
+    name:           string & =~"^[a-zA-Z_][a-zA-Z0-9_]*$"
+    kind:           "enum" | "record" | "array" | "physical" | "access" | "file" | "incomplete" | "protected" | "range" | "alias"
+    file:           string & =~".+\\.(vhd|vhdl)$"
+    line:           int & >=1
+    in_package?:    string                              // Package containing this type
+    in_arch?:       string                              // Architecture if local type
+    // Enum-specific
+    enum_literals?: [...string]                         // For enums: ["IDLE", "RUN", "STOP"]
+    // Record-specific
+    fields?:        [...#RecordField]                   // For records: field definitions
+    // Array-specific
+    element_type?:  string                              // For arrays: element type
+    index_types?:   [...string]                         // For arrays: index type(s)
+    unconstrained?: bool                                // For arrays: true if "range <>"
+    // Physical-specific
+    base_unit?:     string                              // For physical: base unit name
+    // Range-specific
+    range_low?:     string                              // For range types: low bound
+    range_high?:    string                              // For range types: high bound
+    range_dir?:     "to" | "downto" | ""                // Range direction
+}
+
+// RecordField represents a field in a record type
+#RecordField: {
+    name: string & =~"^[a-zA-Z_][a-zA-Z0-9_]*$"
+    type: string & !=""
+    line: int & >=1
+}
+
+// SubtypeDeclaration represents a VHDL subtype declaration
+#SubtypeDeclaration: {
+    name:        string & =~"^[a-zA-Z_][a-zA-Z0-9_]*$"
+    base_type:   string & !=""                          // The parent type
+    constraint?: string                                 // Range or index constraint
+    resolution?: string                                 // Resolution function
+    file:        string & =~".+\\.(vhd|vhdl)$"
+    line:        int & >=1
+    in_package?: string
+    in_arch?:    string
+}
+
+// FunctionDeclaration represents a VHDL function declaration or body
+#FunctionDeclaration: {
+    name:        string                                 // Can be identifier or operator symbol
+    return_type: string & !=""
+    parameters?: [...#SubprogramParameter]
+    is_pure:     bool                                   // true for pure (default), false for impure
+    has_body:    bool                                   // true if function body, not just declaration
+    file:        string & =~".+\\.(vhd|vhdl)$"
+    line:        int & >=1
+    in_package?: string
+    in_arch?:    string
+}
+
+// ProcedureDeclaration represents a VHDL procedure declaration or body
+#ProcedureDeclaration: {
+    name:        string & =~"^[a-zA-Z_][a-zA-Z0-9_]*$"
+    parameters?: [...#SubprogramParameter]
+    has_body:    bool                                   // true if procedure body
+    file:        string & =~".+\\.(vhd|vhdl)$"
+    line:        int & >=1
+    in_package?: string
+    in_arch?:    string
+}
+
+// SubprogramParameter represents a parameter in a function or procedure
+#SubprogramParameter: {
+    name:       string & =~"^[a-zA-Z_][a-zA-Z0-9_]*$"
+    direction?: "in" | "out" | "inout" | ""             // Empty defaults to "in"
+    type:       string & !=""
+    class?:     "signal" | "variable" | "constant" | "file" | ""
+    default?:   string                                  // Default value expression
+    line:       int & >=1
 }

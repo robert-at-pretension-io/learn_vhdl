@@ -609,7 +609,17 @@ These constructs cause parse failures in production code:
 
 ---
 
-## Implementation Roadmap
+## Prioritized Roadmap
+
+Based on impact analysis, these are the highest-value improvements ranked by ROI:
+
+| Rank | Task | Impact | Blocking |
+|------|------|--------|----------|
+| **#1** | **Type System & Function Extraction** | Enables type-aware rules, width checking | Latch detection, overload resolution |
+| **#2** | **Latch Inference Detection** | Critical synthesis rule | Needs type info for proper detection |
+| **#3** | **Package Contents Indexing** | Complete cross-file resolution | Type lookups, constant evaluation |
+| **#4** | **Generate Elaboration** | Evaluate for-generate ranges | Instance counting, signal tracing |
+| **#5** | **CDC Enhancement** | Clock domain crossing analysis | Multi-clock designs |
 
 ### Phase 1: Grammar Completion (Current Focus)
 - [x] 98.75% valid acceptance rate
@@ -624,9 +634,11 @@ These constructs cause parse failures in production code:
 - [ ] Package contents indexing
 - [ ] Library-qualified name resolution
 
-### Phase 3: Type System
-- [ ] Function/procedure extraction
-- [ ] Type signature storage
+### Phase 3: Type System (HIGH PRIORITY)
+- [ ] Function/procedure extraction with signatures
+- [ ] Type declaration extraction (records, enums, arrays)
+- [ ] Constant extraction with values
+- [ ] Type signature storage in indexer
 - [ ] Overload resolution
 - [ ] Type compatibility checking
 - [ ] Width validation

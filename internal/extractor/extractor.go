@@ -68,7 +68,12 @@ type FileFacts struct {
 	Instances      []Instance           // Component/entity instantiations
 	CaseStatements []CaseStatement      // Case statements for latch detection
 	Generates      []GenerateStatement  // Generate statements (for-generate, if-generate, case-generate)
-	// Type system information (for filtering false positives)
+	// Type system
+	Types      []TypeDeclaration      // Type declarations (enum, record, array, etc.)
+	Subtypes   []SubtypeDeclaration   // Subtype declarations
+	Functions  []FunctionDeclaration  // Function declarations/bodies
+	Procedures []ProcedureDeclaration // Procedure declarations/bodies
+	// Type system information (for filtering false positives) - LEGACY, use Types instead
 	EnumLiterals []string          // Enum literals from type declarations (e.g., S_IDLE, S_RUN)
 	Constants    []string          // Constants from constant declarations
 	// Concurrent statements (outside processes)
@@ -277,6 +282,87 @@ type Port struct {
 	InEntity  string // Which entity this port belongs to
 }
 
+// =============================================================================
+// TYPE SYSTEM TYPES
+// =============================================================================
+// These types enable type-aware analysis: overload resolution, width checking,
+// latch detection, and more.
+
+// TypeDeclaration represents a VHDL type declaration
+// Captures: type name is (enum_literals) | record ... | array ... | range ...
+type TypeDeclaration struct {
+	Name       string        // Type name (e.g., "state_t")
+	Kind       string        // "enum", "record", "array", "physical", "access", "file", "incomplete", "protected"
+	Line       int
+	InPackage  string        // Package containing this type (empty if in architecture)
+	InArch     string        // Architecture containing this type (empty if in package)
+	// Enum-specific
+	EnumLiterals []string    // For enums: ["IDLE", "RUN", "STOP"]
+	// Record-specific
+	Fields []RecordField     // For records: field definitions
+	// Array-specific
+	ElementType  string      // For arrays: element type
+	IndexTypes   []string    // For arrays: index type(s) or range(s)
+	Unconstrained bool       // For arrays: true if "range <>"
+	// Physical-specific (time, etc.)
+	BaseUnit     string      // For physical: base unit name
+	// Range-specific
+	RangeLow     string      // For integer/real subtypes: low bound
+	RangeHigh    string      // For integer/real subtypes: high bound
+	RangeDir     string      // "to" or "downto"
+}
+
+// RecordField represents a field in a record type
+type RecordField struct {
+	Name string
+	Type string
+	Line int
+}
+
+// SubtypeDeclaration represents a VHDL subtype declaration
+// Captures: subtype name is [resolution] base_type [constraint]
+type SubtypeDeclaration struct {
+	Name       string
+	BaseType   string   // The parent type
+	Constraint string   // Range or index constraint (if any)
+	Resolution string   // Resolution function (if any)
+	Line       int
+	InPackage  string
+	InArch     string
+}
+
+// FunctionDeclaration represents a VHDL function declaration or body
+type FunctionDeclaration struct {
+	Name       string
+	ReturnType string
+	Parameters []SubprogramParameter
+	IsPure     bool    // true for pure functions (default), false for impure
+	HasBody    bool    // true if this is a function body (not just declaration)
+	Line       int
+	InPackage  string  // Package containing this function
+	InArch     string  // Architecture if local function
+}
+
+// ProcedureDeclaration represents a VHDL procedure declaration or body
+type ProcedureDeclaration struct {
+	Name       string
+	Parameters []SubprogramParameter
+	HasBody    bool    // true if this is a procedure body (not just declaration)
+	Line       int
+	InPackage  string  // Package containing this procedure
+	InArch     string  // Architecture if local procedure
+}
+
+// SubprogramParameter represents a parameter in a function or procedure
+type SubprogramParameter struct {
+	Name      string
+	Direction string  // "in", "out", "inout" (empty defaults to "in")
+	Type      string
+	Class     string  // "signal", "variable", "constant", "file" (empty defaults based on direction)
+	Default   string  // Default value expression (if any)
+	Line      int
+}
+
 // New creates a new Extractor with VHDL language loaded
 func New() *Extractor {
 	// Load the VHDL language (thread-safe, can be shared)
@@ -321,7 +407,14 @@ func (e *Extractor) Extract(filePath string) (FileFacts, error) {
 }
 
 // walkTree traverses the syntax tree and extracts relevant nodes
+// context is the current architecture name (for scoping signals, processes, etc.)
+// We also need to track package context separately for type declarations
 func (e *Extractor) walkTree(node *sitter.Node, source []byte, facts *FileFacts, context string) {
+	e.walkTreeWithPkg(node, source, facts, "", context)
+}
+
+// walkTreeWithPkg traverses with both package and architecture context
+func (e *Extractor) walkTreeWithPkg(node *sitter.Node, source []byte, facts *FileFacts, pkgContext, archContext string) {
 	if node == nil {
 		return
 	}
@@ -334,17 +427,17 @@ func (e *Extractor) walkTree(node *sitter.Node, source []byte, facts *FileFacts,
 		facts.Entities = append(facts.Entities, entity)
 		// Extract ports from entity
 		e.extractPortsFromEntity(node, source, entity.Name, facts)
-		context = entity.Name
+		archContext = entity.Name
 
 	case "architecture_body":
 		arch := e.extractArchitecture(node, source)
 		facts.Architectures = append(facts.Architectures, arch)
-		context = arch.Name
+		archContext = arch.Name
 
 	case "package_declaration":
 		pkg := e.extractPackage(node, source)
 		facts.Packages = append(facts.Packages, pkg)
-		context = pkg.Name
+		pkgContext = pkg.Name
 
 	case "use_clause":
 		dep := e.extractUseClause(node, source, facts.File)
@@ -369,18 +462,36 @@ func (e *Extractor) walkTree(node *sitter.Node, source []byte, facts *FileFacts,
 			})
 		}
 		// Also extract as Instance with port/generic maps for system-level analysis
-		inst := e.extractInstance(node, source, context)
+		inst := e.extractInstance(node, source, archContext)
 		facts.Instances = append(facts.Instances, inst)
 
 	case "signal_declaration":
-		signals := e.extractSignals(node, source, context)
+		signals := e.extractSignals(node, source, archContext)
 		facts.Signals = append(facts.Signals, signals...)
 
 	case "type_declaration":
-		// Extract enum literals from enumeration type definitions
-		// These are used to filter out false positives in signal analysis
-		enumLits := e.extractEnumLiterals(node, source)
-		facts.EnumLiterals = append(facts.EnumLiterals, enumLits...)
+		// Extract full type declaration
+		td := e.extractTypeDeclaration(node, source, pkgContext, archContext)
+		facts.Types = append(facts.Types, td)
+		// Also populate legacy EnumLiterals for backward compatibility
+		if td.Kind == "enum" {
+			facts.EnumLiterals = append(facts.EnumLiterals, td.EnumLiterals...)
+		}
+
+	case "subtype_declaration":
+		// Extract subtype declaration
+		st := e.extractSubtypeDeclaration(node, source, pkgContext, archContext)
+		facts.Subtypes = append(facts.Subtypes, st)
+
+	case "function_declaration":
+		// Extract function declaration/body
+		fd := e.extractFunctionDeclaration(node, source, pkgContext, archContext)
+		facts.Functions = append(facts.Functions, fd)
+
+	case "procedure_declaration":
+		// Extract procedure declaration/body
+		pd := e.extractProcedureDeclaration(node, source, pkgContext, archContext)
+		facts.Procedures = append(facts.Procedures, pd)
 
 	case "constant_declaration":
 		// Extract constant names to filter out false positives
@@ -394,7 +505,7 @@ func (e *Extractor) walkTree(node *sitter.Node, source []byte, facts *FileFacts,
 	case "signal_assignment":
 		// Concurrent signal assignment (outside processes)
 		// Note: Sequential assignments inside processes are "sequential_signal_assignment"
-		ca := e.extractConcurrentAssignment(node, source, context)
+		ca := e.extractConcurrentAssignment(node, source, archContext)
 		facts.ConcurrentAssignments = append(facts.ConcurrentAssignments, ca)
 		// Add to signal usages
 		facts.SignalUsages = append(facts.SignalUsages, SignalUsage{
@@ -412,20 +523,20 @@ func (e *Extractor) walkTree(node *sitter.Node, source []byte, facts *FileFacts,
 			})
 		}
 		// Extract signal dependencies for loop detection
-		deps := e.extractSignalDepsFromConcurrent(ca, context)
+		deps := e.extractSignalDepsFromConcurrent(ca, archContext)
 		facts.SignalDeps = append(facts.SignalDeps, deps...)
 
 	case "process_statement":
-		proc := e.extractProcess(node, source, context)
+		proc := e.extractProcess(node, source, archContext)
 		facts.Processes = append(facts.Processes, proc)
 		// Extract case statements within the process for latch detection
-		e.extractCaseStatementsFromProcess(node, source, context, proc.Label, facts)
+		e.extractCaseStatementsFromProcess(node, source, archContext, proc.Label, facts)
 		// Extract comparisons for trojan/trigger detection
-		e.extractComparisonsFromProcess(node, source, context, proc.Label, facts)
+		e.extractComparisonsFromProcess(node, source, archContext, proc.Label, facts)
 		// Extract arithmetic operations for power analysis
-		e.extractArithmeticOpsFromProcess(node, source, context, proc.Label, facts)
+		e.extractArithmeticOpsFromProcess(node, source, archContext, proc.Label, facts)
 		// Extract signal dependencies for loop detection
-		e.extractSignalDepsFromProcess(node, source, context, proc.Label, proc.IsSequential, facts)
+		e.extractSignalDepsFromProcess(node, source, archContext, proc.Label, proc.IsSequential, facts)
 
 		// Add to semantic collections
 		if proc.ClockSignal != "" {
@@ -469,20 +580,20 @@ func (e *Extractor) walkTree(node *sitter.Node, source []byte, facts *FileFacts,
 
 	case "generate_statement":
 		// Extract generate statement with its nested declarations
-		gen := e.extractGenerateStatement(node, source, context)
+		gen := e.extractGenerateStatement(node, source, archContext)
 		facts.Generates = append(facts.Generates, gen)
 		// Add scoped signals to the main facts with generate context
 		// This allows policies to know which signals are inside generate blocks
 		for _, sig := range gen.Signals {
-			sig.InEntity = context + "." + gen.Label // Scope: arch.gen_label
+			sig.InEntity = archContext + "." + gen.Label // Scope: arch.gen_label
 			facts.Signals = append(facts.Signals, sig)
 		}
 		for _, inst := range gen.Instances {
-			inst.InArch = context + "." + gen.Label
+			inst.InArch = archContext + "." + gen.Label
 			facts.Instances = append(facts.Instances, inst)
 		}
 		for _, proc := range gen.Processes {
-			proc.InArch = context + "." + gen.Label
+			proc.InArch = archContext + "." + gen.Label
 			facts.Processes = append(facts.Processes, proc)
 		}
 		// Don't recurse manually - extractGenerateStatement handles nested content
@@ -491,7 +602,7 @@ func (e *Extractor) walkTree(node *sitter.Node, source []byte, facts *FileFacts,
 
 	// Recurse into children
 	for i := 0; i < int(node.ChildCount()); i++ {
-		e.walkTree(node.Child(i), source, facts, context)
+		e.walkTreeWithPkg(node.Child(i), source, facts, pkgContext, archContext)
 	}
 }
 
@@ -2000,6 +2111,435 @@ func (e *Extractor) extractGenerateBody(node *sitter.Node, source []byte, gen *G
 		}
 	}
 	walk(node)
+}
+
+// =============================================================================
+// TYPE SYSTEM EXTRACTION
+// =============================================================================
+
+// extractTypeDeclaration extracts a type declaration (enum, record, array, etc.)
+// Grammar: type name is definition;
+func (e *Extractor) extractTypeDeclaration(node *sitter.Node, source []byte, pkgContext, archContext string) TypeDeclaration {
+	td := TypeDeclaration{
+		Line:      int(node.StartPoint().Row) + 1,
+		InPackage: pkgContext,
+		InArch:    archContext,
+	}
+
+	// Extract type name
+	if nameNode := node.ChildByFieldName("name"); nameNode != nil {
+		td.Name = nameNode.Content(source)
+	}
+
+	// Extract type definition
+	if defNode := node.ChildByFieldName("definition"); defNode != nil {
+		defType := defNode.Type()
+
+		switch defType {
+		case "enumeration_type_definition":
+			td.Kind = "enum"
+			td.EnumLiterals = e.extractEnumLiteralsFromDef(defNode, source)
+
+		case "record_type_definition":
+			td.Kind = "record"
+			td.Fields = e.extractRecordFields(defNode, source)
+
+		case "array_type_definition":
+			td.Kind = "array"
+			e.extractArrayTypeDetails(defNode, source, &td)
+
+		case "physical_type_definition":
+			td.Kind = "physical"
+			e.extractPhysicalTypeDetails(defNode, source, &td)
+
+		default:
+			// Could be a simple type (integer range), access type, file type, etc.
+			content := strings.ToLower(defNode.Content(source))
+			if strings.HasPrefix(content, "access") {
+				td.Kind = "access"
+			} else if strings.HasPrefix(content, "file") {
+				td.Kind = "file"
+			} else if strings.Contains(content, "range") {
+				td.Kind = "range"
+				// Try to extract range details
+				e.extractRangeDetails(defNode, source, &td)
+			} else {
+				td.Kind = "alias" // Simple type alias
+			}
+		}
+	} else {
+		// Incomplete type declaration: type name;
+		td.Kind = "incomplete"
+	}
+
+	return td
+}
+
+// extractEnumLiteralsFromDef extracts enum literals from an enumeration_type_definition
+func (e *Extractor) extractEnumLiteralsFromDef(node *sitter.Node, source []byte) []string {
+	var literals []string
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		switch child.Type() {
+		case "identifier":
+			literals = append(literals, child.Content(source))
+		case "character_literal":
+			// Character enums like '0', '1', 'Z'
+			literals = append(literals, child.Content(source))
+		}
+	}
+	return literals
+}
+
+// extractRecordFields extracts fields from a record_type_definition
+func (e *Extractor) extractRecordFields(node *sitter.Node, source []byte) []RecordField {
+	var fields []RecordField
+
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		if child.Type() == "element_declaration" {
+			// element_declaration: name[, name...] : type;
+			fieldLine := int(child.StartPoint().Row) + 1
+			var names []string
+			var fieldType string
+			sawColon := false
+
+			for j := 0; j < int(child.ChildCount()); j++ {
+				elem := child.Child(j)
+				if elem.Content(source) == ":" {
+					sawColon = true
+					continue
+				}
+				if elem.Type() == "identifier" {
+					if !sawColon {
+						names = append(names, elem.Content(source))
+					} else if fieldType == "" {
+						fieldType = elem.Content(source)
+					}
+				}
+			}
+
+			// Also check for field name via grammar field
+			if nameNode := child.ChildByFieldName("name"); nameNode != nil && len(names) == 0 {
+				names = append(names, nameNode.Content(source))
+			}
+			if typeNode := child.ChildByFieldName("type"); typeNode != nil {
+				fieldType = typeNode.Content(source)
+			}
+
+			// Create a field for each name
+			for _, name := range names {
+				fields = append(fields, RecordField{
+					Name: name,
+					Type: fieldType,
+					Line: fieldLine,
+				})
+			}
+		}
+	}
+
+	return fields
+}
+
+// extractArrayTypeDetails extracts array type information
+func (e *Extractor) extractArrayTypeDetails(node *sitter.Node, source []byte, td *TypeDeclaration) {
+	// array (index_constraint, ...) of element_type
+	content := node.Content(source)
+
+	// Check for unconstrained array (range <>)
+	if strings.Contains(content, "<>") {
+		td.Unconstrained = true
+	}
+
+	// Walk children to find index types and element type
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		childType := child.Type()
+
+		// Index constraints come before 'of' keyword
+		if childType == "identifier" {
+			// Could be index type or element type
+			// Element type comes after 'of'
+			if td.ElementType == "" {
+				// Check if previous sibling was 'of' keyword
+				if i > 0 {
+					prev := node.Child(i - 1)
+					if strings.ToLower(prev.Content(source)) == "of" {
+						td.ElementType = child.Content(source)
+						continue
+					}
+				}
+				// Otherwise it's an index type
+				td.IndexTypes = append(td.IndexTypes, child.Content(source))
+			}
+		}
+	}
+
+	// If we couldn't extract element type, try getting from content
+	if td.ElementType == "" {
+		parts := strings.Split(strings.ToLower(content), " of ")
+		if len(parts) > 1 {
+			// Element type is after "of"
+			elemPart := strings.TrimSpace(parts[1])
+			elemPart = strings.TrimRight(elemPart, ";")
+			td.ElementType = elemPart
+		}
+	}
+}
+
+// extractPhysicalTypeDetails extracts physical type information (time, etc.)
+func (e *Extractor) extractPhysicalTypeDetails(node *sitter.Node, source []byte, td *TypeDeclaration) {
+	// Physical type: range X to Y units base_unit; secondary_units... end units;
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		if child.Type() == "identifier" && td.BaseUnit == "" {
+			td.BaseUnit = child.Content(source)
+			break
+		}
+	}
+}
+
+// extractRangeDetails extracts range constraint details
+func (e *Extractor) extractRangeDetails(node *sitter.Node, source []byte, td *TypeDeclaration) {
+	content := node.Content(source)
+	lowerContent := strings.ToLower(content)
+
+	// Look for "to" or "downto"
+	if strings.Contains(lowerContent, " downto ") {
+		td.RangeDir = "downto"
+		parts := strings.Split(lowerContent, " downto ")
+		if len(parts) == 2 {
+			// Extract the actual values (strip "range" keyword if present)
+			low := strings.TrimPrefix(parts[0], "range ")
+			td.RangeLow = strings.TrimSpace(low)
+			td.RangeHigh = strings.TrimSpace(parts[1])
+		}
+	} else if strings.Contains(lowerContent, " to ") {
+		td.RangeDir = "to"
+		parts := strings.Split(lowerContent, " to ")
+		if len(parts) == 2 {
+			low := strings.TrimPrefix(parts[0], "range ")
+			td.RangeLow = strings.TrimSpace(low)
+			td.RangeHigh = strings.TrimSpace(parts[1])
+		}
+	}
+}
+
+// extractSubtypeDeclaration extracts a subtype declaration
+// Grammar: subtype name is [resolution] type_mark [constraint];
+func (e *Extractor) extractSubtypeDeclaration(node *sitter.Node, source []byte, pkgContext, archContext string) SubtypeDeclaration {
+	st := SubtypeDeclaration{
+		Line:      int(node.StartPoint().Row) + 1,
+		InPackage: pkgContext,
+		InArch:    archContext,
+	}
+
+	// Extract subtype name
+	if nameNode := node.ChildByFieldName("name"); nameNode != nil {
+		st.Name = nameNode.Content(source)
+	}
+
+	// Extract base type from 'indication' field (grammar: field('indication', $._type_mark))
+	if indicationNode := node.ChildByFieldName("indication"); indicationNode != nil {
+		st.BaseType = indicationNode.Content(source)
+	}
+
+	// Also try 'prefix' field (some grammar variants)
+	if st.BaseType == "" {
+		if prefixNode := node.ChildByFieldName("prefix"); prefixNode != nil {
+			st.BaseType = prefixNode.Content(source)
+		}
+	}
+
+	// Fallback: walk children to find base type after "is"
+	if st.BaseType == "" {
+		sawIs := false
+		for i := 0; i < int(node.ChildCount()); i++ {
+			child := node.Child(i)
+			childContent := child.Content(source)
+
+			if strings.ToLower(childContent) == "is" {
+				sawIs = true
+				continue
+			}
+
+			if sawIs && child.Type() == "identifier" && st.BaseType == "" {
+				st.BaseType = childContent
+				break
+			}
+		}
+	}
+
+	// Extract resolution function if present
+	if resNode := node.ChildByFieldName("resolution"); resNode != nil {
+		st.Resolution = resNode.Content(source)
+	}
+
+	// Try to extract constraint from content
+	content := node.Content(source)
+	if idx := strings.Index(strings.ToLower(content), "range"); idx != -1 {
+		// Has range constraint
+		st.Constraint = strings.TrimSpace(content[idx:])
+		st.Constraint = strings.TrimRight(st.Constraint, ";")
+	} else if idx := strings.Index(content, "("); idx != -1 {
+		// Has index constraint like (0 to 7)
+		endIdx := strings.LastIndex(content, ")")
+		if endIdx > idx {
+			st.Constraint = content[idx : endIdx+1]
+		}
+	}
+
+	return st
+}
+
+// extractFunctionDeclaration extracts a function declaration or body
+// Grammar: [pure|impure] function name [parameters] return type [is ... end];
+func (e *Extractor) extractFunctionDeclaration(node *sitter.Node, source []byte, pkgContext, archContext string) FunctionDeclaration {
+	fd := FunctionDeclaration{
+		Line:      int(node.StartPoint().Row) + 1,
+		InPackage: pkgContext,
+		InArch:    archContext,
+		IsPure:    true, // Default is pure
+	}
+
+	// Check for pure/impure
+	content := strings.ToLower(node.Content(source))
+	if strings.HasPrefix(content, "impure") {
+		fd.IsPure = false
+	}
+
+	// Check if this has a body (contains "is" followed by "begin")
+	if strings.Contains(content, " is ") && strings.Contains(content, "begin") {
+		fd.HasBody = true
+	}
+
+	// Extract function name
+	if nameNode := node.ChildByFieldName("name"); nameNode != nil {
+		fd.Name = nameNode.Content(source)
+	}
+
+	// Extract return type
+	if retNode := node.ChildByFieldName("return_type"); retNode != nil {
+		fd.ReturnType = retNode.Content(source)
+	}
+
+	// Extract parameters
+	fd.Parameters = e.extractSubprogramParameters(node, source)
+
+	return fd
+}
+
+// extractProcedureDeclaration extracts a procedure declaration or body
+// Grammar: procedure name [parameters] [is ... end];
+func (e *Extractor) extractProcedureDeclaration(node *sitter.Node, source []byte, pkgContext, archContext string) ProcedureDeclaration {
+	pd := ProcedureDeclaration{
+		Line:      int(node.StartPoint().Row) + 1,
+		InPackage: pkgContext,
+		InArch:    archContext,
+	}
+
+	// Check if this has a body
+	content := strings.ToLower(node.Content(source))
+	if strings.Contains(content, " is ") && strings.Contains(content, "begin") {
+		pd.HasBody = true
+	}
+
+	// Extract procedure name
+	if nameNode := node.ChildByFieldName("name"); nameNode != nil {
+		pd.Name = nameNode.Content(source)
+	}
+
+	// Extract parameters
+	pd.Parameters = e.extractSubprogramParameters(node, source)
+
+	return pd
+}
+
+// extractSubprogramParameters extracts parameters from a function/procedure
+func (e *Extractor) extractSubprogramParameters(node *sitter.Node, source []byte) []SubprogramParameter {
+	var params []SubprogramParameter
+
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n == nil {
+			return
+		}
+
+		if n.Type() == "parameter" {
+			// Extract parameter details
+			paramLine := int(n.StartPoint().Row) + 1
+			var names []string
+			var paramType string
+			var direction string
+			var class string
+			var defaultVal string
+			sawColon := false
+
+			// Check for class (signal/variable/constant)
+			if classNode := n.ChildByFieldName("class"); classNode != nil {
+				class = strings.ToLower(classNode.Content(source))
+			}
+
+			// Check for direction
+			if dirNode := n.ChildByFieldName("direction"); dirNode != nil {
+				direction = strings.ToLower(dirNode.Content(source))
+			}
+
+			// Check for default
+			if defNode := n.ChildByFieldName("default"); defNode != nil {
+				defaultVal = defNode.Content(source)
+			}
+
+			// Walk children for names and type
+			for i := 0; i < int(n.ChildCount()); i++ {
+				child := n.Child(i)
+				childContent := child.Content(source)
+
+				if childContent == ":" {
+					sawColon = true
+					continue
+				}
+
+				if child.Type() == "identifier" {
+					if !sawColon {
+						names = append(names, childContent)
+					} else if paramType == "" {
+						paramType = childContent
+					}
+				}
+
+				// Handle parameter class
+				if child.Type() == "parameter_class" {
+					class = strings.ToLower(childContent)
+				}
+
+				// Handle port_direction
+				if child.Type() == "port_direction" {
+					direction = strings.ToLower(childContent)
+				}
+			}
+
+			// Create a parameter for each name
+			for _, name := range names {
+				params = append(params, SubprogramParameter{
+					Name:      name,
+					Direction: direction,
+					Type:      paramType,
+					Class:     class,
+					Default:   defaultVal,
+					Line:      paramLine,
+				})
+			}
+		}
+
+		// Recurse into children
+		for i := 0; i < int(n.ChildCount()); i++ {
+			walk(n.Child(i))
+		}
+	}
+	walk(node)
+
+	return params
 }
 
 // extractSimple is a fallback regex-based extractor when Tree-sitter isn't available

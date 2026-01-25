@@ -53,7 +53,12 @@ type Input struct {
 	Processes             []Process              `json:"processes"`              // Process statements for sensitivity/clock analysis
 	ConcurrentAssignments []ConcurrentAssignment `json:"concurrent_assignments"` // Concurrent signal assignments (outside processes)
 	Generates             []GenerateStatement    `json:"generates"`              // Generate statements (for/if/case generate)
-	// Type system info for filtering false positives
+	// Type system
+	Types      []TypeDeclaration      `json:"types"`      // Type declarations (enum, record, array, etc.)
+	Subtypes   []SubtypeDeclaration   `json:"subtypes"`   // Subtype declarations
+	Functions  []FunctionDeclaration  `json:"functions"`  // Function declarations/bodies
+	Procedures []ProcedureDeclaration `json:"procedures"` // Procedure declarations/bodies
+	// Type system info for filtering false positives (LEGACY - use Types instead)
 	EnumLiterals []string `json:"enum_literals"` // Enum literals from type declarations
 	Constants    []string `json:"constants"`     // Constants from constant declarations
 	// Advanced analysis for security/power/correctness
@@ -242,6 +247,82 @@ type GenerateStatement struct {
 	SignalCount   int `json:"signal_count"`   // Number of signals declared inside
 	InstanceCount int `json:"instance_count"` // Number of instances inside
 	ProcessCount  int `json:"process_count"`  // Number of processes inside
+}
+
+// =============================================================================
+// TYPE SYSTEM TYPES
+// =============================================================================
+
+// TypeDeclaration represents a VHDL type declaration
+type TypeDeclaration struct {
+	Name         string        `json:"name"`                     // Type name
+	Kind         string        `json:"kind"`                     // "enum", "record", "array", "physical", "access", "file", "incomplete", "protected"
+	File         string        `json:"file"`
+	Line         int           `json:"line"`
+	InPackage    string        `json:"in_package,omitempty"`     // Package containing this type
+	InArch       string        `json:"in_arch,omitempty"`        // Architecture if local type
+	EnumLiterals []string      `json:"enum_literals,omitempty"`  // For enums
+	Fields       []RecordField `json:"fields,omitempty"`         // For records
+	ElementType  string        `json:"element_type,omitempty"`   // For arrays
+	IndexTypes   []string      `json:"index_types,omitempty"`    // For arrays
+	Unconstrained bool         `json:"unconstrained,omitempty"`  // For arrays
+	BaseUnit     string        `json:"base_unit,omitempty"`      // For physical types
+	RangeLow     string        `json:"range_low,omitempty"`      // For range types
+	RangeHigh    string        `json:"range_high,omitempty"`     // For range types
+	RangeDir     string        `json:"range_dir,omitempty"`      // "to" or "downto"
+}
+
+// RecordField represents a field in a record type
+type RecordField struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+	Line int    `json:"line"`
+}
+
+// SubtypeDeclaration represents a VHDL subtype declaration
+type SubtypeDeclaration struct {
+	Name       string `json:"name"`
+	BaseType   string `json:"base_type"`
+	Constraint string `json:"constraint,omitempty"`
+	Resolution string `json:"resolution,omitempty"`
+	File       string `json:"file"`
+	Line       int    `json:"line"`
+	InPackage  string `json:"in_package,omitempty"`
+	InArch     string `json:"in_arch,omitempty"`
+}
+
+// FunctionDeclaration represents a VHDL function declaration or body
+type FunctionDeclaration struct {
+	Name       string                `json:"name"`
+	ReturnType string                `json:"return_type"`
+	Parameters []SubprogramParameter `json:"parameters,omitempty"`
+	IsPure     bool                  `json:"is_pure"`
+	HasBody    bool                  `json:"has_body"`
+	File       string                `json:"file"`
+	Line       int                   `json:"line"`
+	InPackage  string                `json:"in_package,omitempty"`
+	InArch     string                `json:"in_arch,omitempty"`
+}
+
+// ProcedureDeclaration represents a VHDL procedure declaration or body
+type ProcedureDeclaration struct {
+	Name       string                `json:"name"`
+	Parameters []SubprogramParameter `json:"parameters,omitempty"`
+	HasBody    bool                  `json:"has_body"`
+	File       string                `json:"file"`
+	Line       int                   `json:"line"`
+	InPackage  string                `json:"in_package,omitempty"`
+	InArch     string                `json:"in_arch,omitempty"`
+}
+
+// SubprogramParameter represents a parameter in a function or procedure
+type SubprogramParameter struct {
+	Name      string `json:"name"`
+	Direction string `json:"direction,omitempty"` // "in", "out", "inOut"
+	Type      string `json:"type"`
+	Class     string `json:"class,omitempty"`   // "signal", "variable", "constant", "file"
+	Default   string `json:"default,omitempty"` // Default value expression
+	Line      int    `json:"line"`
 }
 
 // New creates a new policy engine, loading policies from the given directory
