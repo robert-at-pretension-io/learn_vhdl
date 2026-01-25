@@ -385,9 +385,10 @@ module.exports = grammar({
     comment: $ => token(seq('--', /.*/)),
     // VHDL-2008: Block comments /* ... */ (can span multiple lines)
     block_comment: $ => token(seq('/*', /[^*]*\*+([^/*][^*]*\*+)*/, '/')),
-    identifier: $ => /[_a-zA-Z][a-zA-Z0-9_]*/,
-    // Extended identifier (VHDL-93+): \NEXT\, \my signal\
-    extended_identifier: $ => /\\[^\\]+\\/,
+    identifier: $ => token(choice(
+      /[_a-zA-Z][a-zA-Z0-9_]*/,
+      /\\[^\\]+\\/
+    )),
     selector_clause: $=> prec.left(3, repeat1(seq('.', choice($.identifier, $._kw_all)))),
     library_clause: $=> seq($._kw_library, $.identifier, repeat(seq(',', $.identifier)), ';'),
     use_clause: $ => seq(
@@ -483,7 +484,6 @@ module.exports = grammar({
     ),
 
     _package_declarative_item: $ => choice(
-      $.comment,
       $.use_clause,  // VHDL-2008: use clause in packages (for generic package parameters)
       $.constant_declaration,
       $.type_declaration,
@@ -651,12 +651,10 @@ module.exports = grammar({
     ),
 
     _protected_type_declarative_item: $ => choice(
-      $.comment,
       $.subprogram_declaration
     ),
 
     _protected_type_body_item: $ => choice(
-      $.comment,
       $.variable_declaration,
       $.subprogram_body
     ),
@@ -761,9 +759,9 @@ module.exports = grammar({
     _signature: $ => seq(
       '[',
       optional(seq(
-        $.identifier,
-        repeat(seq(',', $.identifier)),
-        optional(seq($._kw_return, $.identifier))
+        $._type_mark,
+        repeat(seq(',', $._type_mark)),
+        optional(seq($._kw_return, $._type_mark))
       )),
       ']'
     ),
@@ -783,7 +781,7 @@ module.exports = grammar({
       optional(choice($._kw_pure, $._kw_impure)),  // VHDL-2008
       $._kw_function,
       field('name', choice($.identifier, $._operator_symbol)),
-      optional(seq($._kw_generic, $._parameter_list)),
+      optional(seq($._kw_generic, $._entity_generic_list)),
       optional(choice(
         seq($._kw_parameter, $._parameter_list),
         $._parameter_list
@@ -812,7 +810,7 @@ module.exports = grammar({
     procedure_declaration: $ => seq(
       $._kw_procedure,
       field('name', $.identifier),
-      optional(seq($._kw_generic, $._parameter_list)),
+      optional(seq($._kw_generic, $._entity_generic_list)),
       optional(choice(
         seq($._kw_parameter, $._parameter_list),
         $._parameter_list
@@ -888,15 +886,7 @@ module.exports = grammar({
 
     // Default values can be identifiers, numbers, literals, or expressions
     // Visible for extraction
-    default_value: $ => choice(
-      $.allocator_expression,  // new Type or new Type'(value)
-      seq(optional(choice('+', '-')), $.number, optional($.identifier)),  // Numbers: 1, -1, 1.0, 1 fs, -1.0 ns
-      seq($.identifier, $._string_literal),  // Based string like B"10010110"
-      $._string_literal,  // String literal: "1011"
-      $.identifier,  // Simple identifier
-      seq('(', /[^)]+/, ')'),  // Expression in parens
-      prec(-1, seq($.identifier, repeat1(seq(/[+\-*/<>=]+/, choice($.identifier, $.number)))))  // Expression: a**b+c
-    ),
+    default_value: $ => $._expression,
 
     number: _ => /[0-9][0-9_]*(\.[0-9][0-9_]*)?/,  // Integer or floating point (underscores allowed)
 
@@ -956,7 +946,6 @@ module.exports = grammar({
     ),
 
     _package_body_declarative_item: $ => choice(
-      $.comment,
       $.subprogram_body,
       $.type_declaration,  // For protected type bodies
       $.constant_declaration,
@@ -1003,7 +992,6 @@ module.exports = grammar({
     ),
 
     _entity_statement: $ => choice(
-      $.comment,
       $.assert_statement,
       $.process_statement,
       $.subprogram_declaration,  // Procedure/function in entity
@@ -1144,7 +1132,6 @@ module.exports = grammar({
     ),
 
     _entity_declarative_item: $ => choice(
-      $.comment,
       $.constant_declaration,
       $.type_declaration,
       $.subtype_declaration,
@@ -1202,7 +1189,6 @@ module.exports = grammar({
     ),
 
     _configuration_item: $ => choice(
-      $.comment,
       $._block_configuration
     ),
 
@@ -1216,7 +1202,6 @@ module.exports = grammar({
     ),
 
     _configuration_item_or_component: $ => choice(
-      $.comment,
       $._component_configuration,
       $._block_configuration
     ),
@@ -1264,7 +1249,7 @@ module.exports = grammar({
       $._kw_context,
       field('name', $.identifier),
       $._kw_is,
-      repeat(choice($.library_clause, $.use_clause, $.context_reference, $.comment)),
+      repeat(choice($.library_clause, $.use_clause, $.context_reference)),
       $._kw_end,
       optional($._kw_context),
       optional($.identifier),
@@ -1461,7 +1446,6 @@ module.exports = grammar({
 
     // Concurrent statements (architecture body)
     _concurrent_statement: $ => choice(
-      $.comment,
       $.generate_statement,
       $.block_statement,
       $.signal_assignment,
@@ -1524,15 +1508,15 @@ module.exports = grammar({
     ),
 
     _generate_body: $ => choice(
-      seq(
+      prec.dynamic(1, seq(
         repeat1($._block_declarative_item),
         $._kw_begin,
         repeat($._concurrent_statement)
-      ),
-      seq(
+      )),
+      prec.dynamic(-1, seq(
         optional($._kw_begin),
         repeat1($._concurrent_statement)
-      )
+      ))
     ),
 
     // Range expression: 0 to 10, vec'range, etc.
@@ -1663,7 +1647,6 @@ module.exports = grammar({
 
     // Process declarative items - what can appear before $._kw_begin in a process
     _process_declarative_item: $ => choice(
-      $.comment,
       $.variable_declaration,
       $.type_declaration,
       $.subtype_declaration,
@@ -1741,7 +1724,6 @@ module.exports = grammar({
 
     // Declarative items inside subprograms (functions/procedures)
     _subprogram_declarative_item: $ => choice(
-      $.comment,
       $.variable_declaration,
       $.constant_declaration,
       $.type_declaration,
@@ -1766,7 +1748,6 @@ module.exports = grammar({
     // Statements (simplified - just match anything until semicolon for now)
     // Order matters for ambiguous cases - signal assignment before procedure call
     _sequential_statement: $ => choice(
-      $.comment,
       prec(3, $.sequential_block_statement),
       prec(3, $.return_statement),
       prec(3, $.if_statement),
