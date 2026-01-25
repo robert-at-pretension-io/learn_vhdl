@@ -85,6 +85,13 @@ static bool is_octal_digit(int32_t c) {
 }
 
 /**
+ * Check if character is a valid decimal digit
+ */
+static bool is_decimal_digit(int32_t c) {
+    return (c >= '0' && c <= '9') || c == '_';
+}
+
+/**
  * Main scanning function - called by Tree-sitter for each token
  *
  * @param payload   Our scanner state (unused)
@@ -112,12 +119,26 @@ bool tree_sitter_vhdl_external_scanner_scan(
     int32_t prefix = lexer->lookahead;
     bool (*digit_check)(int32_t) = NULL;
 
+    if (prefix >= '0' && prefix <= '9') {
+        // Sized bit string literal: <size>[s|u]<base>"..."
+        while (is_decimal_digit(lexer->lookahead)) {
+            lexer->advance(lexer, false);
+        }
+        if (lexer->lookahead == 's' || lexer->lookahead == 'S' ||
+            lexer->lookahead == 'u' || lexer->lookahead == 'U') {
+            lexer->advance(lexer, false);
+        }
+        prefix = lexer->lookahead;
+    }
+
     if (prefix == 'X' || prefix == 'x') {
         digit_check = is_hex_digit;
     } else if (prefix == 'B' || prefix == 'b') {
         digit_check = is_binary_digit;
     } else if (prefix == 'O' || prefix == 'o') {
         digit_check = is_octal_digit;
+    } else if (prefix == 'D' || prefix == 'd') {
+        digit_check = is_decimal_digit;
     } else {
         return false;  // Not a bit string literal
     }
