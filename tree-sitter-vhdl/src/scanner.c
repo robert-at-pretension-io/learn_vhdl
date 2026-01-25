@@ -146,8 +146,9 @@ bool tree_sitter_vhdl_external_scanner_scan(
     // Consume the prefix
     lexer->advance(lexer, false);
 
-    // Must be followed by opening quote
-    if (lexer->lookahead != '"') {
+    // Must be followed by opening quote or percent delimiter
+    int32_t delimiter = lexer->lookahead;
+    if (delimiter != '"' && delimiter != '%') {
         return false;  // Not a bit string literal, let normal lexer handle
     }
 
@@ -155,11 +156,11 @@ bool tree_sitter_vhdl_external_scanner_scan(
     // This is important for error recovery
     lexer->mark_end(lexer);
 
-    // Consume the opening quote
+    // Consume the opening delimiter
     lexer->advance(lexer, false);
 
-    // Consume digits until closing quote
-    while (lexer->lookahead != '"' && lexer->lookahead != 0) {
+    // Consume digits until closing delimiter
+    while (lexer->lookahead != delimiter && lexer->lookahead != 0) {
         if (!digit_check(lexer->lookahead)) {
             // Invalid digit for this base - still consume to closing quote
             // This allows for better error recovery
@@ -167,8 +168,8 @@ bool tree_sitter_vhdl_external_scanner_scan(
         lexer->advance(lexer, false);
     }
 
-    // Must end with closing quote
-    if (lexer->lookahead != '"') {
+    // Must end with closing delimiter
+    if (lexer->lookahead != delimiter) {
         return false;  // Unterminated string
     }
 

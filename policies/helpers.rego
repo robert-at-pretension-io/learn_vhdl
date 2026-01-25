@@ -260,3 +260,41 @@ is_actual_signal(name) {
     not is_constant(name)
     not is_skip_name(name)
 }
+
+# =============================================================================
+# Lint Configuration Helpers
+# =============================================================================
+# These helpers check lint_config passed from Go to filter/adjust violations
+
+# Check if a rule is disabled (severity == "off")
+rule_is_disabled(rule_name) {
+    input.lint_config.rules[rule_name] == "off"
+}
+
+# Get the configured severity for a rule (defaults to "warning" if not configured)
+get_rule_severity(rule_name) := severity {
+    severity := input.lint_config.rules[rule_name]
+    severity != null
+} else := "warning"
+
+# Check if rule is enabled (not "off")
+rule_is_enabled(rule_name) {
+    not rule_is_disabled(rule_name)
+}
+
+# =============================================================================
+# Third-Party File Filtering
+# =============================================================================
+# Third-party libraries should have warnings suppressed
+
+# Check if a file is from a third-party library
+is_third_party_file(file) {
+    tp_file := input.third_party_files[_]
+    file == tp_file
+}
+
+# Check if a file is from a third-party library (also match by filename ending)
+is_third_party_file(file) {
+    tp_file := input.third_party_files[_]
+    endswith(file, tp_file)
+}

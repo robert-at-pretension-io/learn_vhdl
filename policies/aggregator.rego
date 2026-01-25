@@ -23,6 +23,7 @@ import data.vhdl.testbench
 import data.vhdl.security
 import data.vhdl.rdc
 import data.vhdl.power
+import data.vhdl.helpers
 
 # =============================================================================
 # Aggregate all violations from policy modules
@@ -93,10 +94,47 @@ rdc_violations := rdc.violations
 power_violations := power.violations
 
 # =============================================================================
-# All enabled violations
+# All enabled violations (filtered by lint config and third-party files)
 # =============================================================================
 
-all_violations := core_violations | sensitivity_violations | clock_reset_violations | signal_violations | port_violations | instance_violations | style_violations | naming_violations | process_violations | type_violations | fsm_violations | combinational_violations | sequential_violations | hierarchy_violations | quality_violations | synthesis_violations | testbench_violations | security_violations | rdc_violations | power_violations
+# Raw violations from all modules before filtering
+raw_violations := core_violations | sensitivity_violations | clock_reset_violations | signal_violations | port_violations | instance_violations | style_violations | naming_violations | process_violations | type_violations | fsm_violations | combinational_violations | sequential_violations | hierarchy_violations | quality_violations | synthesis_violations | testbench_violations | security_violations | rdc_violations | power_violations
+
+# Filter out:
+# 1. Violations for rules that are disabled (severity == "off")
+# 2. Violations from third-party files
+# 3. Apply configured severity overrides
+all_violations[filtered] {
+    v := raw_violations[_]
+
+    # Skip if rule is disabled
+    not helpers.rule_is_disabled(v.rule)
+
+    # Skip if from third-party file
+    not helpers.is_third_party_file(v.file)
+
+    # Apply configured severity (or keep original if not configured)
+    configured_severity := helpers.get_rule_severity(v.rule)
+    final_severity := severity_or_default(configured_severity, v.severity)
+
+    # Build filtered violation with possibly adjusted severity
+    filtered := {
+        "rule": v.rule,
+        "severity": final_severity,
+        "file": v.file,
+        "line": v.line,
+        "message": v.message
+    }
+}
+
+# Helper to use configured severity if valid, otherwise keep original
+severity_or_default(configured, original) := configured {
+    configured != null
+    configured != ""
+    # Only use configured if it's a valid severity
+    valid_severities := {"error", "warning", "info"}
+    valid_severities[configured]
+} else := original
 
 # =============================================================================
 # Summary statistics

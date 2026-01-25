@@ -31,3 +31,5 @@
 
 *.log
 .aider*
+vhdl_lint.json
+.vhdl_lint.json

@@ -31,6 +31,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/robert-at-pretension-io/vhdl-lint/internal/config"
 	"github.com/robert-at-pretension-io/vhdl-lint/internal/extractor"
 	"github.com/robert-at-pretension-io/vhdl-lint/internal/policy"
 	"github.com/robert-at-pretension-io/vhdl-lint/internal/validator"
@@ -39,6 +40,9 @@ import (
 // Indexer is the cross-file linker that builds the symbol table
 // and resolves dependencies between VHDL files.
 type Indexer struct {
+	// Configuration loaded from vhdl_lint.json
+	Config *config.Config
+
 	// Library map: logical name -> physical path
 	Libraries map[string]string
 
@@ -47,6 +51,12 @@ type Indexer struct {
 
 	// Extracted facts from all files
 	Facts []extractor.FileFacts
+
+	// Resolved library information (file -> library mapping)
+	FileLibraries map[string]config.FileLibraryInfo
+
+	// Third-party files (for suppressing warnings)
+	ThirdPartyFiles map[string]bool
 
 	// Verbose output
 	Verbose bool
@@ -66,25 +76,101 @@ type Symbol struct {
 	Line     int    // Line number
 }
 
-// New creates a new Indexer
+// New creates a new Indexer with default configuration
 func New() *Indexer {
 	return &Indexer{
+		Config: config.DefaultConfig(),
 		Libraries: map[string]string{
 			"work": ".", // Default: work library is current directory
 		},
 		Symbols: &SymbolTable{
 			symbols: make(map[string]Symbol),
 		},
+		FileLibraries:   make(map[string]config.FileLibraryInfo),
+		ThirdPartyFiles: make(map[string]bool),
 	}
+}
+
+// NewWithConfig creates a new Indexer with the given configuration
+func NewWithConfig(cfg *config.Config) *Indexer {
+	idx := New()
+	idx.Config = cfg
+	return idx
 }
 
 // Run executes the indexing pipeline
 func (idx *Indexer) Run(rootPath string) error {
-	// 1. Find all VHDL files
-	files, err := idx.findVHDLFiles(rootPath)
-	if err != nil {
-		return fmt.Errorf("scanning files: %w", err)
+	// 0. Load configuration if not already loaded
+	if idx.Config == nil {
+		cfg, err := config.Load(rootPath)
+		if err != nil {
+			fmt.Printf("Warning: Could not load config: %v (using defaults)\n", err)
+			idx.Config = config.DefaultConfig()
+		} else {
+			idx.Config = cfg
+		}
 	}
+
+	// 1. Find all VHDL files using configuration
+	var files []string
+	var err error
+
+	// Check if config has library definitions
+	if len(idx.Config.Libraries) > 0 {
+		libs, resolveErr := idx.Config.ResolveLibraries(rootPath)
+		if resolveErr != nil {
+			fmt.Printf("Warning: Error resolving libraries: %v\n", resolveErr)
+		}
+
+		// Collect all files and track library info
+		fileSet := make(map[string]bool)
+		for _, lib := range libs {
+			for _, f := range lib.Files {
+				if !fileSet[f] {
+					fileSet[f] = true
+					files = append(files, f)
+
+					// Track library info for each file
+					idx.FileLibraries[f] = config.FileLibraryInfo{
+						LibraryName:  lib.Name,
+						IsThirdParty: lib.IsThirdParty,
+					}
+
+					// Track third-party files
+					if lib.IsThirdParty {
+						idx.ThirdPartyFiles[f] = true
+					}
+				}
+			}
+		}
+
+		// Report library info
+		fmt.Printf("Loaded configuration with %d libraries\n", len(libs))
+		for _, lib := range libs {
+			thirdParty := ""
+			if lib.IsThirdParty {
+				thirdParty = " (third-party)"
+			}
+			fmt.Printf("  %s: %d files%s\n", lib.Name, len(lib.Files), thirdParty)
+		}
+	}
+
+	// Fallback to directory scan if no files from config
+	if len(files) == 0 {
+		files, err = idx.findVHDLFiles(rootPath)
+		if err != nil {
+			return fmt.Errorf("scanning files: %w", err)
+		}
+	}
+
+	// Filter out ignored files
+	var filteredFiles []string
+	for _, f := range files {
+		if !idx.Config.ShouldIgnoreFile(f) {
+			filteredFiles = append(filteredFiles, f)
+		}
+	}
+	files = filteredFiles
 
 	fmt.Printf("Found %d VHDL files\n", len(files))
 
@@ -105,10 +191,17 @@ func (idx *Indexer) Run(rootPath string) error {
 			}
 			factsChan <- facts
 
-			// Register exports in symbol table
+			// Determine the library name for this file
+			// Use actual library from config, or fall back to "work"
+			libName := "work"
+			if libInfo, ok := idx.FileLibraries[f]; ok && libInfo.LibraryName != "" {
+				libName = strings.ToLower(libInfo.LibraryName)
+			}
+
+			// Register exports in symbol table with proper library prefix
 			for _, entity := range facts.Entities {
 				idx.Symbols.Add(Symbol{
-					Name: fmt.Sprintf("work.%s", strings.ToLower(entity.Name)),
+					Name: fmt.Sprintf("%s.%s", libName, strings.ToLower(entity.Name)),
 					Kind: "entity",
 					File: f,
 					Line: entity.Line,
@@ -116,7 +209,7 @@ func (idx *Indexer) Run(rootPath string) error {
 			}
 			for _, pkg := range facts.Packages {
 				idx.Symbols.Add(Symbol{
-					Name: fmt.Sprintf("work.%s", strings.ToLower(pkg.Name)),
+					Name: fmt.Sprintf("%s.%s", libName, strings.ToLower(pkg.Name)),
 					Kind: "package",
 					File: f,
 					Line: pkg.Line,
@@ -245,10 +338,24 @@ func (idx *Indexer) Run(rootPath string) error {
 	}
 
 	// 3. Pass 2: Resolution (check imports)
+	// Note: "work" in VHDL is a relative reference to the file's own library.
+	// We translate "work.x" to the file's actual library name for resolution.
 	var missing []string
 	for _, facts := range idx.Facts {
+		// Get the actual library name for this file
+		fileLib := "work"
+		if libInfo, ok := idx.FileLibraries[facts.File]; ok && libInfo.LibraryName != "" {
+			fileLib = strings.ToLower(libInfo.LibraryName)
+		}
+
 		for _, dep := range facts.Dependencies {
 			qualName := strings.ToLower(dep.Target)
+
+			// Translate "work.x" to the file's actual library
+			if strings.HasPrefix(qualName, "work.") {
+				qualName = fileLib + qualName[4:] // Replace "work" with actual library
+			}
+
 			if !idx.Symbols.Has(qualName) && !isStandardLibrary(qualName) {
 				missing = append(missing, fmt.Sprintf("%s: missing import %q", facts.File, dep.Target))
 			}
@@ -333,6 +440,7 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 		CaseStatements:        []policy.CaseStatement{},
 		Processes:             []policy.Process{},
 		ConcurrentAssignments: []policy.ConcurrentAssignment{},
+		Generates:             []policy.GenerateStatement{},
 		// Type system info for filtering
 		EnumLiterals: []string{},
 		Constants:    []string{},
@@ -340,6 +448,16 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 		Comparisons:   []policy.Comparison{},
 		ArithmeticOps: []policy.ArithmeticOp{},
 		SignalDeps:    []policy.SignalDep{},
+		// Configuration
+		LintConfig: policy.LintRuleConfig{
+			Rules: idx.Config.Lint.Rules,
+		},
+		ThirdPartyFiles: []string{},
+	}
+
+	// Add third-party files list
+	for f := range idx.ThirdPartyFiles {
+		input.ThirdPartyFiles = append(input.ThirdPartyFiles, f)
 	}
 
 	// Aggregate facts from all files
@@ -418,7 +536,19 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 		}
 
 		for _, d := range facts.Dependencies {
-			resolved := idx.Symbols.Has(strings.ToLower(d.Target)) || isStandardLibrary(d.Target)
+			// Get the actual library name for this file
+			fileLib := "work"
+			if libInfo, ok := idx.FileLibraries[facts.File]; ok && libInfo.LibraryName != "" {
+				fileLib = strings.ToLower(libInfo.LibraryName)
+			}
+
+			// Translate "work.x" to the file's actual library for resolution
+			qualName := strings.ToLower(d.Target)
+			if strings.HasPrefix(qualName, "work.") {
+				qualName = fileLib + qualName[4:]
+			}
+
+			resolved := idx.Symbols.Has(qualName) || isStandardLibrary(d.Target)
 			input.Dependencies = append(input.Dependencies, policy.Dependency{
 				Source:   d.Source,
 				Target:   d.Target,
@@ -564,6 +694,25 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 				File:         facts.File,
 				Line:         dep.Line,
 				InArch:       dep.InArch,
+			})
+		}
+
+		// Generate statements (for-generate, if-generate, case-generate)
+		for _, gen := range facts.Generates {
+			input.Generates = append(input.Generates, policy.GenerateStatement{
+				Label:         gen.Label,
+				Kind:          gen.Kind,
+				File:          facts.File,
+				Line:          gen.Line,
+				InArch:        gen.InArch,
+				LoopVar:       gen.LoopVar,
+				RangeLow:      gen.RangeLow,
+				RangeHigh:     gen.RangeHigh,
+				RangeDir:      gen.RangeDir,
+				Condition:     gen.Condition,
+				SignalCount:   len(gen.Signals),
+				InstanceCount: len(gen.Instances),
+				ProcessCount:  len(gen.Processes),
 			})
 		}
 

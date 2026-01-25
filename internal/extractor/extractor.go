@@ -65,8 +65,9 @@ type FileFacts struct {
 	Signals        []Signal
 	Ports          []Port
 	Processes      []Process
-	Instances      []Instance      // Component/entity instantiations
-	CaseStatements []CaseStatement // Case statements for latch detection
+	Instances      []Instance           // Component/entity instantiations
+	CaseStatements []CaseStatement      // Case statements for latch detection
+	Generates      []GenerateStatement  // Generate statements (for-generate, if-generate, case-generate)
 	// Type system information (for filtering false positives)
 	EnumLiterals []string          // Enum literals from type declarations (e.g., S_IDLE, S_RUN)
 	Constants    []string          // Constants from constant declarations
@@ -176,6 +177,28 @@ type SignalDep struct {
 	IsSequential bool   // True if crosses a clock boundary
 	Line         int
 	InArch       string
+}
+
+// GenerateStatement represents a VHDL generate statement
+// Generate statements create conditional or iterative scopes with their own declarations
+// Types: for-generate (iteration), if-generate (conditional), case-generate (selection)
+type GenerateStatement struct {
+	Label     string   // Generate block label (required in VHDL)
+	Kind      string   // "for", "if", "case"
+	Line      int
+	InArch    string   // Which architecture contains this generate
+	// For-generate specific
+	LoopVar   string   // Loop variable name (for-generate)
+	RangeLow  string   // Range low bound (for-generate)
+	RangeHigh string   // Range high bound (for-generate)
+	RangeDir  string   // "to" or "downto" (for-generate)
+	// If-generate specific
+	Condition string   // Condition expression (if-generate)
+	// Nested declarations (scoped to this generate block)
+	Signals   []Signal            // Signals declared inside
+	Instances []Instance          // Component instances inside
+	Processes []Process           // Processes inside
+	Generates []GenerateStatement // Nested generate statements
 }
 
 // Entity represents a VHDL entity declaration
@@ -443,6 +466,27 @@ func (e *Extractor) walkTree(node *sitter.Node, source []byte, facts *FileFacts,
 				Line:      proc.Line,
 			})
 		}
+
+	case "generate_statement":
+		// Extract generate statement with its nested declarations
+		gen := e.extractGenerateStatement(node, source, context)
+		facts.Generates = append(facts.Generates, gen)
+		// Add scoped signals to the main facts with generate context
+		// This allows policies to know which signals are inside generate blocks
+		for _, sig := range gen.Signals {
+			sig.InEntity = context + "." + gen.Label // Scope: arch.gen_label
+			facts.Signals = append(facts.Signals, sig)
+		}
+		for _, inst := range gen.Instances {
+			inst.InArch = context + "." + gen.Label
+			facts.Instances = append(facts.Instances, inst)
+		}
+		for _, proc := range gen.Processes {
+			proc.InArch = context + "." + gen.Label
+			facts.Processes = append(facts.Processes, proc)
+		}
+		// Don't recurse manually - extractGenerateStatement handles nested content
+		return
 	}
 
 	// Recurse into children
@@ -1821,6 +1865,141 @@ func (e *Extractor) extractSignalDepsFromConcurrent(ca ConcurrentAssignment, arc
 		})
 	}
 	return deps
+}
+
+// extractGenerateStatement extracts a generate statement with its nested declarations
+// Handles for-generate, if-generate, and case-generate (VHDL-2008)
+// Requires grammar to expose visible nodes: for_generate, if_generate, case_generate
+func (e *Extractor) extractGenerateStatement(node *sitter.Node, source []byte, context string) GenerateStatement {
+	gen := GenerateStatement{
+		Line:      int(node.StartPoint().Row) + 1,
+		InArch:    context,
+		Signals:   []Signal{},
+		Instances: []Instance{},
+		Processes: []Process{},
+		Generates: []GenerateStatement{},
+	}
+
+	// Extract label (required for generate statements)
+	if labelNode := node.ChildByFieldName("label"); labelNode != nil {
+		gen.Label = labelNode.Content(source)
+	}
+
+	// Determine the generate kind by walking children
+	// Grammar must expose for_generate, if_generate, case_generate as visible nodes
+	var bodyNode *sitter.Node
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		childType := child.Type()
+
+		switch childType {
+		case "for_generate":
+			gen.Kind = "for"
+			e.extractForGenerateDetails(child, source, &gen)
+			bodyNode = child // The body is inside for_generate
+
+		case "if_generate":
+			gen.Kind = "if"
+			e.extractIfGenerateDetails(child, source, &gen)
+			bodyNode = child // The body is inside if_generate
+
+		case "case_generate":
+			gen.Kind = "case"
+			// Case generate: case expr generate ... end generate
+			// Extract expression using grammar field
+			if exprNode := child.ChildByFieldName("expression"); exprNode != nil {
+				gen.Condition = exprNode.Content(source)
+			}
+			bodyNode = child // The body is inside case_generate
+		}
+	}
+
+	// Extract nested declarations from the generate body
+	// Pass the for_generate/if_generate/case_generate node, NOT the generate_statement
+	if bodyNode != nil {
+		e.extractGenerateBody(bodyNode, source, &gen)
+	}
+
+	return gen
+}
+
+// extractForGenerateDetails extracts for-generate specific info (loop var, range)
+// Uses grammar fields: loop_var, range
+func (e *Extractor) extractForGenerateDetails(node *sitter.Node, source []byte, gen *GenerateStatement) {
+	// Use grammar field for loop variable
+	if loopVarNode := node.ChildByFieldName("loop_var"); loopVarNode != nil {
+		gen.LoopVar = loopVarNode.Content(source)
+	}
+
+	// Extract range info from content
+	// Grammar combines range into one field, but we need to parse low/high/dir
+	// For now, store the full range expression
+	if rangeNode := node.ChildByFieldName("range"); rangeNode != nil {
+		gen.RangeLow = rangeNode.Content(source)
+	}
+
+	// Look for "to" or "downto" in children to determine direction
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		content := strings.ToLower(child.Content(source))
+		if content == "to" {
+			gen.RangeDir = "to"
+			break
+		} else if content == "downto" {
+			gen.RangeDir = "downto"
+			break
+		}
+	}
+}
+
+// extractIfGenerateDetails extracts if-generate specific info (condition)
+// Uses grammar field: condition
+func (e *Extractor) extractIfGenerateDetails(node *sitter.Node, source []byte, gen *GenerateStatement) {
+	// Use grammar field for condition
+	if condNode := node.ChildByFieldName("condition"); condNode != nil {
+		gen.Condition = condNode.Content(source)
+	}
+}
+
+// extractGenerateBody extracts signals, instances, and processes from generate body
+func (e *Extractor) extractGenerateBody(node *sitter.Node, source []byte, gen *GenerateStatement) {
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n == nil {
+			return
+		}
+
+		nodeType := n.Type()
+
+		switch nodeType {
+		case "signal_declaration":
+			signals := e.extractSignals(n, source, gen.Label)
+			gen.Signals = append(gen.Signals, signals...)
+			return // Don't recurse into signal declaration
+
+		case "component_instantiation":
+			inst := e.extractInstance(n, source, gen.Label)
+			gen.Instances = append(gen.Instances, inst)
+			return // Don't recurse into instance
+
+		case "process_statement":
+			proc := e.extractProcess(n, source, gen.Label)
+			gen.Processes = append(gen.Processes, proc)
+			return // Don't recurse into process
+
+		case "generate_statement":
+			// Nested generate - extract recursively
+			nested := e.extractGenerateStatement(n, source, gen.InArch+"."+gen.Label)
+			gen.Generates = append(gen.Generates, nested)
+			return // Don't recurse - already handled
+		}
+
+		// Recurse into children
+		for i := 0; i < int(n.ChildCount()); i++ {
+			walk(n.Child(i))
+		}
+	}
+	walk(node)
 }
 
 // extractSimple is a fallback regex-based extractor when Tree-sitter isn't available

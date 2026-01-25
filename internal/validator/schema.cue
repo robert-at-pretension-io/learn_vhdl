@@ -20,6 +20,7 @@ package schema
     case_statements:        [...#CaseStatement]
     processes:              [...#Process]
     concurrent_assignments: [...#ConcurrentAssignment]
+    generates:              [...#GenerateStatement]
     // Type system info for filtering false positives
     enum_literals:          [...string]  // Enum literals from type declarations (e.g., S_IDLE, S_RUN)
     constants:              [...string]  // Constants from constant declarations
@@ -27,6 +28,14 @@ package schema
     comparisons:            [...#Comparison]
     arithmetic_ops:         [...#ArithmeticOp]
     signal_deps:            [...#SignalDep]
+    // Configuration
+    lint_config:            #LintConfig  // Rule severities from vhdl_lint.json
+    third_party_files:      [...string]  // Files from third-party libraries (suppress warnings)
+}
+
+// LintConfig contains rule configuration passed to OPA
+#LintConfig: {
+    rules: {[string]: "off" | "info" | "warning" | "error"}  // rule name -> severity
 }
 
 // Entity declaration
@@ -187,4 +196,25 @@ package schema
     file:          string & =~".+\\.(vhd|vhdl)$"
     line:          int & >=1
     in_arch:       string                               // Which architecture
+}
+
+// GenerateStatement represents a VHDL generate statement (for/if/case generate)
+// Generate statements create conditional or iterative scopes with their own declarations
+#GenerateStatement: {
+    label:          string                              // Generate block label (required)
+    kind:           "for" | "if" | "case" | ""          // Generate type (empty if not yet determined)
+    file:           string & =~".+\\.(vhd|vhdl)$"
+    line:           int & >=1
+    in_arch:        string                              // Containing architecture
+    // For-generate specific (optional)
+    loop_var?:      string                              // Loop variable name
+    range_low?:     string                              // Range low bound
+    range_high?:    string                              // Range high bound
+    range_dir?:     "to" | "downto" | ""                // Range direction
+    // If-generate specific (optional)
+    condition?:     string                              // Condition expression
+    // Nested content counts
+    signal_count:   int & >=0                           // Signals declared inside
+    instance_count: int & >=0                           // Instances inside
+    process_count:  int & >=0                           // Processes inside
 }

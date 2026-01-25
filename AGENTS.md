@@ -33,7 +33,7 @@ The compiler never crashes on user input. It ingests code, understands what it c
   * Visible semantic nodes (`port_direction`, `association_element`, etc.) for extraction
 * **The Edge:** If it sees unknown syntax, it inserts an `(ERROR)` node and resynchronizes.
 
-**Current Status:** 70.21% IEEE 1076-2008 compliance (132/188 tests passing)
+**Current Status:** 94%+ grammar compliance across 12,000+ test files
 
 #### CRITICAL: Grammar is the Source of Truth
 
@@ -73,6 +73,97 @@ npx tree-sitter parse file.vhd
 - If `npx tree-sitter generate` panics, run `npm run build` in `tree-sitter-vhdl/` (pinned CLI).
 - Prefer deferred decisions for VHDL "syntactic homonyms" like `name(0)`; unify names instead of guessing array vs call.
 - Avoid local-maximum hacks that only improve a narrow test set; aim for abstractions that generalize.
+
+#### AI-Assisted Grammar Improvement Workflow
+
+The test suite contains **12,000+ VHDL files** from production projects (GRLIB, OSVVM, VUnit, neorv32, ghdl, etc.). Running the full suite and caching results enables efficient AI-assisted improvement.
+
+**Step 1: Run Full Test Suite with Analysis (Human or AI)**
+```bash
+# This takes a few minutes but only needs to run once per session
+ANALYZE=1 ./test_grammar.sh external_tests
+```
+
+This creates three cache files:
+- `.grammar_fail_counts` - Error count per file (sorted by severity)
+- `.grammar_fail_list` - List of all failing files
+- `.grammar_focus_list` - Top N worst offenders (when using FOCUS_TOP)
+
+**Step 2: AI Analyzes Cache to Find Patterns**
+```bash
+# AI should read the cache files to identify worst offenders
+cat .grammar_fail_counts | head -20   # Top 20 files by error count
+cat .grammar_fail_list | wc -l        # Total failing files
+
+# AI examines a few of the worst files
+cd tree-sitter-vhdl
+npx tree-sitter parse ../path/to/worst_file.vhd 2>&1 | grep -A2 ERROR
+```
+
+The AI looks for patterns:
+- Same ERROR construct appearing in many files = high-value fix
+- Single file with many errors = unusual construct or encoding issue
+- Cluster of files from same project = project-specific VHDL style
+
+**Step 3: Fix Grammar Based on Analysis**
+```bash
+# AI edits grammar.js to handle the identified construct
+vim grammar.js
+
+# Regenerate parser
+npx tree-sitter generate
+```
+
+**Step 4: Fast Iteration with Focus Mode**
+```bash
+# Re-test ONLY the previously failing files (instant feedback)
+FOCUS_FAILS=1 ./test_grammar.sh
+
+# Or re-test only top N worst offenders
+FOCUS_TOP=50 ./test_grammar.sh
+```
+
+**Step 5: Verify with Full Suite**
+```bash
+# After fixing, run full suite again to confirm improvement
+ANALYZE=1 ./test_grammar.sh external_tests
+# Score should improve, cache files update automatically
+```
+
+**The Key Insight:** Don't re-run 12,000 files after every grammar edit. Instead:
+1. Run full suite ONCE to build cache
+2. AI analyzes cache to prioritize fixes
+3. Use FOCUS_FAILS or FOCUS_TOP for instant feedback during iteration
+4. Run full suite again only to verify final improvement
+
+**Example AI Session:**
+```
+Human: Improve the grammar pass rate
+
+AI: Let me first run the full test suite to build the cache...
+    [runs ANALYZE=1 ./test_grammar.sh external_tests]
+    Current score: 94.19% (569 failures)
+
+    Analyzing .grammar_fail_counts...
+    Top failures are in osvvm/AXI4 files with "protected type" constructs.
+
+    Let me examine one of these files...
+    [reads tree-sitter parse output]
+
+    The ERROR is around "protected body" - this VHDL-2008 construct isn't in the grammar.
+
+    [edits grammar.js to add protected_type_body rule]
+    [runs npx tree-sitter generate]
+
+    Quick verification with focus mode...
+    [runs FOCUS_TOP=50 ./test_grammar.sh]
+
+    50 files now pass that previously failed!
+
+    Running full suite to confirm...
+    [runs ANALYZE=1 ./test_grammar.sh external_tests]
+    New score: 95.8% (+160 files fixed)
+```
 
 ### Phase 2: The Extractor (Go)
 
@@ -392,13 +483,19 @@ Repeat steps 2-5 until the pass rate improves. Common patterns to look for:
 
 ## External Tests: A Tool for Improvement, Not Error Finding
 
-The `external_tests/` directory contains real-world VHDL projects:
+The `external_tests/` directory contains **12,000+ VHDL files** from real-world projects:
 
-- **neorv32** - RISC-V processor (production quality)
-- **hdl4fpga** - FPGA IP library
-- **PoC** - VLSI-EDA IP cores
-- **ghdl** - GHDL test suite
-- **Compliance-Tests** - IEEE 1076-2008 compliance tests
+| Project | Files | Description |
+|---------|-------|-------------|
+| **ghdl** | ~9,600 | GHDL test suite (largest) |
+| **grlib** | ~800 | LEON3/5 SPARC processors + SoC IP |
+| **osvvm** | ~640 | VHDL-2008 verification methodology |
+| **vunit** | ~330 | Unit testing framework |
+| **PoC** | ~290 | VLSI-EDA IP cores |
+| **vhdl-tests** | ~280 | Miscellaneous tests |
+| **hdl4fpga** | ~270 | FPGA IP library |
+| **Compliance-Tests** | ~80 | IEEE 1076-2008 compliance |
+| **neorv32** | ~70 | RISC-V processor |
 
 ### The Key Insight: Production Code is Correct
 

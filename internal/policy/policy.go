@@ -52,6 +52,7 @@ type Input struct {
 	CaseStatements        []CaseStatement        `json:"case_statements"`        // Case statements for latch detection
 	Processes             []Process              `json:"processes"`              // Process statements for sensitivity/clock analysis
 	ConcurrentAssignments []ConcurrentAssignment `json:"concurrent_assignments"` // Concurrent signal assignments (outside processes)
+	Generates             []GenerateStatement    `json:"generates"`              // Generate statements (for/if/case generate)
 	// Type system info for filtering false positives
 	EnumLiterals []string `json:"enum_literals"` // Enum literals from type declarations
 	Constants    []string `json:"constants"`     // Constants from constant declarations
@@ -59,6 +60,15 @@ type Input struct {
 	Comparisons   []Comparison   `json:"comparisons"`    // Comparisons for trojan/trigger detection
 	ArithmeticOps []ArithmeticOp `json:"arithmetic_ops"` // Expensive operations for power analysis
 	SignalDeps    []SignalDep    `json:"signal_deps"`    // Signal dependencies for loop detection
+	// Configuration for lint rules
+	LintConfig LintRuleConfig `json:"lint_config"` // Rule severities and enabled/disabled
+	// Third-party file tracking
+	ThirdPartyFiles []string `json:"third_party_files"` // Files from third-party libraries (suppress warnings)
+}
+
+// LintRuleConfig contains rule configuration passed to OPA
+type LintRuleConfig struct {
+	Rules map[string]string `json:"rules"` // rule name -> "off", "warning", "error"
 }
 
 // Process represents a VHDL process for policy analysis
@@ -211,6 +221,27 @@ type SignalDep struct {
 	File         string `json:"file"`
 	Line         int    `json:"line"`
 	InArch       string `json:"in_arch"`
+}
+
+// GenerateStatement represents a VHDL generate statement
+// Generate statements create conditional or iterative scopes with their own declarations
+type GenerateStatement struct {
+	Label     string `json:"label"`     // Generate block label (required in VHDL)
+	Kind      string `json:"kind"`      // "for", "if", "case"
+	File      string `json:"file"`
+	Line      int    `json:"line"`
+	InArch    string `json:"in_arch"`   // Which architecture contains this generate
+	// For-generate specific
+	LoopVar   string `json:"loop_var,omitempty"`   // Loop variable name (for-generate)
+	RangeLow  string `json:"range_low,omitempty"`  // Range low bound (for-generate)
+	RangeHigh string `json:"range_high,omitempty"` // Range high bound (for-generate)
+	RangeDir  string `json:"range_dir,omitempty"`  // "to" or "downto" (for-generate)
+	// If-generate specific
+	Condition string `json:"condition,omitempty"` // Condition expression (if-generate)
+	// Nested content counts (actual content is flattened to main lists)
+	SignalCount   int `json:"signal_count"`   // Number of signals declared inside
+	InstanceCount int `json:"instance_count"` // Number of instances inside
+	ProcessCount  int `json:"process_count"`  // Number of processes inside
 }
 
 // New creates a new policy engine, loading policies from the given directory
