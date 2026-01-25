@@ -34,6 +34,7 @@ package schema
     comparisons:            [...#Comparison]
     arithmetic_ops:         [...#ArithmeticOp]
     signal_deps:            [...#SignalDep]
+    cdc_crossings:          [...#CDCCrossing]
     // Configuration
     lint_config:            #LintConfig  // Rule severities from vhdl_lint.json
     third_party_files:      [...string]  // Files from third-party libraries (suppress warnings)
@@ -202,6 +203,22 @@ package schema
     file:          string & =~".+\\.(vhd|vhdl)$"
     line:          int & >=1
     in_arch:       string                               // Which architecture
+}
+
+// CDCCrossing represents a potential clock domain crossing
+// Detected when a signal written in one clock domain is read in another
+#CDCCrossing: {
+    signal:          string                             // Signal crossing domains
+    source_clock:    string                             // Clock domain where signal is written
+    source_proc:     string                             // Process that writes the signal
+    dest_clock:      string                             // Clock domain where signal is read
+    dest_proc:       string                             // Process that reads the signal
+    is_synchronized: bool                               // True if synchronizer detected
+    sync_stages:     int & >=0                          // Number of synchronizer stages
+    is_multi_bit:    bool                               // True if signal is wider than 1 bit
+    file:            string & =~".+\\.(vhd|vhdl)$"
+    line:            int & >=1
+    in_arch:         string                             // Which architecture
 }
 
 // GenerateStatement represents a VHDL generate statement (for/if/case generate)

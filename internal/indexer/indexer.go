@@ -528,6 +528,24 @@ func (idx *Indexer) Run(rootPath string) error {
 				}
 			}
 		}
+
+		// CDC crossings
+		fmt.Printf("\n=== Verbose: CDC Crossings ===\n")
+		for _, facts := range idx.Facts {
+			for _, cdc := range facts.CDCCrossings {
+				syncStatus := "unsynchronized"
+				if cdc.IsSynchronized {
+					syncStatus = fmt.Sprintf("synchronized (%d stages)", cdc.SyncStages)
+				}
+				bitWidth := "single-bit"
+				if cdc.IsMultiBit {
+					bitWidth = "multi-bit"
+				}
+				fmt.Printf("  %s: %s -> %s (%s, %s) [%s]\n",
+					cdc.Signal, cdc.SourceClock, cdc.DestClock, bitWidth, syncStatus,
+					fmt.Sprintf("%s writes, %s reads", cdc.SourceProc, cdc.DestProc))
+			}
+		}
 	}
 
 	// 3. Pass 2: Resolution (check imports)
@@ -647,6 +665,7 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 		Comparisons:   []policy.Comparison{},
 		ArithmeticOps: []policy.ArithmeticOp{},
 		SignalDeps:    []policy.SignalDep{},
+		CDCCrossings:  []policy.CDCCrossing{},
 		// Configuration
 		LintConfig: policy.LintRuleConfig{
 			Rules: idx.Config.Lint.Rules,
@@ -893,6 +912,23 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 				File:         facts.File,
 				Line:         dep.Line,
 				InArch:       dep.InArch,
+			})
+		}
+
+		// CDC crossings: signals crossing clock domains
+		for _, cdc := range facts.CDCCrossings {
+			input.CDCCrossings = append(input.CDCCrossings, policy.CDCCrossing{
+				Signal:         cdc.Signal,
+				SourceClock:    cdc.SourceClock,
+				SourceProc:     cdc.SourceProc,
+				DestClock:      cdc.DestClock,
+				DestProc:       cdc.DestProc,
+				IsSynchronized: cdc.IsSynchronized,
+				SyncStages:     cdc.SyncStages,
+				IsMultiBit:     cdc.IsMultiBit,
+				File:           cdc.File,
+				Line:           cdc.Line,
+				InArch:         cdc.InArch,
 			})
 		}
 

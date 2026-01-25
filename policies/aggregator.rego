@@ -20,6 +20,7 @@ import data.vhdl.quality
 import data.vhdl.synthesis
 import data.vhdl.testbench
 import data.vhdl.latch
+import data.vhdl.cdc
 # Advanced static analysis modules
 import data.vhdl.security
 import data.vhdl.rdc
@@ -84,6 +85,9 @@ testbench_violations := testbench.violations
 # Latch inference detection rules
 latch_violations := latch.violations
 
+# Clock Domain Crossing rules
+cdc_violations := cdc.cdc_violations
+
 # =============================================================================
 # Advanced Static Analysis ("God-Tier" Rules)
 # =============================================================================
@@ -102,7 +106,7 @@ power_violations := power.violations
 # =============================================================================
 
 # Raw violations from all modules before filtering
-raw_violations := core_violations | sensitivity_violations | clock_reset_violations | signal_violations | port_violations | instance_violations | style_violations | naming_violations | process_violations | type_violations | fsm_violations | combinational_violations | sequential_violations | hierarchy_violations | quality_violations | synthesis_violations | testbench_violations | latch_violations | security_violations | rdc_violations | power_violations
+raw_violations := core_violations | sensitivity_violations | clock_reset_violations | signal_violations | port_violations | instance_violations | style_violations | naming_violations | process_violations | type_violations | fsm_violations | combinational_violations | sequential_violations | hierarchy_violations | quality_violations | synthesis_violations | testbench_violations | latch_violations | cdc_violations | security_violations | rdc_violations | power_violations
 
 # Filter out:
 # 1. Violations for rules that are disabled (severity == "off")
@@ -168,6 +172,7 @@ summary := {
         "synthesis": count(synthesis_violations),
         "testbench": count(testbench_violations),
         "latch": count(latch_violations),
+        "cdc": count(cdc_violations),
         # Advanced static analysis
         "security": count(security_violations),
         "rdc": count(rdc_violations),
@@ -279,6 +284,12 @@ optional_rules := {
         "large_literal_comparison - Comparison against >16-bit literal",
         "counter_trigger - Counter compared to large literal",
         "inverted_trigger - /= with large literal"
+    ],
+    # Clock Domain Crossing
+    "cdc.optional_violations": [
+        "cdc_unsync_single_bit - Single-bit signal crossing clock domain",
+        "cdc_unsync_multi_bit - Multi-bit signal crossing clock domain",
+        "cdc_insufficient_sync - Synchronizer has < 2 stages"
     ],
     # Reset Domain Crossing
     "rdc.optional_violations": [

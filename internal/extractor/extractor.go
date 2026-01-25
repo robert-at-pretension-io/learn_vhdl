@@ -43,6 +43,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
@@ -87,6 +89,7 @@ type FileFacts struct {
 	Comparisons      []Comparison      // Comparisons for trojan detection
 	ArithmeticOps    []ArithmeticOp    // Expensive operations for power analysis
 	SignalDeps       []SignalDep       // Signal dependencies for loop detection
+	CDCCrossings     []CDCCrossing     // Clock domain crossing detection
 }
 
 // ClockDomain represents a clock and the signals it drives
@@ -182,6 +185,22 @@ type SignalDep struct {
 	InProcess    string // Which process (empty if concurrent)
 	IsSequential bool   // True if crosses a clock boundary
 	Line         int
+	InArch       string
+}
+
+// CDCCrossing represents a potential clock domain crossing
+// Detected when a signal written in one clock domain is read in another
+type CDCCrossing struct {
+	Signal       string // Signal crossing domains
+	SourceClock  string // Clock domain where signal is written
+	SourceProc   string // Process that writes the signal
+	DestClock    string // Clock domain where signal is read
+	DestProc     string // Process that reads the signal
+	IsSynchronized bool // True if synchronizer detected
+	SyncStages   int    // Number of synchronizer stages (0 if not sync'd)
+	IsMultiBit   bool   // True if signal is wider than 1 bit (needs special handling)
+	Line         int    // Line of the reading process
+	File         string
 	InArch       string
 }
 
@@ -417,6 +436,9 @@ func (e *Extractor) Extract(filePath string) (FileFacts, error) {
 
 	// Walk the tree and extract facts
 	e.walkTree(tree.RootNode(), content, &facts, "")
+
+	// Detect clock domain crossings
+	facts.CDCCrossings = DetectCDCCrossings(&facts)
 
 	return facts, nil
 }
@@ -1338,6 +1360,21 @@ func (e *Extractor) analyzeProcessSemantics(node *sitter.Node, source []byte, pr
 			e.extractReadsFromNode(n, source, readSet, true)
 
 		case "if_statement":
+			// Check for clock edge pattern in elsif clause
+			// Grammar parses "elsif rising_edge(clk)" with prefix/content fields
+			if prefixNode := n.ChildByFieldName("prefix"); prefixNode != nil {
+				funcName := strings.ToLower(prefixNode.Content(source))
+				if contentNode := n.ChildByFieldName("content"); contentNode != nil {
+					argName := contentNode.Content(source)
+					if funcName == "rising_edge" && argName != "" && proc.ClockSignal == "" {
+						proc.ClockSignal = argName
+						proc.ClockEdge = "rising"
+					} else if funcName == "falling_edge" && argName != "" && proc.ClockSignal == "" {
+						proc.ClockSignal = argName
+						proc.ClockEdge = "falling"
+					}
+				}
+			}
 			// Check for reset pattern in if condition
 			// Pattern: if reset = '1' then (before clock edge = async)
 			// Pattern: elsif reset = '1' then (after clock edge = sync)
@@ -2923,4 +2960,177 @@ func BuildConstantMap(constants []ConstantDeclaration) map[string]int {
 		}
 	}
 	return result
+}
+
+// DetectCDCCrossings analyzes processes to find signals crossing clock domains
+// A CDC crossing occurs when a signal written in one clock domain is read in another
+func DetectCDCCrossings(facts *FileFacts) []CDCCrossing {
+	var crossings []CDCCrossing
+
+	// Build map: signal -> list of (process, clock) that write it
+	type writeInfo struct {
+		process string
+		clock   string
+		arch    string
+	}
+	signalWriters := make(map[string][]writeInfo)
+
+	// Build map: signal -> bit width estimate (for multi-bit detection)
+	signalWidths := make(map[string]int)
+	for _, sig := range facts.Signals {
+		signalWidths[strings.ToLower(sig.Name)] = estimateSignalWidth(sig.Type)
+	}
+
+	// Collect all sequential processes and their writes
+	for _, proc := range facts.Processes {
+		if !proc.IsSequential || proc.ClockSignal == "" {
+			continue // Only care about clocked processes
+		}
+		for _, sig := range proc.AssignedSignals {
+			sigLower := strings.ToLower(sig)
+			signalWriters[sigLower] = append(signalWriters[sigLower], writeInfo{
+				process: proc.Label,
+				clock:   proc.ClockSignal,
+				arch:    proc.InArch,
+			})
+		}
+	}
+
+	// Build synchronizer detection map
+	// Pattern: signal_meta -> signal_sync (2-stage) or signal_meta1 -> signal_meta2 -> signal_sync (3-stage)
+	syncStages := detectSynchronizers(facts.Processes)
+
+	// Check each sequential process for reads from different clock domains
+	for _, proc := range facts.Processes {
+		if !proc.IsSequential || proc.ClockSignal == "" {
+			continue
+		}
+		destClock := strings.ToLower(proc.ClockSignal)
+
+		for _, readSig := range proc.ReadSignals {
+			readLower := strings.ToLower(readSig)
+			writers := signalWriters[readLower]
+
+			for _, w := range writers {
+				srcClock := strings.ToLower(w.clock)
+				// Skip same clock domain
+				if srcClock == destClock {
+					continue
+				}
+
+				// Found a CDC crossing
+				crossing := CDCCrossing{
+					Signal:      readSig,
+					SourceClock: w.clock,
+					SourceProc:  w.process,
+					DestClock:   proc.ClockSignal,
+					DestProc:    proc.Label,
+					Line:        proc.Line,
+					File:        facts.File,
+					InArch:      proc.InArch,
+					IsMultiBit:  signalWidths[readLower] > 1,
+				}
+
+				// Check if this signal goes through a synchronizer
+				if stages, ok := syncStages[readLower]; ok && stages >= 2 {
+					crossing.IsSynchronized = true
+					crossing.SyncStages = stages
+				}
+
+				crossings = append(crossings, crossing)
+			}
+		}
+	}
+
+	return crossings
+}
+
+// detectSynchronizers looks for common synchronizer patterns
+// Returns map of signal name -> number of synchronizer stages detected
+func detectSynchronizers(processes []Process) map[string]int {
+	result := make(map[string]int)
+
+	// Look for patterns like:
+	// sig_meta <= async_sig;
+	// sig_sync <= sig_meta;
+	// This indicates async_sig has 2 sync stages
+
+	// Build assignment chains: what does each signal get assigned from?
+	signalSource := make(map[string]string) // signal -> its direct source
+
+	for _, proc := range processes {
+		if !proc.IsSequential {
+			continue
+		}
+		// If process assigns exactly one signal from one source, track it
+		if len(proc.AssignedSignals) == 1 && len(proc.ReadSignals) == 1 {
+			assigned := strings.ToLower(proc.AssignedSignals[0])
+			read := strings.ToLower(proc.ReadSignals[0])
+			signalSource[assigned] = read
+		}
+	}
+
+	// Trace chains: for each signal, count how many synchronizer stages
+	for sig := range signalSource {
+		stages := 0
+		current := sig
+		visited := make(map[string]bool)
+
+		// Walk backwards through the chain
+		for {
+			source, exists := signalSource[current]
+			if !exists || visited[source] {
+				break
+			}
+			visited[current] = true
+			stages++
+			current = source
+		}
+
+		// The original source signal has this many sync stages
+		if stages >= 2 && current != sig {
+			result[current] = stages
+		}
+	}
+
+	return result
+}
+
+// estimateSignalWidth guesses the bit width from a VHDL type string
+func estimateSignalWidth(typeStr string) int {
+	typeLower := strings.ToLower(typeStr)
+
+	// Single-bit types
+	if typeLower == "std_logic" || typeLower == "std_ulogic" ||
+		typeLower == "bit" || typeLower == "boolean" {
+		return 1
+	}
+
+	// Vector types - try to extract width
+	// std_logic_vector(7 downto 0) -> 8 bits
+	// std_logic_vector(WIDTH-1 downto 0) -> unknown, assume multi-bit
+	if strings.Contains(typeLower, "vector") ||
+		strings.Contains(typeLower, "unsigned") ||
+		strings.Contains(typeLower, "signed") {
+		// Try to find numeric range
+		if match := regexp.MustCompile(`(\d+)\s+(?:downto|to)\s+(\d+)`).FindStringSubmatch(typeLower); match != nil {
+			high, _ := strconv.Atoi(match[1])
+			low, _ := strconv.Atoi(match[2])
+			width := high - low
+			if width < 0 {
+				width = -width
+			}
+			return width + 1
+		}
+		// Has a range but couldn't parse - assume multi-bit
+		return 8 // Conservative guess
+	}
+
+	// Integer types
+	if typeLower == "integer" || typeLower == "natural" || typeLower == "positive" {
+		return 32
+	}
+
+	// Unknown type - assume single bit to avoid false positives
+	return 1
 }

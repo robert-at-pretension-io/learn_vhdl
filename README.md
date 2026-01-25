@@ -158,7 +158,7 @@ Example rules:
 - Entity naming conventions
 - Unresolved dependencies
 - Missing component definitions
-- (Future) Clock domain crossing detection
+- Clock domain crossing detection
 - (Future) Latch inference detection
 
 ---
@@ -623,7 +623,7 @@ Based on impact analysis, these are the highest-value improvements ranked by ROI
 | **#2** | **Latch Inference Detection** | Critical synthesis rule | ✅ IMPLEMENTED |
 | **#3** | **Package Contents Indexing** | Complete cross-file resolution | ✅ IMPLEMENTED |
 | **#4** | **Generate Elaboration** | Evaluate for-generate ranges | ✅ IMPLEMENTED |
-| **#5** | **CDC Enhancement** | Clock domain crossing analysis | Pending |
+| **#5** | **CDC Enhancement** | Clock domain crossing analysis | ✅ IMPLEMENTED |
 
 ### Phase 1: Grammar Completion (Current Focus)
 - [x] 98.75% valid acceptance rate
@@ -657,7 +657,10 @@ Based on impact analysis, these are the highest-value improvements ranked by ROI
   - Evaluate for-generate ranges (0 to 7, WIDTH-1 downto 0)
   - Simple constant expression evaluation (+, -, *, /)
   - Tracks iteration counts for instance counting
-- [ ] Clock domain crossing analysis
+- [x] Clock domain crossing analysis
+  - Detects unsynchronized single-bit and multi-bit crossings
+  - Identifies synchronizer patterns (2+ stage flip-flop chains)
+  - Rules: `cdc_unsync_single_bit`, `cdc_unsync_multi_bit`, `cdc_insufficient_sync`
 - [ ] Multi-driver detection
 - [ ] FSM extraction and completeness checking
 - [ ] Combinational loop detection
@@ -693,9 +696,9 @@ Based on impact analysis, these are the highest-value improvements ranked by ROI
 
 ### Policies
 - [ ] Type-aware width checking
-- [ ] Latch inference detection
+- [x] Latch inference detection
 - [ ] Multi-driver detection
-- [ ] Clock domain crossing analysis
+- [x] Clock domain crossing analysis
 - [ ] Combinational loop detection
 - [ ] FSM completeness checking
 - [ ] Floating input detection

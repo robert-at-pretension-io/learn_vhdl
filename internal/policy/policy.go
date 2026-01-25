@@ -66,6 +66,7 @@ type Input struct {
 	Comparisons   []Comparison   `json:"comparisons"`    // Comparisons for trojan/trigger detection
 	ArithmeticOps []ArithmeticOp `json:"arithmetic_ops"` // Expensive operations for power analysis
 	SignalDeps    []SignalDep    `json:"signal_deps"`    // Signal dependencies for loop detection
+	CDCCrossings  []CDCCrossing  `json:"cdc_crossings"`  // Clock domain crossings
 	// Configuration for lint rules
 	LintConfig LintRuleConfig `json:"lint_config"` // Rule severities and enabled/disabled
 	// Third-party file tracking
@@ -227,6 +228,22 @@ type SignalDep struct {
 	File         string `json:"file"`
 	Line         int    `json:"line"`
 	InArch       string `json:"in_arch"`
+}
+
+// CDCCrossing represents a potential clock domain crossing
+// Detected when a signal written in one clock domain is read in another
+type CDCCrossing struct {
+	Signal         string `json:"signal"`          // Signal crossing domains
+	SourceClock    string `json:"source_clock"`    // Clock domain where signal is written
+	SourceProc     string `json:"source_proc"`     // Process that writes the signal
+	DestClock      string `json:"dest_clock"`      // Clock domain where signal is read
+	DestProc       string `json:"dest_proc"`       // Process that reads the signal
+	IsSynchronized bool   `json:"is_synchronized"` // True if synchronizer detected
+	SyncStages     int    `json:"sync_stages"`     // Number of synchronizer stages (0 if not sync'd)
+	IsMultiBit     bool   `json:"is_multi_bit"`    // True if signal is wider than 1 bit
+	File           string `json:"file"`
+	Line           int    `json:"line"`
+	InArch         string `json:"in_arch"`
 }
 
 // GenerateStatement represents a VHDL generate statement
