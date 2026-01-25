@@ -609,7 +609,8 @@ func (e *Extractor) extractAssociationList(node *sitter.Node, source []byte, res
 
 // extractAssociationElement extracts formal => actual from an association_element
 func (e *Extractor) extractAssociationElement(node *sitter.Node, source []byte) (formal, actual string) {
-	// Structure: identifier "=>" (identifier | number | expression | "open")
+	// Structure: identifier "=>" (identifier | indexed_name | expression | "open")
+	// Handle complex actuals like cpu_trace(i), sig(7 downto 0), etc.
 	sawArrow := false
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
@@ -620,10 +621,28 @@ func (e *Extractor) extractAssociationElement(node *sitter.Node, source []byte) 
 			continue
 		}
 
-		if childType == "identifier" || childType == "number" || childType == "character_literal" {
-			if !sawArrow {
+		// For formal (before =>), usually just an identifier
+		if !sawArrow {
+			if childType == "identifier" {
 				formal = child.Content(source)
-			} else {
+			}
+			continue
+		}
+
+		// For actual (after =>), capture the full content including indexed_name, selected_name, etc.
+		// This ensures cpu_trace(i) is captured as "cpu_trace(i)" for signal usage tracking
+		switch childType {
+		case "identifier", "number", "character_literal":
+			actual = child.Content(source)
+		case "indexed_name", "selected_name", "attribute_name":
+			// Get full content for complex expressions
+			actual = child.Content(source)
+		case "open":
+			actual = "open"
+		default:
+			// For any other expression type, get the full content
+			// This handles things like (others => '0'), type conversions, etc.
+			if actual == "" && childType != "(" && childType != ")" && childType != "," {
 				actual = child.Content(source)
 			}
 		}

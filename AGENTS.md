@@ -4,82 +4,113 @@
 
 This is a **learning project** with two goals:
 
-1. **Learn VHDL** by building a compiler for it
+1. **Learn VHDL** by building a compiler/linter for it
 2. **Learn compiler construction** using modern, declarative tools
 
 The philosophy is "learn by doing" - instead of just reading about VHDL, we build a tool that understands it. Every grammar rule we write teaches us something about the language.
 
 ## The Core Philosophy: "Panic is Failure"
 
-The compiler never crashes. It ingests code, understands what it can, and explicitly reports what it cannot.
+The compiler never crashes on user input. It ingests code, understands what it can, and explicitly reports what it cannot.
 
 * **User Errors:** "You wrote bad VHDL (Latch inferred)."
 * **System Edges:** "I don't know how to handle `generate` statements yet."
+* **Contract Violations:** The tool crashes *immediately* if internal data doesn't match the schema - no silent failures.
 
 ---
 
-## The Architecture: The "Rust-Powered Declarative Stack"
+## The Architecture: The "Go-Powered Declarative Stack"
 
 ### Phase 1: The Resilient Parser (Tree-sitter)
 
 * **The Goal:** Turn text into a tree without crashing.
-* **The Tech:** **Tree-sitter** (C-lib wrapped in Rust).
-* **The Configuration:** `grammar.js`.
+* **The Tech:** **Tree-sitter** (C parser with Go bindings).
+* **The Configuration:** `tree-sitter-vhdl/grammar.js`.
 * **How it works:**
-  * It uses a GLR algorithm that tolerates syntax errors.
-  * It handles **Precedence** automatically (you define `*` > `+` in JS, not Rust).
-* **The Edge:** If it sees syntax it doesn't know, it inserts an `(ERROR)` node and resynchronizes. Your Rust code scans for these nodes to report "Parsing Edges."
+  * GLR algorithm tolerates syntax errors
+  * Produces valid tree even for broken code
+  * Supports case-insensitive keywords (VHDL requirement)
+  * Visible semantic nodes (`port_direction`, `association_element`, etc.) for extraction
+* **The Edge:** If it sees unknown syntax, it inserts an `(ERROR)` node and resynchronizes.
 
-### Phase 2: The Librarian (Petgraph)
+**Current Status:** 70.21% IEEE 1076-2008 compliance (132/188 tests passing)
 
-* **The Goal:** Figure out the compile order.
-* **The Tech:** **Petgraph** + **Walkdir**.
+#### CRITICAL: Grammar is the Source of Truth
+
+**When you encounter false positives or extraction bugs, FIX THE GRAMMAR FIRST.**
+
+ERROR nodes are poisonous. When the grammar can't parse a VHDL construct:
+1. Tree-sitter creates an `ERROR` node containing raw text
+2. Keywords inside ERROR nodes appear as identifiers
+3. The extractor sees fake "signals" that don't exist
+4. OPA rules fire false positives
+
+**Never work around grammar bugs:**
+- ❌ Adding skip lists in OPA rules
+- ❌ Filtering keywords in the extractor
+- ❌ Ignoring certain file patterns
+
+**Always fix at the source:**
+- ✅ Identify which VHDL construct causes the ERROR
+- ✅ Update `grammar.js` to handle that construct
+- ✅ Regenerate: `npx tree-sitter generate`
+- ✅ Rebuild Go: `go build ./cmd/vhdl-lint`
+
+**To debug parse failures:**
+```bash
+# See ERROR nodes in a file
+npx tree-sitter parse file.vhd 2>&1 | grep ERROR
+
+# Get full parse tree
+npx tree-sitter parse file.vhd
+```
+
+### Phase 2: The Extractor (Go)
+
+* **The Goal:** Transform syntax trees into semantic facts.
+* **The Tech:** **Go** walking the Tree-sitter tree.
+* **What it extracts:**
+  * **Structural:** Entities, Architectures, Packages, Signals, Ports
+  * **Behavioral:** Processes with sensitivity lists
+  * **Semantic:** Clock domains, reset patterns, signal read/write analysis
+  * **Hierarchical:** Component instances with port/generic mappings
+
+### Phase 3: The Indexer (Go)
+
+* **The Goal:** Build the cross-file "world view."
+* **The Tech:** **Go** with concurrent file processing.
 * **The Logic:**
-  * Scan the Tree-sitter tree for `library` and `use` nodes.
-  * Build a DAG (Directed Acyclic Graph) of files.
-  * Topological Sort → The Build Order.
-* **The Edge:** If a file requests a library that doesn't exist in the graph, report a "Missing Dependency" edge.
+  * **Pass 1:** Parse all files, build global symbol table (entities, packages)
+  * **Pass 2:** Resolve imports, check dependencies
+  * **Output:** Normalized JSON for policy evaluation
+* **The Edge:** Reports missing dependencies, unresolved components.
 
-### Phase 3: The Bridge "Lowering" (Rust)
+### Phase 4: The Contract Guard (CUE)
 
-* **The Goal:** Translate syntax (Tree) into logic (S-Expressions & Facts).
-* **The Tech:** **Hand-written Rust**.
-* **The Task:** This is the glue. You write match arms to convert Tree-sitter nodes.
-  * *Normalization:* `rising_edge(clk)` → `(And (Event clk) (Eq clk '1'))`.
-  * *Attribute Handling:* You match on the attribute string to decide if `x'range` becomes a **Value**, a **Type**, or a **Range**.
-* **The Edge:** You use a catch-all match arm (`_ => ...`). If you hit a syntax node you haven't implemented yet, return `(Error "Missing Lowering")` instead of panicking.
-
-### Phase 4: The Semantic Brain (Egglog)
-
-* **The Goal:** Solve Equations (Types, Overloading, Constants).
-* **The Tech:** **Egglog** (Equality Saturation).
-* **The Configuration:** `.egg` files (Rewrite rules).
+* **The Goal:** Guarantee data integrity between Go and OPA.
+* **The Tech:** **CUE** schema validation.
 * **The Logic:**
-  * **Type Inference:** `(Add Int Int)` becomes `Int`.
-  * **Overloading:** It filters the list of possible functions for `"+"` until only one matches the argument types.
-  * **Context:** It solves **Aggregates** (`others => '0'`) by looking at the target signal's type.
-* **The Edge:** After running, query for "Stuck Terms." If `(Abs (Int 5))` didn't reduce, report "Missing Semantic Rule for Abs."
+  * Go marshals extracted data to JSON
+  * CUE validates against `schema/ir.cue`
+  * If validation fails, **crash immediately** - no silent failures
+* **Why this matters:** Without CUE, if a field name changes, OPA silently receives `undefined` and produces no violations. With CUE, you get an immediate error.
 
-### Phase 5: The Flow Analyst (Crepe)
+### Phase 5: The Policy Engine (OPA)
 
-* **The Goal:** Analyze Paths (Latches, Dead Code, Uninitialized Variables).
-* **The Tech:** **Crepe** (Datalog).
-* **The Configuration:** Datalog Rules (embedded in Rust macro).
+* **The Goal:** Declarative compliance checking.
+* **The Tech:** **OPA** with Rego policy language.
 * **The Logic:**
-  * You feed it **Facts**: `Edge(Block1, Block2)`, `Assigns(Block1, "signal_x")`.
-  * You write **Rules**: "A Latch exists if there is a path from Start to End that never touches `signal_x`."
-  * Crepe efficiently calculates the "Fixed Point" (all reachable states).
-* **The Edge:** If Crepe returns an empty set for `Reachable(Start, End)`, your graph building logic (Phase 3) is likely broken.
-
-### Phase 6: The Reporter (Miette)
-
-* **The Goal:** Talk to the human.
-* **The Tech:** **Miette**.
-* **The Task:**
-  * Take the "Edges" from Phases 1, 3, 4.
-  * Take the "User Errors" from Phases 4, 5.
-  * Map them back to the original source code spans.
-  * Print beautiful, helpful diagnostics.
+  * Receives normalized JSON from indexer
+  * Evaluates declarative rules
+  * Returns violations with file/line locations
+* **Current rules:**
+  * Naming conventions
+  * Unresolved dependencies
+  * Missing component definitions
+* **Future rules:**
+  * Latch inference
+  * Clock domain crossings
+  * Multi-driver detection
 
 ---
 
@@ -87,11 +118,91 @@ The compiler never crashes. It ingests code, understands what it can, and explic
 
 | Problem Domain | Chosen Tech | Why this specifically? |
 | --- | --- | --- |
-| **Syntax** | **Tree-sitter** | Handles precedence and recovery automatically. Pure config. |
-| **Dependencies** | **Petgraph** | Standard graph algo library. Fast. |
-| **Type/Math** | **Egglog** | Solves "Ambiguity" (Overloading) better than any manual algorithm. |
-| **Control Flow** | **Crepe** | Datalog is faster than Egglog for "Reachability" problems. |
-| **Architecture** | **Rust** | Safety, speed, and the ecosystem glue that holds it all together. |
+| **Syntax** | **Tree-sitter** | Error-tolerant parsing, incremental updates, industry standard |
+| **Extraction** | **Go** | Fast, concurrent, single binary deployment |
+| **Cross-file** | **Go Indexer** | Symbol table, dependency graph, parallel processing |
+| **Contract** | **CUE** | Type-safe schema validation, prevents silent failures |
+| **Policy** | **OPA/Rego** | Declarative rules, standard enterprise tooling |
+
+---
+
+## Data Flow
+
+```
+VHDL Files
+    │
+    ▼
+Tree-sitter Parser (grammar.js)
+    │
+    ▼ Concrete Syntax Tree
+    │
+Go Extractor
+    │
+    ▼ FileFacts (entities, signals, processes, instances...)
+    │
+Go Indexer
+    │
+    ▼ Normalized JSON (policy.Input)
+    │
+CUE Validator ──── CRASH if schema mismatch
+    │
+    ▼ Validated JSON
+    │
+OPA Policy Engine
+    │
+    ▼ Violations
+    │
+Human-readable Report
+```
+
+---
+
+## Key Data Structures
+
+### FileFacts (from Extractor)
+```go
+type FileFacts struct {
+    File          string
+    Entities      []Entity
+    Architectures []Architecture
+    Packages      []Package
+    Signals       []Signal
+    Ports         []Port
+    Processes     []Process
+    Instances     []Instance      // NEW: component instantiations
+    ClockDomains  []ClockDomain   // Semantic: clock analysis
+    SignalUsages  []SignalUsage   // Semantic: read/write tracking
+    ResetInfos    []ResetInfo     // Semantic: reset detection
+}
+```
+
+### Instance (for hierarchical analysis)
+```go
+type Instance struct {
+    Name       string            // "u_cpu"
+    Target     string            // "work.cpu"
+    PortMap    map[string]string // formal -> actual signal
+    GenericMap map[string]string // formal -> actual value
+    Line       int
+    InArch     string
+}
+```
+
+### Process (with semantic analysis)
+```go
+type Process struct {
+    Label           string
+    SensitivityList []string
+    IsSequential    bool     // Has clock edge
+    ClockSignal     string   // "clk"
+    ClockEdge       string   // "rising" or "falling"
+    HasReset        bool
+    ResetSignal     string
+    ResetAsync      bool     // Async if checked before clock
+    AssignedSignals []string // Signals written
+    ReadSignals     []string // Signals read
+}
+```
 
 ---
 
@@ -99,11 +210,139 @@ The compiler never crashes. It ingests code, understands what it can, and explic
 
 This is the tight feedback loop for learning:
 
-1. **Look at test.vhdl** - Find a construct you don't understand yet
-2. **Run `./dev.sh`** - See ERROR nodes for unparsed constructs
-3. **Add grammar rules** - Edit `grammar.js` to recognize the construct
-4. **Run `./dev.sh` again** - Errors should decrease
-5. **Repeat** - Each cycle teaches you more VHDL
+1. **Find a VHDL construct** you don't understand
+2. **Run `./test_grammar.sh`** to see current pass rate
+3. **Edit `grammar.js`** to recognize the construct
+4. **Run `npx tree-sitter generate`** to rebuild parser
+5. **Run `./test_grammar.sh`** again - score should improve
+6. **Add extraction logic** in Go if semantic data is needed
+7. **Add CUE schema** if new data types are introduced
+8. **Add OPA rules** to check for violations
+9. **Repeat** - each cycle teaches you more VHDL
 
-### Example Cycle
+---
 
+## External Tests: A Tool for Improvement, Not Error Finding
+
+The `external_tests/` directory contains real-world VHDL projects:
+
+- **neorv32** - RISC-V processor (production quality)
+- **hdl4fpga** - FPGA IP library
+- **PoC** - VLSI-EDA IP cores
+- **ghdl** - GHDL test suite
+- **Compliance-Tests** - IEEE 1076-2008 compliance tests
+
+### The Key Insight: Production Code is Correct
+
+**When you run the linter against external_tests and see violations, assume they are FALSE POSITIVES until proven otherwise.**
+
+Real-world projects like neorv32 are:
+- Battle-tested in production FPGAs
+- Reviewed by experienced engineers
+- Synthesized and verified by commercial tools
+
+If our linter says `signal 'cpu_trace' is unused` but the signal is clearly used in a generate statement, **the bug is in our tool, not in neorv32.**
+
+### How to Use External Tests
+
+**Purpose:** Improve grammar and extraction, NOT find bugs in production code.
+
+```bash
+# Run against neorv32
+./vhdl-lint external_tests/neorv32/rtl/core/
+
+# When you see violations, investigate:
+# 1. Is it a real issue? (Unlikely for production code)
+# 2. Or is our extraction missing something?
+
+# Debug with verbose output
+./vhdl-lint -v external_tests/neorv32/rtl/core/neorv32_top.vhd
+
+# Check for parse errors (ERROR nodes)
+cd tree-sitter-vhdl && npx tree-sitter parse ../external_tests/neorv32/rtl/core/neorv32_top.vhd 2>&1 | grep ERROR
+```
+
+### Common False Positive Patterns
+
+| Violation | Likely Cause | Fix Location |
+|-----------|--------------|--------------|
+| `unused_signal` | Signal used in generate/port map not tracked | Extractor |
+| `undriven_signal` | Assignment in generate statement missed | Grammar + Extractor |
+| `sensitivity_list_incomplete` | Complex expression reads not extracted | Extractor |
+| `unresolved_dependency` | Package/library not in search path | Indexer |
+
+### The Improvement Loop
+
+1. **Run on external_tests** - collect violations
+2. **Assume false positives** - investigate each one
+3. **Find the gap** - what construct aren't we handling?
+4. **Fix at the source**:
+   - Grammar issue? Fix `grammar.js`
+   - Extraction issue? Fix extractor
+   - Policy too strict? Adjust Rego rules
+5. **Verify** - violations should decrease
+6. **Repeat** - until false positive rate is acceptable
+
+### Performance Notes
+
+Large files with complex expressions can be slow:
+- `neorv32_cpu_alu_fpu.vhd` (117KB): ~7-8 seconds
+- `neorv32_top.vhd` (73KB): ~300ms
+- Most files: ~100ms
+
+The slowdown is due to GLR parsing with many conflicts. This is a grammar complexity issue, not a bug.
+
+---
+
+## Current Capabilities
+
+### Extraction
+- [x] Entity declarations with ports
+- [x] Architecture bodies
+- [x] Package declarations
+- [x] Signal declarations (multi-name)
+- [x] Port declarations with direction
+- [x] Process statements with sensitivity lists
+- [x] Component instantiations with port/generic maps
+- [x] Clock domain detection (rising_edge/falling_edge)
+- [x] Reset pattern detection (async/sync)
+- [x] Signal read/write analysis
+
+### Policies
+- [x] Naming conventions
+- [x] Unresolved dependencies
+- [x] Missing component definitions
+
+### System-Level
+- [x] Cross-file symbol resolution
+- [x] Dependency tracking
+- [x] Port map extraction
+
+---
+
+## Future Work
+
+### Grammar (improve IEEE 1076-2008 compliance)
+- [ ] Generate statements
+- [ ] Configuration declarations
+- [ ] Block statements
+- [ ] Protected types
+
+### Extractors
+- [ ] FSM state/transition extraction
+- [ ] Attribute expressions (`'range`, `'length`)
+- [ ] Aggregate analysis (`others => '0'`)
+- [ ] Case statement coverage
+
+### Policies
+- [ ] Latch inference detection
+- [ ] Multi-driver detection
+- [ ] Clock domain crossing analysis
+- [ ] Combinational loop detection
+- [ ] FSM completeness checking
+- [ ] Floating input detection
+
+### System-Level
+- [ ] Hierarchical signal tracing
+- [ ] Cross-module clock mismatch detection
+- [ ] Full hierarchy elaboration
