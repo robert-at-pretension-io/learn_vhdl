@@ -20,6 +20,13 @@
 #   FOCUS_TOP=50 ANALYZE=1 ./test_grammar.sh         # Build top-fail cache (one-time)
 #   FOCUS_TOP=50 ./test_grammar.sh                   # Re-run only top 50 failures
 #
+# SEMANTIC LINT PASS (XPASS -> Linter):
+#   LINT_XPASS=1 ./test_grammar.sh                   # Run vhdl-lint on XPASS list
+#   LINT_FILTER=semantic LINT_XPASS=1 ./test_grammar.sh  # Only analyzer_failure/*
+#   LINT_MAX_FILES=200 LINT_XPASS=1 ./test_grammar.sh    # Limit for speed (0 = all)
+#   LINT_BIN=./vhdl-lint LINT_XPASS=1 ./test_grammar.sh  # Custom linter path
+#   LINT_RULES_TOP=10 LINT_XPASS=1 ./test_grammar.sh     # Top rule counts
+#
 # ANTI-TEST FILTERS:
 #   Some suites include non-compliant/negative tests that should fail to parse.
 #   These are excluded from the primary score by default, but still tracked.
@@ -73,6 +80,11 @@ FOCUS_FAILS="${FOCUS_FAILS:-0}"
 FOCUS_FILE="${FOCUS_FILE:-.grammar_focus_list}"
 FAIL_CACHE="${FAIL_CACHE:-.grammar_fail_counts}"
 FAIL_LIST_CACHE="${FAIL_LIST_CACHE:-.grammar_fail_list}"
+LINT_XPASS="${LINT_XPASS:-0}"
+LINT_FILTER="${LINT_FILTER:-semantic}"
+LINT_MAX_FILES="${LINT_MAX_FILES:-200}"
+LINT_BIN="${LINT_BIN:-./vhdl-lint}"
+LINT_RULES_TOP="${LINT_RULES_TOP:-10}"
 
 # =============================================================================
 # EXCLUDE_GLOBS: Files to exclude from the primary pass rate calculation
@@ -220,6 +232,13 @@ TEMP_IGNORED_TESTS="
 */vhdl-tests/ieee-1076-2008/Annex_G/G_04_03_02.vhd
 */vhdl-tests/ieee-1076-2008/Annex_G/G_04_04_01.vhd
 */vhdl-tests/ieee-1076-2008/08/08_05_01.vhd
+# POSITIVE tests with missing semicolons (treat as invalid until upstream fixes)
+*/vhdl-tests/ieee-1076-2019/05/05_03_02_01_01.vhd
+*/vhdl-tests/ieee-1076-2019/05/05_06_04_01.vhd
+*/vhdl-tests/ieee-1076-2019/06/06_05_02_01.vhd
+*/vhdl-tests/ieee-1076-2019/06/06_05_07_01_01.vhd
+*/vhdl-tests/ieee-1076-2019/06/06_05_07_01_02.vhd
+*/vhdl-tests/ieee-1076-2019/08/08_05_01.vhd
 */grlib/designs/leon3-digilent-xc7z020/leon3mp.vhd
 */grlib/lib/gaisler/misc/charrom.vhd
 */grlib/lib/gsi/ssram/core_burst.vhd
@@ -553,6 +572,129 @@ if [ "$ANALYZE" -eq 1 ] && [ -s "$XPASS_LIST" ]; then
     done
     if [ "$XPASS" -gt 5 ]; then
         echo "  ... and $((XPASS - 5)) more (see \$XPASS_LIST for full list)"
+    fi
+fi
+
+# Semantic lint pass: run vhdl-lint on XPASS files to reduce semantic misses
+if [ "$LINT_XPASS" -eq 1 ] && [ -s "$XPASS_LIST" ]; then
+    echo ""
+    echo "=== Semantic Lint Analysis (XPASS -> linter) ==="
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "Skipping semantic lint analysis: python3 not found"
+    elif [ ! -x "$LINT_BIN" ]; then
+        echo "Skipping semantic lint analysis: $LINT_BIN not found or not executable"
+    else
+        lint_checked=0
+        lint_with_violations=0
+        lint_clean=0
+        lint_failed=0
+        rules_tmp="$(mktemp)"
+        clean_tmp="$(mktemp)"
+        counts_tmp="$(mktemp)"
+        fail_tmp="$(mktemp)"
+
+        while read -r f; do
+            should_lint=0
+            case "$LINT_FILTER" in
+                all)
+                    should_lint=1
+                    ;;
+                semantic)
+                    if [[ "$f" == *"/analyzer_failure/"* ]]; then
+                        should_lint=1
+                    fi
+                    ;;
+                syntax)
+                    if [[ "$f" == *"/non_compliant/"* || "$f" == *"/negative/"* || "$f" == *"/synth/err"* ]]; then
+                        should_lint=1
+                    fi
+                    ;;
+                *)
+                    should_lint=1
+                    ;;
+            esac
+
+            if [ "$should_lint" -eq 0 ]; then
+                continue
+            fi
+
+            if [ "$LINT_MAX_FILES" -ne 0 ] && [ "$lint_checked" -ge "$LINT_MAX_FILES" ]; then
+                break
+            fi
+            lint_checked=$((lint_checked + 1))
+
+            summary=$(
+                "$LINT_BIN" --json "$f" 2>/dev/null | LINT_RULES_TMP="$rules_tmp" python3 -c 'import json,os,sys
+try:
+    data=json.load(sys.stdin)
+except Exception:
+    sys.exit(2)
+rules_tmp=os.environ.get("LINT_RULES_TMP")
+if rules_tmp:
+    try:
+        with open(rules_tmp,"a",encoding="utf-8") as handle:
+            for v in data.get("violations", []):
+                handle.write(v.get("rule", "") + "\n")
+    except Exception:
+        pass
+summary=data.get("summary", {})
+total=summary.get("total_violations", 0)
+errors=summary.get("errors", 0)
+warnings=summary.get("warnings", 0)
+info=summary.get("info", 0)
+print(f"{total}\t{errors}\t{warnings}\t{info}")'
+            )
+
+            if [ $? -ne 0 ] || [ -z "$summary" ]; then
+                lint_failed=$((lint_failed + 1))
+                echo "$f" >> "$fail_tmp"
+                continue
+            fi
+
+            total=$(echo "$summary" | awk -F'\t' '{print $1}')
+            errors=$(echo "$summary" | awk -F'\t' '{print $2}')
+            warnings=$(echo "$summary" | awk -F'\t' '{print $3}')
+            info=$(echo "$summary" | awk -F'\t' '{print $4}')
+
+            echo -e "$total\t$errors\t$warnings\t$info\t$f" >> "$counts_tmp"
+
+            if [ "$total" -gt 0 ]; then
+                lint_with_violations=$((lint_with_violations + 1))
+            else
+                lint_clean=$((lint_clean + 1))
+                echo "$f" >> "$clean_tmp"
+            fi
+        done < "$XPASS_LIST"
+
+        echo "Files checked: $lint_checked (filter=$LINT_FILTER, max=$LINT_MAX_FILES)"
+        echo "With violations: $lint_with_violations"
+        echo "Clean (semantic XPASS): $lint_clean"
+        echo "Lint failures: $lint_failed"
+
+        if [ -s "$clean_tmp" ]; then
+            echo ""
+            echo "Top semantic XPASS candidates (no violations):"
+            head -10 "$clean_tmp" | while read -r f; do
+                echo "  $f"
+            done
+        fi
+
+        if [ -s "$rules_tmp" ]; then
+            echo ""
+            echo "Top rule hits:"
+            sort "$rules_tmp" | sed '/^$/d' | uniq -c | sort -nr | head -n "$LINT_RULES_TOP" | awk '{printf "  %s %s\n", $1, $2}'
+        fi
+
+        if [ -s "$fail_tmp" ]; then
+            echo ""
+            echo "Lint failures (first 10):"
+            head -10 "$fail_tmp" | while read -r f; do
+                echo "  $f"
+            done
+        fi
+
+        rm -f "$rules_tmp" "$clean_tmp" "$counts_tmp" "$fail_tmp"
     fi
 fi
 

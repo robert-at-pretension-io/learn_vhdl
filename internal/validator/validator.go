@@ -40,6 +40,9 @@ import (
 //go:embed schema.cue
 var schemaFS embed.FS
 
+//go:embed output_schema.cue
+var outputSchemaFS embed.FS
+
 // Validator validates extracted data against the CUE schema contract.
 // This is the "strict gatekeeper" that prevents silent failures in OPA.
 // If the data doesn't match the schema, we crash immediately with a
@@ -150,4 +153,55 @@ func (v *Validator) ValidationErrors(data interface{}) []string {
 		errs = append(errs, e.Error())
 	}
 	return errs
+}
+
+// OutputValidator validates linter output against the output schema
+type OutputValidator struct {
+	ctx    *cue.Context
+	schema cue.Value
+}
+
+// NewOutputValidator creates a validator for linter output
+func NewOutputValidator() (*OutputValidator, error) {
+	ctx := cuecontext.New()
+
+	schemaBytes, err := outputSchemaFS.ReadFile("output_schema.cue")
+	if err != nil {
+		return nil, fmt.Errorf("loading output schema: %w", err)
+	}
+
+	schema := ctx.CompileBytes(schemaBytes)
+	if schema.Err() != nil {
+		return nil, fmt.Errorf("compiling output schema: %w", schema.Err())
+	}
+
+	return &OutputValidator{
+		ctx:    ctx,
+		schema: schema,
+	}, nil
+}
+
+// Validate checks that the output data conforms to the output schema
+func (v *OutputValidator) Validate(data interface{}) error {
+	jsonBytes, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("marshaling output to JSON: %w", err)
+	}
+
+	dataValue := v.ctx.CompileBytes(jsonBytes)
+	if dataValue.Err() != nil {
+		return fmt.Errorf("compiling output as CUE: %w", dataValue.Err())
+	}
+
+	outputDef := v.schema.LookupPath(cue.ParsePath("#LintOutput"))
+	if outputDef.Err() != nil {
+		return fmt.Errorf("looking up #LintOutput definition: %w", outputDef.Err())
+	}
+
+	unified := outputDef.Unify(dataValue)
+	if err := unified.Validate(); err != nil {
+		return fmt.Errorf("output schema validation failed: %w", err)
+	}
+
+	return nil
 }

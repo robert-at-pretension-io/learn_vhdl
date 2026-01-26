@@ -158,6 +158,32 @@ ANALYZE=1 ./test_grammar.sh external_tests
 3. Use FOCUS_FAILS or FOCUS_TOP for instant feedback during iteration
 4. Run full suite again only to verify final improvement
 
+#### Semantic XPASS Reduction Loop (Linter Pass)
+
+Use the grammar XPASS list as input to the linter to shrink **semantic** misses:
+
+```bash
+# 1) Build XPASS list
+ANALYZE=1 ./test_grammar.sh external_tests
+
+# 2) Run linter over semantic negatives only (analyzer_failure)
+LINT_XPASS=1 LINT_FILTER=semantic LINT_MAX_FILES=0 ./test_grammar.sh
+
+# Optional: focus syntax negatives (non_compliant/negative/synth/err)
+LINT_XPASS=1 LINT_FILTER=syntax LINT_MAX_FILES=0 ./test_grammar.sh
+```
+
+Interpret the output:
+- **Top rule hits** show which semantic rules are already firing.
+- **Clean list** are semantic negatives with *no* violations → add Rego rules or extractor coverage.
+- Iterate: add rules → rerun `LINT_XPASS` → confirm clean list shrinks.
+
+Quick checklist:
+- Clean list shrinking across iterations?
+- Rule hits dominated by style/naming? Temporarily disable them for semantic runs.
+- Clean files in `analyzer_failure` likely need extractor/read-write coverage.
+- Extractors are imperfect: run the linter on semantically valid projects to detect false positives.
+
 **Example AI Session:**
 ```
 Human: Improve the grammar pass rate

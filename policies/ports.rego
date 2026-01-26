@@ -77,5 +77,50 @@ port_is_assigned(port_name, entity_name) {
     lower(ca.target) == lower(port_name)
 }
 
+# Rule: Output port read internally (illegal in VHDL-93, allowed in VHDL-2008)
+# Demoted to info since most modern designs use VHDL-2008+
+output_port_read[violation] {
+    port := input.ports[_]
+    port.direction == "out"
+    port_is_read(port.name, port.in_entity)
+    violation := {
+        "rule": "output_port_read",
+        "severity": "info",
+        "file": input.entities[_].file,
+        "line": port.line,
+        "message": sprintf("Output port '%s' is read internally (use buffer or internal signal for VHDL-93 compatibility)", [port.name])
+    }
+}
+
+# Rule: Inout port used as output only (consider using 'out' direction)
+inout_as_output[violation] {
+    port := input.ports[_]
+    lower(port.direction) == "inout"
+    port_is_assigned(port.name, port.in_entity)
+    not port_is_read(port.name, port.in_entity)
+    violation := {
+        "rule": "inout_as_output",
+        "severity": "info",
+        "file": input.entities[_].file,
+        "line": port.line,
+        "message": sprintf("Inout port '%s' is only written, never read - consider 'out' direction", [port.name])
+    }
+}
+
+# Rule: Inout port used as input only (consider using 'in' direction)
+inout_as_input[violation] {
+    port := input.ports[_]
+    lower(port.direction) == "inout"
+    port_is_read(port.name, port.in_entity)
+    not port_is_assigned(port.name, port.in_entity)
+    violation := {
+        "rule": "inout_as_input",
+        "severity": "info",
+        "file": input.entities[_].file,
+        "line": port.line,
+        "message": sprintf("Inout port '%s' is only read, never written - consider 'in' direction", [port.name])
+    }
+}
+
 # NOW ENABLED - concurrent assignment extraction makes these accurate
-violations := unused_input_port | undriven_output_port
+violations := unused_input_port | undriven_output_port | output_port_read | inout_as_output | inout_as_input

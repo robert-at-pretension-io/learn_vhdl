@@ -46,6 +46,40 @@ is_actual_signal(name) {
     not is_constant(name)
 }
 
+# Helper: Check if name is declared anywhere (signal/port/type/subprogram/etc)
+is_declared_identifier(name) {
+    sig := input.signals[_]
+    lower(sig.name) == lower(name)
+}
+is_declared_identifier(name) {
+    port := input.ports[_]
+    lower(port.name) == lower(name)
+}
+is_declared_identifier(name) {
+    c := input.constants[_]
+    lower(c) == lower(name)
+}
+is_declared_identifier(name) {
+    lit := input.enum_literals[_]
+    lower(lit) == lower(name)
+}
+is_declared_identifier(name) {
+    t := input.types[_]
+    lower(t.name) == lower(name)
+}
+is_declared_identifier(name) {
+    st := input.subtypes[_]
+    lower(st.name) == lower(name)
+}
+is_declared_identifier(name) {
+    fn := input.functions[_]
+    lower(fn.name) == lower(name)
+}
+is_declared_identifier(name) {
+    pr := input.procedures[_]
+    lower(pr.name) == lower(name)
+}
+
 # Rule: Signal declared but never used (dead code)
 unused_signal[violation] {
     sig := input.signals[_]
@@ -145,24 +179,121 @@ signal_is_assigned(sig_name) {
 
 # Rule: Signal assigned in multiple places (potential multi-driver)
 # Now checks both processes and concurrent assignments
+# Severity: warning (not error) because record field assignments create false positives
 multi_driven_signal[violation] {
     sig := input.signals[_]
     driver_count := count_drivers(sig.name)
     driver_count > 1
     violation := {
         "rule": "multi_driven_signal",
-        "severity": "error",
+        "severity": "warning",
         "file": sig.file,
         "line": sig.line,
-        "message": sprintf("Signal '%s' is assigned in %d places (potential multi-driver)", [sig.name, driver_count])
+        "message": sprintf("Signal '%s' is assigned in %d places (review for multi-driver)", [sig.name, driver_count])
+    }
+}
+
+# Rule: Signal or port used but not declared
+undeclared_signal_usage[violation] {
+    proc := input.processes[_]
+    name := proc.read_signals[_]
+    not helpers.is_skip_name(name)
+    not is_declared_identifier(name)
+    violation := {
+        "rule": "undeclared_signal_usage",
+        "severity": "warning",
+        "file": proc.file,
+        "line": proc.line,
+        "message": sprintf("Signal '%s' is read but not declared in this design unit", [name])
+    }
+}
+undeclared_signal_usage[violation] {
+    proc := input.processes[_]
+    name := proc.assigned_signals[_]
+    not helpers.is_skip_name(name)
+    not is_declared_identifier(name)
+    violation := {
+        "rule": "undeclared_signal_usage",
+        "severity": "warning",
+        "file": proc.file,
+        "line": proc.line,
+        "message": sprintf("Signal '%s' is assigned but not declared in this design unit", [name])
+    }
+}
+undeclared_signal_usage[violation] {
+    ca := input.concurrent_assignments[_]
+    name := ca.read_signals[_]
+    not helpers.is_skip_name(name)
+    not is_declared_identifier(name)
+    violation := {
+        "rule": "undeclared_signal_usage",
+        "severity": "warning",
+        "file": ca.file,
+        "line": ca.line,
+        "message": sprintf("Signal '%s' is read but not declared in this design unit", [name])
+    }
+}
+undeclared_signal_usage[violation] {
+    ca := input.concurrent_assignments[_]
+    name := ca.target
+    not helpers.is_skip_name(name)
+    not is_declared_identifier(name)
+    violation := {
+        "rule": "undeclared_signal_usage",
+        "severity": "warning",
+        "file": ca.file,
+        "line": ca.line,
+        "message": sprintf("Signal '%s' is assigned but not declared in this design unit", [name])
+    }
+}
+
+# Rule: Input port driven inside architecture (illegal)
+input_port_driven[violation] {
+    port := input.ports[_]
+    lower(port.direction) == "in"
+    proc := input.processes[_]
+    assigned := proc.assigned_signals[_]
+    lower(assigned) == lower(port.name)
+    violation := {
+        "rule": "input_port_driven",
+        "severity": "error",
+        "file": proc.file,
+        "line": proc.line,
+        "message": sprintf("Input port '%s' is assigned in process '%s' (illegal driver)", [port.name, proc.label])
+    }
+}
+input_port_driven[violation] {
+    port := input.ports[_]
+    lower(port.direction) == "in"
+    ca := input.concurrent_assignments[_]
+    lower(ca.target) == lower(port.name)
+    violation := {
+        "rule": "input_port_driven",
+        "severity": "error",
+        "file": ca.file,
+        "line": ca.line,
+        "message": sprintf("Input port '%s' is driven by concurrent assignment (illegal driver)", [port.name])
     }
 }
 
 # Helper: Count total drivers for a signal
+# Assignments inside the same generate block count as 1 driver (not N)
 count_drivers(sig_name) = total {
     proc_drivers := count([p | p := input.processes[_]; sig_assigned_in_process(sig_name, p)])
-    conc_drivers := count([ca | ca := input.concurrent_assignments[_]; lower(ca.target) == lower(sig_name)])
-    total := proc_drivers + conc_drivers
+    # Count non-generate concurrent assignments
+    non_gen_drivers := count([ca |
+        ca := input.concurrent_assignments[_]
+        lower(ca.target) == lower(sig_name)
+        not ca.in_generate
+    ])
+    # Count distinct generate blocks that assign this signal (each block = 1 driver)
+    gen_drivers := count({label |
+        ca := input.concurrent_assignments[_]
+        lower(ca.target) == lower(sig_name)
+        ca.in_generate
+        label := ca.generate_label
+    })
+    total := proc_drivers + non_gen_drivers + gen_drivers
 }
 
 # Helper: Check if signal is assigned in a specific process
@@ -220,7 +351,7 @@ duplicate_signal_name[violation] {
 }
 
 # NOW ENABLED - concurrent assignment extraction makes these accurate
-violations := unused_signal | undriven_signal | multi_driven_signal
+violations := unused_signal | undriven_signal | multi_driven_signal | undeclared_signal_usage | input_port_driven
 
 # Additional optional rules
 optional_violations := wide_signal | duplicate_signal_name

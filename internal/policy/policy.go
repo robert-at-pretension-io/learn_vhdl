@@ -53,6 +53,7 @@ type Input struct {
 	Processes             []Process              `json:"processes"`              // Process statements for sensitivity/clock analysis
 	ConcurrentAssignments []ConcurrentAssignment `json:"concurrent_assignments"` // Concurrent signal assignments (outside processes)
 	Generates             []GenerateStatement    `json:"generates"`              // Generate statements (for/if/case generate)
+	Configurations        []Configuration        `json:"configurations"`         // Configuration declarations
 	// Type system
 	Types         []TypeDeclaration        `json:"types"`          // Type declarations (enum, record, array, etc.)
 	Subtypes      []SubtypeDeclaration     `json:"subtypes"`       // Subtype declarations
@@ -86,6 +87,7 @@ type Process struct {
 	IsSequential    bool     `json:"is_sequential"`
 	IsCombinational bool     `json:"is_combinational"`
 	ClockSignal     string   `json:"clock_signal"`
+	ClockEdge       string   `json:"clock_edge"`
 	HasReset        bool     `json:"has_reset"`
 	ResetSignal     string   `json:"reset_signal"`
 	AssignedSignals []string `json:"assigned_signals"`
@@ -130,6 +132,7 @@ type Signal struct {
 	File     string `json:"file"`
 	Line     int    `json:"line"`
 	InEntity string `json:"in_entity"`
+	Width    int    `json:"width"` // Estimated bit width (0 if unknown)
 }
 
 type Port struct {
@@ -138,6 +141,7 @@ type Port struct {
 	Type      string `json:"type"`
 	Line      int    `json:"line"`
 	InEntity  string `json:"in_entity"`
+	Width     int    `json:"width"` // Estimated bit width (0 if unknown)
 }
 
 type Dependency struct {
@@ -183,12 +187,14 @@ type CaseStatement struct {
 // ConcurrentAssignment represents a concurrent signal assignment (outside processes)
 // Enables detection of undriven/multi-driven signals that were previously missed
 type ConcurrentAssignment struct {
-	Target      string   `json:"target"`       // Signal being assigned (LHS)
-	ReadSignals []string `json:"read_signals"` // Signals being read (RHS)
-	File        string   `json:"file"`
-	Line        int      `json:"line"`
-	InArch      string   `json:"in_arch"` // Which architecture contains this assignment
-	Kind        string   `json:"kind"`    // "simple", "conditional", "selected"
+	Target        string   `json:"target"`         // Signal being assigned (LHS)
+	ReadSignals   []string `json:"read_signals"`   // Signals being read (RHS)
+	File          string   `json:"file"`
+	Line          int      `json:"line"`
+	InArch        string   `json:"in_arch"`        // Which architecture contains this assignment
+	Kind          string   `json:"kind"`           // "simple", "conditional", "selected"
+	InGenerate    bool     `json:"in_generate"`    // True if inside a generate block
+	GenerateLabel string   `json:"generate_label"` // Label of containing generate block
 }
 
 // Comparison represents a comparison operation for trojan/trigger detection
@@ -281,6 +287,14 @@ type GenerateStatement struct {
 	SignalCount   int `json:"signal_count"`   // Number of signals declared inside
 	InstanceCount int `json:"instance_count"` // Number of instances inside
 	ProcessCount  int `json:"process_count"`  // Number of processes inside
+}
+
+// Configuration represents a VHDL configuration declaration
+type Configuration struct {
+	Name       string `json:"name"`
+	EntityName string `json:"entity_name"`
+	File       string `json:"file"`
+	Line       int    `json:"line"`
 }
 
 // =============================================================================

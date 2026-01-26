@@ -47,7 +47,13 @@ func main() {
 			printUsage()
 			os.Exit(1)
 		}
-		runLint(os.Args[2], true)
+		runLintWithOptions(os.Args[2], true, false)
+	case "-j", "--json":
+		if len(os.Args) < 3 {
+			printUsage()
+			os.Exit(1)
+		}
+		runLintWithOptions(os.Args[2], false, true)
 	case "-h", "--help", "help":
 		printUsage()
 	case "-c", "--config":
@@ -55,9 +61,9 @@ func main() {
 			printUsage()
 			os.Exit(1)
 		}
-		runLintWithConfig(os.Args[2], os.Args[3], false)
+		runLintWithConfig(os.Args[2], os.Args[3], false, false)
 	default:
-		runLint(cmd, false)
+		runLintWithOptions(cmd, false, false)
 	}
 }
 
@@ -69,7 +75,8 @@ Commands:
   <path>            Lint VHDL files in the given path
 
 Options:
-  -v, --verbose     Enable verbose output
+  -v, --verbose     Enable verbose output (extraction details)
+  -j, --json        Output results as JSON (for programmatic parsing)
   -c, --config      Specify config file: vhdl-lint -c config.json <path>
   -h, --help        Show this help message
 
@@ -109,23 +116,26 @@ func runInit() {
 	fmt.Println("  - Lint rule severities")
 }
 
-func runLint(path string, verbose bool) {
+func runLintWithOptions(path string, verbose, jsonOutput bool) {
 	// Load config from default locations
 	cfg, err := config.Load(path)
 	if err != nil {
-		fmt.Printf("Warning: Could not load config: %v (using defaults)\n", err)
+		if !jsonOutput {
+			fmt.Printf("Warning: Could not load config: %v (using defaults)\n", err)
+		}
 		cfg = config.DefaultConfig()
 	}
 
 	idx := indexer.NewWithConfig(cfg)
 	idx.Verbose = verbose
+	idx.JSONOutput = jsonOutput
 	if err := idx.Run(path); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func runLintWithConfig(configPath, lintPath string, verbose bool) {
+func runLintWithConfig(configPath, lintPath string, verbose, jsonOutput bool) {
 	cfg, err := config.LoadFile(configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error loading config %s: %v\n", configPath, err)
@@ -134,6 +144,7 @@ func runLintWithConfig(configPath, lintPath string, verbose bool) {
 
 	idx := indexer.NewWithConfig(cfg)
 	idx.Verbose = verbose
+	idx.JSONOutput = jsonOutput
 	if err := idx.Run(lintPath); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)

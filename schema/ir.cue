@@ -19,6 +19,7 @@ package schema
     instances:       [...#Instance]
     case_statements: [...#CaseStatement]
     processes:       [...#Process]
+    configurations:  [...#Configuration]
 }
 
 // Entity declaration
@@ -121,6 +122,7 @@ package schema
     is_sequential:    bool                              // Has clock edge
     is_combinational: bool                              // No clock edge
     clock_signal:     string                            // Clock signal if sequential
+    clock_edge:       string                            // "rising" or "falling" if sequential
     has_reset:        bool                              // Has reset logic
     reset_signal:     string                            // Reset signal name
     assigned_signals: [...string]                       // Signals written
@@ -128,4 +130,12 @@ package schema
     file:             string & =~".+\\.(vhd|vhdl)$"
     line:             int & >=1
     in_arch:          string                            // Containing architecture
+}
+
+// Configuration declaration
+#Configuration: {
+    name:        string & =~"^[a-zA-Z_][a-zA-Z0-9_]*$"
+    entity_name: string & =~"^[a-zA-Z_][a-zA-Z0-9_]*$"
+    file:        string & =~".+\\.(vhd|vhdl)$"
+    line:        int & >=1
 }

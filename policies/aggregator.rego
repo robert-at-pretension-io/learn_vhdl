@@ -21,6 +21,8 @@ import data.vhdl.synthesis
 import data.vhdl.testbench
 import data.vhdl.latch
 import data.vhdl.cdc
+import data.vhdl.configurations
+import data.vhdl.subprograms
 # Advanced static analysis modules
 import data.vhdl.security
 import data.vhdl.rdc
@@ -37,53 +39,59 @@ core_violations := core.violations
 # Sensitivity list rules (always enabled)
 sensitivity_violations := sensitivity.violations
 
-# Clock/reset rules (always enabled)
-clock_reset_violations := clocks_resets.violations
+# Clock/reset rules
+clock_reset_violations := clocks_resets.violations | clocks_resets.optional_violations
 
-# Signal analysis rules (enabled - concurrent assignments now tracked)
-signal_violations := signals.violations
+# Signal analysis rules
+signal_violations := signals.violations | signals.optional_violations
 
 # Port analysis rules (enabled - concurrent assignments now tracked)
 port_violations := ports.violations
 
 # Instance rules
-instance_violations := instances.violations
+instance_violations := instances.violations | instances.optional_violations
+
+# Configuration rules
+configuration_violations := configurations.violations
+
+# Subprogram rules
+subprogram_violations := subprograms.violations
 
 # Style rules
-style_violations := style.violations
+style_violations := style.violations | style.optional_violations
 
-# Naming rules (disabled by default - project-specific)
-naming_violations := naming.violations
+# Naming rules
+naming_violations := naming.violations | naming.optional_violations
 
 # Process rules
 process_violations := processes.violations
 
-# Type rules (disabled by default)
-type_violations := types.violations
+# Type rules
+type_violations := types.violations | types.optional_violations
 
 # FSM rules
-fsm_violations := fsm.violations
+fsm_violations := fsm.violations | fsm.optional_violations
 
 # Combinational logic rules
-combinational_violations := combinational.violations
+combinational_violations := combinational.violations | combinational.optional_violations
 
 # Sequential logic rules
-sequential_violations := sequential.violations
+sequential_violations := sequential.violations | sequential.optional_violations
 
 # Hierarchy rules
-hierarchy_violations := hierarchy.violations
+hierarchy_violations := hierarchy.violations | hierarchy.optional_violations
 
 # Quality rules
-quality_violations := quality.violations
+quality_violations := quality.violations | quality.optional_violations
 
 # Synthesis rules
-synthesis_violations := synthesis.violations
+synthesis_violations := synthesis.violations | synthesis.optional_violations
 
 # Testbench rules
-testbench_violations := testbench.violations
+testbench_violations := testbench.violations | testbench.optional_violations
 
 # Latch inference detection rules
-latch_violations := latch.violations
+latch_violations := latch.violations | latch.optional_violations
 
 # Clock Domain Crossing rules
 cdc_violations := cdc.cdc_violations
@@ -93,20 +101,20 @@ cdc_violations := cdc.cdc_violations
 # =============================================================================
 
 # Security rules (hardware trojan detection)
-security_violations := security.violations
+security_violations := security.violations | security.optional_violations
 
 # Reset Domain Crossing rules
-rdc_violations := rdc.violations
+rdc_violations := rdc.violations | rdc.optional_violations
 
 # Power analysis rules (operand isolation)
-power_violations := power.violations
+power_violations := power.violations | power.optional_violations
 
 # =============================================================================
 # All enabled violations (filtered by lint config and third-party files)
 # =============================================================================
 
 # Raw violations from all modules before filtering
-raw_violations := core_violations | sensitivity_violations | clock_reset_violations | signal_violations | port_violations | instance_violations | style_violations | naming_violations | process_violations | type_violations | fsm_violations | combinational_violations | sequential_violations | hierarchy_violations | quality_violations | synthesis_violations | testbench_violations | latch_violations | cdc_violations | security_violations | rdc_violations | power_violations
+raw_violations := core_violations | sensitivity_violations | clock_reset_violations | signal_violations | port_violations | instance_violations | configuration_violations | subprogram_violations | style_violations | naming_violations | process_violations | type_violations | fsm_violations | combinational_violations | sequential_violations | hierarchy_violations | quality_violations | synthesis_violations | testbench_violations | latch_violations | cdc_violations | security_violations | rdc_violations | power_violations
 
 # Filter out:
 # 1. Violations for rules that are disabled (severity == "off")
@@ -160,6 +168,8 @@ summary := {
         "signals": count(signal_violations),
         "ports": count(port_violations),
         "instances": count(instance_violations),
+        "configurations": count(configuration_violations),
+        "subprograms": count(subprogram_violations),
         "style": count(style_violations),
         "naming": count(naming_violations),
         "processes": count(process_violations),
@@ -181,17 +191,11 @@ summary := {
 }
 
 # =============================================================================
-# Optional rules (can be enabled per-project)
+# Optional rules catalog (disable per-project via lint config if needed)
 # =============================================================================
 
-# To enable optional rules, create a custom aggregator:
-#
-#   package myproject.compliance
-#   import data.vhdl.compliance
-#   import data.vhdl.naming
-#   import data.vhdl.quality
-#
-#   all_violations := compliance.all_violations | naming.optional_violations | quality.optional_violations
+# Optional rules are included by default. To suppress them, set rule severity
+# to "off" in vhdl_lint.json for the specific rule names.
 
 optional_rules := {
     # Naming conventions

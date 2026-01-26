@@ -25,6 +25,7 @@ package indexer
 // =============================================================================
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -60,6 +61,63 @@ type Indexer struct {
 
 	// Verbose output
 	Verbose bool
+
+	// JSON output mode
+	JSONOutput bool
+}
+
+// LintResult is the structured result of running the linter
+// This can be serialized to JSON for programmatic consumption
+type LintResult struct {
+	// Violations found by policy evaluation
+	Violations []policy.Violation `json:"violations"`
+
+	// Summary counts
+	Summary ResultSummary `json:"summary"`
+
+	// Extraction statistics
+	Stats ExtractionStats `json:"stats"`
+
+	// Per-file breakdown
+	Files []FileResult `json:"files"`
+
+	// Parse errors encountered
+	ParseErrors []ParseError `json:"parse_errors,omitempty"`
+}
+
+// ResultSummary provides aggregate violation counts
+type ResultSummary struct {
+	TotalViolations int `json:"total_violations"`
+	Errors          int `json:"errors"`
+	Warnings        int `json:"warnings"`
+	Info            int `json:"info"`
+}
+
+// ExtractionStats provides counts of extracted elements
+type ExtractionStats struct {
+	Files      int `json:"files"`
+	Symbols    int `json:"symbols"`
+	Entities   int `json:"entities"`
+	Packages   int `json:"packages"`
+	Signals    int `json:"signals"`
+	Ports      int `json:"ports"`
+	Processes  int `json:"processes"`
+	Instances  int `json:"instances"`
+	Generates  int `json:"generates"`
+}
+
+// FileResult provides per-file violation counts
+type FileResult struct {
+	Path       string `json:"path"`
+	Errors     int    `json:"errors"`
+	Warnings   int    `json:"warnings"`
+	Info       int    `json:"info"`
+}
+
+// ParseError represents a file that failed to parse
+type ParseError struct {
+	File    string `json:"file"`
+	Message string `json:"message"`
 }
 
 // SymbolTable holds all exported symbols across files
@@ -144,14 +202,16 @@ func (idx *Indexer) Run(rootPath string) error {
 			}
 		}
 
-		// Report library info
-		fmt.Printf("Loaded configuration with %d libraries\n", len(libs))
-		for _, lib := range libs {
-			thirdParty := ""
-			if lib.IsThirdParty {
-				thirdParty = " (third-party)"
+		// Report library info (only in text mode)
+		if !idx.JSONOutput {
+			fmt.Printf("Loaded configuration with %d libraries\n", len(libs))
+			for _, lib := range libs {
+				thirdParty := ""
+				if lib.IsThirdParty {
+					thirdParty = " (third-party)"
+				}
+				fmt.Printf("  %s: %d files%s\n", lib.Name, len(lib.Files), thirdParty)
 			}
-			fmt.Printf("  %s: %d files%s\n", lib.Name, len(lib.Files), thirdParty)
 		}
 	}
 
@@ -172,7 +232,9 @@ func (idx *Indexer) Run(rootPath string) error {
 	}
 	files = filteredFiles
 
-	fmt.Printf("Found %d VHDL files\n", len(files))
+	if !idx.JSONOutput {
+		fmt.Printf("Found %d VHDL files\n", len(files))
+	}
 
 	// 2. Pass 1: Parallel extraction
 	ext := extractor.New()
@@ -585,49 +647,116 @@ func (idx *Indexer) Run(rootPath string) error {
 		return fmt.Errorf("CRITICAL: Data contract violation (Go -> OPA mismatch): %w", err)
 	}
 
-	// 6. Run policy evaluation
+	// 6. Run policy evaluation and build result
+	lintResult := LintResult{
+		Violations:  []policy.Violation{},
+		ParseErrors: []ParseError{},
+		Stats: ExtractionStats{
+			Files:     len(files),
+			Symbols:   idx.Symbols.Len(),
+			Entities:  len(opaInput.Entities),
+			Packages:  len(opaInput.Packages),
+			Signals:   len(opaInput.Signals),
+			Ports:     len(opaInput.Ports),
+			Processes: len(opaInput.Processes),
+			Instances: len(opaInput.Instances),
+			Generates: len(opaInput.Generates),
+		},
+		Files: []FileResult{},
+	}
+
+	// Add parse errors
+	for _, e := range errs {
+		lintResult.ParseErrors = append(lintResult.ParseErrors, ParseError{
+			File:    "",
+			Message: e.Error(),
+		})
+	}
+
 	policyEngine, err := policy.New("policies")
 	if err != nil {
-		fmt.Printf("Warning: Could not load policies: %v\n", err)
+		if !idx.JSONOutput {
+			fmt.Printf("Warning: Could not load policies: %v\n", err)
+		}
 	} else {
 		result, err := policyEngine.Evaluate(opaInput)
 		if err != nil {
-			fmt.Printf("Warning: Policy evaluation failed: %v\n", err)
+			if !idx.JSONOutput {
+				fmt.Printf("Warning: Policy evaluation failed: %v\n", err)
+			}
 		} else {
-			// Report violations
-			if len(result.Violations) > 0 {
-				fmt.Printf("\n=== Policy Violations ===\n")
-				for _, v := range result.Violations {
-					icon := "ℹ"
-					if v.Severity == "error" {
-						icon = "✗"
-					} else if v.Severity == "warning" {
-						icon = "⚠"
-					}
-					fmt.Printf("%s [%s] %s:%d - %s\n", icon, v.Rule, v.File, v.Line, v.Message)
-				}
+			lintResult.Violations = result.Violations
+			lintResult.Summary = ResultSummary{
+				TotalViolations: result.Summary.TotalViolations,
+				Errors:          result.Summary.Errors,
+				Warnings:        result.Summary.Warnings,
+				Info:            result.Summary.Info,
 			}
 
-			fmt.Printf("\n=== Policy Summary ===\n")
-			fmt.Printf("  Errors:   %d\n", result.Summary.Errors)
-			fmt.Printf("  Warnings: %d\n", result.Summary.Warnings)
-			fmt.Printf("  Info:     %d\n", result.Summary.Info)
+			// Build per-file breakdown
+			fileViolations := make(map[string]*FileResult)
+			for _, v := range result.Violations {
+				fr, ok := fileViolations[v.File]
+				if !ok {
+					fr = &FileResult{Path: v.File}
+					fileViolations[v.File] = fr
+				}
+				switch v.Severity {
+				case "error":
+					fr.Errors++
+				case "warning":
+					fr.Warnings++
+				case "info":
+					fr.Info++
+				}
+			}
+			for _, fr := range fileViolations {
+				lintResult.Files = append(lintResult.Files, *fr)
+			}
 		}
 	}
 
-	// 6. Report basic stats
-	fmt.Printf("\n=== Extraction Summary ===\n")
-	fmt.Printf("  Files:    %d\n", len(files))
-	fmt.Printf("  Symbols:  %d\n", idx.Symbols.Len())
-	fmt.Printf("  Entities: %d\n", len(opaInput.Entities))
-	fmt.Printf("  Packages: %d\n", len(opaInput.Packages))
-	fmt.Printf("  Signals:  %d\n", len(opaInput.Signals))
-	fmt.Printf("  Ports:    %d\n", len(opaInput.Ports))
+	// Output results
+	if idx.JSONOutput {
+		// JSON output mode
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(lintResult); err != nil {
+			return fmt.Errorf("failed to encode JSON output: %w", err)
+		}
+	} else {
+		// Text output mode (original behavior)
+		if len(lintResult.Violations) > 0 {
+			fmt.Printf("\n=== Policy Violations ===\n")
+			for _, v := range lintResult.Violations {
+				icon := "ℹ"
+				if v.Severity == "error" {
+					icon = "✗"
+				} else if v.Severity == "warning" {
+					icon = "⚠"
+				}
+				fmt.Printf("%s [%s] %s:%d - %s\n", icon, v.Rule, v.File, v.Line, v.Message)
+			}
+		}
 
-	if len(errs) > 0 {
-		fmt.Printf("\n=== Parse Errors ===\n")
-		for _, e := range errs {
-			fmt.Printf("  %v\n", e)
+		fmt.Printf("\n=== Policy Summary ===\n")
+		fmt.Printf("  Errors:   %d\n", lintResult.Summary.Errors)
+		fmt.Printf("  Warnings: %d\n", lintResult.Summary.Warnings)
+		fmt.Printf("  Info:     %d\n", lintResult.Summary.Info)
+
+		fmt.Printf("\n=== Extraction Summary ===\n")
+		fmt.Printf("  Files:    %d\n", lintResult.Stats.Files)
+		fmt.Printf("  Symbols:  %d\n", lintResult.Stats.Symbols)
+		fmt.Printf("  Entities: %d\n", lintResult.Stats.Entities)
+		fmt.Printf("  Packages: %d\n", lintResult.Stats.Packages)
+		fmt.Printf("  Signals:  %d\n", lintResult.Stats.Signals)
+		fmt.Printf("  Ports:    %d\n", lintResult.Stats.Ports)
+
+		if len(lintResult.ParseErrors) > 0 {
+			fmt.Printf("\n=== Parse Errors ===\n")
+			for _, e := range lintResult.ParseErrors {
+				fmt.Printf("  %s\n", e.Message)
+			}
 		}
 	}
 
@@ -652,6 +781,7 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 		Processes:             []policy.Process{},
 		ConcurrentAssignments: []policy.ConcurrentAssignment{},
 		Generates:             []policy.GenerateStatement{},
+		Configurations:        []policy.Configuration{},
 		// Type system
 		Types:         []policy.TypeDeclaration{},
 		Subtypes:      []policy.SubtypeDeclaration{},
@@ -836,6 +966,7 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 				IsSequential:    proc.IsSequential,
 				IsCombinational: proc.IsCombinational,
 				ClockSignal:     proc.ClockSignal,
+				ClockEdge:       proc.ClockEdge,
 				HasReset:        proc.HasReset,
 				ResetSignal:     proc.ResetSignal,
 				AssignedSignals: assigned,
@@ -964,6 +1095,16 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 				SignalCount:    len(gen.Signals),
 				InstanceCount:  len(gen.Instances),
 				ProcessCount:   len(gen.Processes),
+			})
+		}
+
+		// Configuration declarations
+		for _, cfg := range facts.Configurations {
+			input.Configurations = append(input.Configurations, policy.Configuration{
+				Name:       cfg.Name,
+				EntityName: cfg.EntityName,
+				File:       facts.File,
+				Line:       cfg.Line,
 			})
 		}
 

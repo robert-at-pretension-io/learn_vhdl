@@ -118,11 +118,14 @@ is_skip_name(name) {
     attrs[lower(name)]
 }
 is_skip_name(name) {
-    # Common ieee function names
+    # Common ieee function names and type conversion functions
     func_names := {"to_integer", "to_unsigned", "to_signed", "to_stdulogicvector",
-                   "resize", "shift_left", "shift_right", "rotate_left", "rotate_right",
-                   "rising_edge", "falling_edge", "now", "or_reduce", "and_reduce",
-                   "xor_reduce", "nand_reduce", "nor_reduce", "xnor_reduce"}
+                   "to_stdlogicvector", "to_bitvector", "to_bit", "to_stdulogic",
+                   "to_stdlogic", "std_logic_vector", "conv_integer", "conv_unsigned",
+                   "conv_signed", "conv_std_logic_vector", "resize", "shift_left",
+                   "shift_right", "rotate_left", "rotate_right", "rising_edge",
+                   "falling_edge", "now", "or_reduce", "and_reduce", "xor_reduce",
+                   "nand_reduce", "nor_reduce", "xnor_reduce", "minimum", "maximum"}
     func_names[lower(name)]
 }
 is_skip_name(name) {
@@ -271,11 +274,12 @@ rule_is_disabled(rule_name) {
     input.lint_config.rules[rule_name] == "off"
 }
 
-# Get the configured severity for a rule (defaults to "warning" if not configured)
+# Get the configured severity for a rule (returns null if not configured)
+# The aggregator will use the rule's original severity if null is returned
 get_rule_severity(rule_name) := severity {
     severity := input.lint_config.rules[rule_name]
     severity != null
-} else := "warning"
+} else := null
 
 # Check if rule is enabled (not "off")
 rule_is_enabled(rule_name) {

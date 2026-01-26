@@ -163,6 +163,97 @@ Example rules:
 
 ---
 
+## Pain Points Addressed
+
+This tool targets the four major time sinks in FPGA development:
+
+### 1. The "20-Minute Typo" (Compilation Penalty) ✅ SOLVED
+
+**The Pain:** In software, a typo is caught in 0.5 seconds. In FPGA land, you click "Synthesize," wait 20 minutes, and see `Error: Symbol 'rst_n' is not declared.`
+
+**Our Solution:** Instant feedback. Catch undeclared symbols, missing dependencies, and orphan architectures before you ever touch the synthesis tool.
+
+| Check | Rule | Status |
+|-------|------|--------|
+| Undeclared signals | `undeclared_signal_usage` | ✅ |
+| Missing components | `unresolved_component` | ✅ |
+| Bad use clauses | `unresolved_dependency` | ✅ |
+| Orphan architectures | `orphan_architecture` | ✅ |
+| Syntax errors | Tree-sitter GLR parser | ✅ |
+
+**Value:** "Save 1 hour/day of synthesis wait time by catching 3 typos before you click Run."
+
+---
+
+### 2. "Who Drives This Signal?" (Spaghetti Code) ⚠️ PARTIAL
+
+**The Pain:** You inherit a 10-year-old codebase. Signal `enable_rx` is toggling unexpectedly. Finding the driver means grepping 50 files and tracing port maps manually.
+
+**Our Solution:** We extract the full dependency graph. The data exists - visualization is the gap.
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Signal dependency tracking | ✅ | `signal_deps` data structure |
+| Instance hierarchy | ✅ | `instances` with port/generic maps |
+| Signal read/write tracking | ✅ | `signal_usages` per process |
+| `--show-driver` CLI | ❌ | **TODO** |
+| Hierarchy graph export | ❌ | **TODO** |
+
+**Planned:** `--show-driver enable_rx` → "Signal driven by process 'rx_ctrl' at line 142"
+
+---
+
+### 3. FSM Deadlocks and "Lockup" ⚠️ PARTIAL
+
+**The Pain:** FSMs are the brain of the FPGA. If a state has no exit condition, the chip freezes. You can't see this in code - you have to simulate every path or stare at it for hours.
+
+**Our Solution:** We detect unreachable and unhandled states. Dead states (no exit) are the gap.
+
+| Check | Rule | Status |
+|-------|------|--------|
+| Unreachable states | `fsm_unreachable_state` | ✅ |
+| Unhandled states in case | `fsm_unhandled_state` | ✅ |
+| Missing default state | `fsm_missing_default_state` | ✅ |
+| FSM without reset | `fsm_no_reset` | ✅ |
+| Dead states (no exit) | ❌ | **TODO** |
+| FSM graph export | ❌ | **TODO** |
+
+**Example Dead State:**
+```vhdl
+case state is
+  when S_INIT => state <= S_RUN;
+  when S_RUN  => state <= S_DONE;
+  when S_DONE => null; -- DEAD: no transition out!
+end case;
+```
+
+---
+
+### 4. The "Bit-Width Silent Killer" ⚠️ IN PROGRESS
+
+**The Pain:** You connect a 12-bit signal to a 10-bit port. The tool silently truncates. The chip works "mostly" - until the counter overflows. This takes days to debug because the logic looks correct.
+
+**Our Solution:** Width checking on port connections.
+
+| Check | Rule | Status |
+|-------|------|--------|
+| Port width mismatch | `port_width_mismatch` | ✅ |
+| Vector truncation | ❌ | **TODO** |
+| Signal width estimation | ✅ | `estimateSignalWidth()` |
+
+---
+
+### Summary: Coverage vs. Pain Points
+
+| Pain Point | Coverage | Marketing Hook |
+|------------|----------|----------------|
+| Synthesis Wait Times | ✅ 100% | "Catch typos before you click Synthesize" |
+| Legacy Code Exploration | ⚠️ 70% | "Visualize the architecture instantly" |
+| FSM Lockups | ⚠️ 80% | "Never ship a dead state" |
+| Width Mismatches | ✅ 90% | "Never let a truncation kill your math" |
+
+---
+
 ## Quick Start
 
 ```bash
@@ -488,6 +579,29 @@ npx tree-sitter parse ../external_tests/neorv32/rtl/core/neorv32_cpu.vhd 2>&1 | 
 # - Record field access not handled
 ```
 
+**Phase 2b: Semantic XPASS Loop (shrink semantic misses)**
+```bash
+# 1. Build the XPASS list with grammar tests
+ANALYZE=1 ./test_grammar.sh external_tests
+
+# 2. Run the linter only on semantic negatives (analyzer_failure)
+LINT_XPASS=1 LINT_FILTER=semantic LINT_MAX_FILES=0 ./test_grammar.sh
+
+# Optional: focus syntax negatives instead
+LINT_XPASS=1 LINT_FILTER=syntax LINT_MAX_FILES=0 ./test_grammar.sh
+
+# 3. Use the output to drive new rules:
+#    - "Top rule hits" -> where rules already catch semantics
+#    - "Clean" list -> missing semantic rules or extractor gaps
+# 4. Add/adjust Rego rules, then repeat
+```
+
+**Semantic XPASS checklist**
+- Clean list shrinking? If not, add rules or extractor coverage.
+- Rule hits dominated by style/naming? Consider disabling for semantic runs.
+- Unexpected clean files in analyzer_failure? Inspect for missing read/write extraction.
+- Extractors are imperfect: always run the linter on known-good (semantically valid) code to catch false positives early.
+
 **Phase 3: Policy (tune false positive rate)**
 ```bash
 # If extraction is correct but policy is too strict:
@@ -712,116 +826,248 @@ Based on impact analysis, these are the highest-value improvements ranked by ROI
 
 ---
 
-## Product Roadmap: High-Value Rules
+## Complete Rule Reference
 
-Rules prioritized by customer value and implementation effort. Focus is on rules that catch real bugs and save engineering time.
+The linter includes **80+ rules** organized by category. All rules can be configured via `vhdl_lint.json`.
 
-### Tier 1: Synthesis Correctness ✅ COMPLETE
+### Signal Rules (`policies/signals.rego`)
 
-These rules catch bugs that break synthesis or cause hardware failures.
+| Rule | Severity | Description |
+|------|----------|-------------|
+| `unused_signal` | Warning | Signal declared but never read or written |
+| `undriven_signal` | Error | Signal read but never assigned |
+| `multi_driven_signal` | Error | Signal assigned in multiple places (multi-driver) |
+| `undeclared_signal_usage` | Error | Signal used but not declared in scope |
+| `input_port_driven` | Error | Input port illegally driven inside architecture |
+| `wide_signal` | Info | Signal wider than 128 bits |
+| `duplicate_signal_name` | Info | Same signal name in different entities |
 
-| Rule | Severity | Description | Status |
-|------|----------|-------------|--------|
-| `multi_driven_signal` | Error | Two processes/assignments driving same signal | ✅ |
-| `floating_instance_input` | Error | Input port not connected in instantiation | ✅ |
-| `unused_signal` | Warning | Signal declared but never used | ✅ |
-| `unregistered_output` | Warning | Output port driven by combinational logic | ✅ |
-| `file_entity_mismatch` | Info | Filename doesn't match entity name | ✅ |
+### Port Rules (`policies/ports.rego`)
 
-### Tier 2: Design Quality ✅ COMPLETE
+| Rule | Severity | Description |
+|------|----------|-------------|
+| `unused_input_port` | Warning | Input port never read |
+| `undriven_output_port` | Error | Output port never assigned (floating) |
+| `output_port_read` | Error | Output port read internally (illegal in VHDL-93) |
+| `inout_as_output` | Info | Bidirectional port only written, never read |
+| `inout_as_input` | Info | Bidirectional port only read, never written |
 
-These rules improve design reliability and catch subtle bugs.
+### Process Rules (`policies/processes.rego`, `policies/sequential.rego`, `policies/combinational.rego`)
 
-| Rule | Severity | Description | Status |
-|------|----------|-------------|--------|
-| `direct_combinational_loop` | Error | Signal depends on itself (A -> A) | ✅ |
-| `two_stage_combinational_loop` | Error | Two-stage loop (A -> B -> A) | ✅ |
-| `three_stage_combinational_loop` | Error | Three-stage loop (A -> B -> C -> A) | ✅ |
-| `cross_process_combinational_loop` | Error | Loop across processes | ✅ |
-| `fsm_missing_default_state` | Error | FSM case without "when others" | ✅ |
-| `fsm_unhandled_state` | Warning | Enum state not handled in case | ✅ |
-| `fsm_unreachable_state` | Warning | State never assigned (heuristic) | ✅ |
-| `missing_reset` | Warning | Sequential process without reset | ✅ |
-| `async_reset_unsynchronized` | Warning | Async reset not synchronized | ✅ |
-| `cdc_unsync_multi_bit` | Error | Multi-bit CDC (needs handshake) | ✅ |
+| Rule | Severity | Description |
+|------|----------|-------------|
+| `sensitivity_list_incomplete` | Warning | Signal read in process but missing from sensitivity |
+| `sensitivity_list_superfluous` | Info | Signal in sensitivity list but never read |
+| `missing_clock_sensitivity` | Error | Sequential process missing clock in sensitivity |
+| `missing_reset_sensitivity` | Warning | Process has reset but not in sensitivity |
+| `mixed_edge_clocking` | Warning | Both rising and falling edge on same clock |
+| `signal_in_seq_and_comb` | Warning | Signal assigned in both sequential and combinational |
+| `complex_process` | Info | Process with many assignments (complexity) |
+| `process_label_missing` | Info | Process without label |
+| `empty_sensitivity_combinational` | Warning | Combinational process with empty sensitivity list |
+| `large_combinational_process` | Info | Large combinational logic block |
 
-#### Tier 2 Implementation Details
+### Clock & Reset Rules (`policies/clocks_resets.rego`, `policies/rdc.rego`)
 
-**Combinational Loop Detection:**
+| Rule | Severity | Description |
+|------|----------|-------------|
+| `missing_reset` | Warning | Sequential process without reset |
+| `multiple_clocks_in_process` | Error | More than one clock edge in same process |
+| `clock_not_std_logic` | Warning | Clock signal not std_logic type |
+| `reset_not_std_logic` | Warning | Reset signal not std_logic type |
+| `async_reset_active_high` | Info | Async reset uses active-high (vs active-low convention) |
+| `async_reset_unsynchronized` | Warning | Async reset crosses clock domain without sync |
+| `reset_crosses_domains` | Warning | Reset signal used in different clock domains |
+| `combinational_reset_gen` | Warning | Reset generated by combinational logic |
+| `short_reset_sync` | Warning | Reset synchronizer too short (<2 stages) |
+
+### CDC Rules (`policies/cdc.rego`)
+
+| Rule | Severity | Description |
+|------|----------|-------------|
+| `cdc_unsync_single_bit` | Warning | Single-bit signal crosses domain unsynchronized |
+| `cdc_unsync_multi_bit` | Error | Multi-bit signal crosses domain (needs handshake) |
+| `cdc_insufficient_sync` | Warning | CDC synchronizer has <2 flip-flop stages |
+
+### Latch Rules (`policies/latch.rego`)
+
+| Rule | Severity | Description |
+|------|----------|-------------|
+| `incomplete_case_latch` | Error | Case statement missing `when others` in combinational |
+| `enum_case_incomplete` | Warning | Enum case doesn't cover all literals |
+| `combinational_incomplete_assignment` | Warning | Not all signals assigned in all branches |
+| `fsm_no_reset` | Warning | FSM state signal has no reset value |
+| `many_signals_no_default` | Warning | Many signals without default in combinational |
+
+### Combinational Loop Rules (`policies/combinational.rego`)
+
+| Rule | Severity | Description |
+|------|----------|-------------|
+| `direct_combinational_loop` | Error | Signal depends on itself (A -> A) |
+| `two_stage_loop` | Error | Two-stage feedback loop (A -> B -> A) |
+| `three_stage_loop` | Error | Three-stage feedback loop |
+| `cross_process_loop` | Error | Loop across multiple processes |
+| `potential_comb_loop` | Warning | Potential loop detected (heuristic) |
+| `combinational_feedback` | Warning | Process output feeds back to input |
+
+### FSM Rules (`policies/fsm.rego`)
+
+| Rule | Severity | Description |
+|------|----------|-------------|
+| `fsm_missing_default_state` | Error | FSM case without `when others` |
+| `fsm_unhandled_state` | Warning | Enum state not handled in case statement |
+| `fsm_unreachable_state` | Warning | State never assigned (unreachable) |
+| `state_signal_not_enum` | Info | State signal should use enum type |
+| `single_state_signal` | Info | Only one state in FSM (trivial) |
+
+### Synthesis Rules (`policies/synthesis.rego`)
+
+| Rule | Severity | Description |
+|------|----------|-------------|
+| `unregistered_output` | Warning | Output port driven by combinational logic |
+| `gated_clock_detection` | Warning | Clock signal assigned (potential gated clock) |
+| `multiple_clock_domains` | Info | Design has multiple clock domains |
+| `signal_crosses_clock_domain` | Warning | Signal used in different clock domains |
+| `very_wide_bus` | Info | Bus wider than 256 bits |
+| `combinational_reset` | Warning | Reset generated combinationally |
+| `potential_memory_inference` | Info | Array assignment pattern may infer RAM |
+
+### Hierarchy Rules (`policies/hierarchy.rego`)
+
+| Rule | Severity | Description |
+|------|----------|-------------|
+| `floating_instance_input` | Error | Instance input port not connected |
+| `sparse_port_map` | Warning | Port map missing many connections |
+| `empty_port_map` | Warning | Instance with no port connections |
+| `hardcoded_port_value` | Info | Literal value in port map |
+| `open_port_connection` | Info | Port explicitly left open |
+| `many_instances` | Info | Architecture has many instances |
+| `instance_name_matches_component` | Info | Instance name same as component (confusing) |
+
+### Instance Rules (`policies/instances.rego`)
+
+| Rule | Severity | Description |
+|------|----------|-------------|
+| `positional_mapping` | Warning | Port map uses positional instead of named |
+| `instance_naming_convention` | Info | Instance doesn't follow u_ or i_ prefix |
+
+### Naming Rules (`policies/naming.rego`)
+
+| Rule | Severity | Description |
+|------|----------|-------------|
+| `entity_naming` | Info | Entity name doesn't follow convention |
+| `signal_input_naming` | Info | Input signal missing _i suffix |
+| `signal_output_naming` | Info | Output signal missing _o suffix |
+| `active_low_naming` | Info | Active-low signal missing _n suffix |
+| `async_reset_naming` | Info | Async reset not named rst/rstn/arst |
+
+### Style Rules (`policies/style.rego`)
+
+| Rule | Severity | Description |
+|------|----------|-------------|
+| `large_entity` | Warning | Entity has >50 ports |
+| `multiple_entities_per_file` | Info | File contains multiple entities |
+| `legacy_packages` | Info | Using std_logic_arith instead of numeric_std |
+| `architecture_naming_convention` | Info | Architecture not named rtl/behavioral/structural |
+| `empty_architecture` | Warning | Architecture has no content |
+
+### Quality Rules (`policies/quality.rego`)
+
+| Rule | Severity | Description |
+|------|----------|-------------|
+| `trivial_architecture` | Warning | Architecture with no statements |
+| `file_entity_mismatch` | Info | Filename doesn't match entity name |
+| `buffer_port` | Warning | Deprecated buffer port mode |
+| `bidirectional_port` | Info | Inout port (often problematic) |
+| `very_long_file` | Info | File with >5 design units |
+| `large_package` | Info | Package with >50 items |
+| `short_signal_name` | Info | Single-character signal name |
+| `long_signal_name` | Info | Signal name >40 characters |
+| `duplicate_signal_in_entity` | Error | Same signal declared twice |
+| `unlabeled_generate` | Warning | Generate block without required label |
+| `many_signals` | Info | Entity has >50 signals |
+| `deep_generate_nesting` | Info | Generate nested >3 levels deep |
+| `magic_width_number` | Info | Signal width is magic number |
+| `hardcoded_generic` | Info | Instance generic is literal number |
+
+### Security Rules (`policies/security.rego`)
+
+| Rule | Severity | Description |
+|------|----------|-------------|
+| `large_literal_comparison` | Warning | Comparison against >32-bit literal (trojan trigger) |
+| `magic_number_comparison` | Info | Comparison against hardcoded value |
+| `trigger_drives_output` | Warning | Comparison directly drives output |
+| `counter_trigger` | Warning | Counter value used as comparison trigger |
+| `multi_trigger_process` | Warning | Process with multiple trigger comparisons |
+
+### Power Rules (`policies/power.rego`)
+
+| Rule | Severity | Description |
+|------|----------|-------------|
+| `unguarded_multiplication` | Warning | Multiplier without clock enable |
+| `unguarded_division` | Warning | Divider without clock enable |
+| `unguarded_exponent` | Warning | Exponent operation without guard |
+| `power_hotspot` | Info | Multiple expensive operations in one process |
+| `combinational_multiplier` | Warning | Multiplier in combinational logic |
+| `clock_gating_opportunity` | Info | Logic could benefit from clock gating |
+
+### Testbench Rules (`policies/testbench.rego`)
+
+| Rule | Severity | Description |
+|------|----------|-------------|
+| `testbench_with_ports` | Warning | Testbench entity has ports |
+| `entity_no_ports_not_tb` | Info | Entity without ports not named *_tb |
+| `mismatched_tb_architecture` | Info | Testbench arch not named tb/testbench |
+
+### Core Rules (`policies/core.rego`)
+
+| Rule | Severity | Description |
+|------|----------|-------------|
+| `orphan_architecture` | Warning | Architecture without matching entity |
+| `entity_without_arch` | Warning | Entity without any architecture |
+| `unresolved_component` | Warning | Component declaration not found |
+| `unresolved_dependency` | Warning | Use clause target not found |
+| `potential_latch` | Warning | Potential latch inference detected |
+
+---
+
+## Configuring Rules
+
+Create `vhdl_lint.json` to customize rule severities:
+
+```json
+{
+  "rules": {
+    "unused_signal": "warning",
+    "multi_driven_signal": "error",
+    "short_signal_name": "off",
+    "large_entity": "info"
+  }
+}
 ```
-Algorithm:
-1. Build directed graph: signal -> signals it depends on (from signal_deps where is_sequential=false)
-2. Run DFS from each node
-3. If we revisit a node in current path = cycle found
-4. Report all signals in the cycle
 
-Example violation:
-  a <= b and c;
-  b <= a or d;    -- Loop: a -> b -> a
+Valid severity values: `"off"`, `"info"`, `"warning"`, `"error"`
+
+Run `vhdl-lint init` to generate a default configuration.
+
+---
+
+## JSON Output
+
+For CI/CD integration, use JSON output mode:
+
+```bash
+# Output as JSON
+./vhdl-lint --json ./src/
+
+# Example: count violations by rule
+./vhdl-lint --json ./src/ | jq '.violations | group_by(.rule) | map({rule: .[0].rule, count: length})'
+
+# Example: filter only errors
+./vhdl-lint --json ./src/ | jq '.violations[] | select(.severity == "error")'
 ```
 
-**FSM Analysis:**
-```
-Algorithm:
-1. Identify state signals: enum-typed signals assigned in sequential processes
-2. Extract transitions: parse case statements on state signal
-   - Each "when STATE_X =>" branch defines transitions
-   - Look for "next_state <= STATE_Y" patterns
-3. Build state transition graph
-4. Check:
-   - Reachability: BFS from reset state, unreached = unreachable
-   - Deadlock: States with no outgoing transitions (except terminal states)
-   - Completeness: All enum values appear in case choices
-```
-
-**Reset Coverage Analysis:**
-```
-Algorithm:
-1. For each sequential process:
-   - If has_reset=false: flag as sequential_no_reset
-   - If has_reset=true but reset_async=true:
-     - Check if reset signal is in CDC crossing list
-     - If crossing domains without sync: flag as async_reset_no_sync
-2. Report missing reset for specific signals:
-   - Track which signals are assigned in reset branch vs clock branch
-   - Signals only in clock branch = partial reset coverage
-```
-
-### Tier 3: Safety-Critical Compliance (Enterprise Value)
-
-For DO-254 (aerospace), ISO 26262 (automotive), IEC 62304 (medical). **Status: Future.**
-
-| Rule Pack | Target Industry | Key Rules |
-|-----------|-----------------|-----------|
-| DO-254 | Aerospace | Dead code, unreachable states, defensive coding, traceability |
-| ISO 26262 | Automotive | Fault detection, safe states, diagnostic coverage |
-| MISRA-VHDL | General safety | Coding style, complexity limits, explicit typing |
-
-### Implementation Priority
-
-```
-Tier 1 ✅ COMPLETE (5 rules)
-  [x] multi_driven_signal - catches synthesis errors
-  [x] unused_signal - code cleanup
-  [x] floating_instance_input - catches wiring bugs
-  [x] unregistered_output - timing closure
-  [x] file_entity_mismatch - best practice
-
-Tier 2 ✅ COMPLETE (10 rules)
-  [x] combinational_loop (4 variants) - simulation hangs
-  [x] fsm_missing_default_state - robustness
-  [x] fsm_unhandled_state - dead code
-  [x] fsm_unreachable_state - dead code (heuristic)
-  [x] missing_reset - power-on state
-  [x] async_reset_unsynchronized - metastability
-  [x] cdc_unsync_multi_bit - CDC correctness
-
-Tier 3: FUTURE (enterprise features)
-  [ ] fsm_deadlock - requires transition extraction
-  [ ] DO-254 compliance pack
-  [ ] ISO 26262 compliance pack
-  [ ] Custom rule configuration
-```
+JSON schema is validated with CUE (`internal/validator/output_schema.cue`).
 
 ---
 

@@ -21,6 +21,8 @@ package schema
     processes:              [...#Process]
     concurrent_assignments: [...#ConcurrentAssignment]
     generates:              [...#GenerateStatement]
+    configurations:         [...#Configuration]
+    signal_usages:          [...#SignalUsage]
     // Type system
     types:                  [...#TypeDeclaration]
     subtypes:               [...#SubtypeDeclaration]
@@ -38,6 +40,14 @@ package schema
     // Configuration
     lint_config:            #LintConfig  // Rule severities from vhdl_lint.json
     third_party_files:      [...string]  // Files from third-party libraries (suppress warnings)
+}
+
+// Configuration represents a VHDL configuration declaration
+#Configuration: {
+    name:        string & =~"^[a-zA-Z_][a-zA-Z0-9_]*$"
+    entity_name: string & =~"^[a-zA-Z_][a-zA-Z0-9_]*$"
+    file:        string & =~".+\\.(vhd|vhdl)$"
+    line:        int & >=1
 }
 
 // LintConfig contains rule configuration passed to OPA
@@ -84,6 +94,7 @@ package schema
     file:      string & =~".+\\.(vhd|vhdl)$"
     line:      int & >=1
     in_entity: string  // Which entity/architecture this signal belongs to
+    width:     int & >=0  // Estimated bit width (0 if unknown)
 }
 
 // Port declaration
@@ -94,6 +105,7 @@ package schema
     type:      string & !=""  // Type must not be empty
     line:      int & >=1
     in_entity: string  // Which entity this port belongs to
+    width:     int & >=0  // Estimated bit width (0 if unknown)
 }
 
 // Dependency between files/entities
@@ -145,6 +157,7 @@ package schema
     is_sequential:    bool                              // Has clock edge
     is_combinational: bool                              // No clock edge
     clock_signal:     string                            // Clock signal if sequential
+    clock_edge:       string                            // "rising" or "falling" if sequential
     has_reset:        bool                              // Has reset logic
     reset_signal:     string                            // Reset signal name
     assigned_signals: [...string]                       // Signals written
@@ -157,12 +170,14 @@ package schema
 // ConcurrentAssignment represents a concurrent signal assignment (outside processes)
 // Enables detection of undriven/multi-driven signals that were previously missed
 #ConcurrentAssignment: {
-    target:       string & =~"^[a-zA-Z_][a-zA-Z0-9_]*$"  // Signal being assigned
-    read_signals: [...string]                            // Signals being read
-    file:         string & =~".+\\.(vhd|vhdl)$"
-    line:         int & >=1
-    in_arch:      string                                 // Containing architecture
-    kind:         "simple" | "conditional" | "selected"  // Assignment type
+    target:         string & =~"^[a-zA-Z_][a-zA-Z0-9_.]*$"  // Signal path (may include dots for record fields)
+    read_signals:   [...string]                             // Signals being read
+    file:           string & =~".+\\.(vhd|vhdl)$"
+    line:           int & >=1
+    in_arch:        string                                  // Containing architecture
+    kind:           "simple" | "conditional" | "selected"   // Assignment type
+    in_generate:    bool                                    // True if inside generate block
+    generate_label: string                                  // Label of containing generate
 }
 
 // Comparison represents a comparison operation for trojan/trigger detection
@@ -196,13 +211,13 @@ package schema
 
 // SignalDep represents a signal dependency for combinational loop detection
 #SignalDep: {
-    source:        string                               // Signal being read
-    target:        string                               // Signal being assigned
-    in_process:    string                               // Which process (empty if concurrent)
-    is_sequential: bool                                 // True if crosses clock boundary
+    source:        string & =~"^[a-zA-Z_][a-zA-Z0-9_.]*$"  // Signal path being read (dots for record fields)
+    target:        string & =~"^[a-zA-Z_][a-zA-Z0-9_.]*$"  // Signal path being assigned
+    in_process:    string                                  // Which process (empty if concurrent)
+    is_sequential: bool                                    // True if crosses clock boundary
     file:          string & =~".+\\.(vhd|vhdl)$"
     line:          int & >=1
-    in_arch:       string                               // Which architecture
+    in_arch:       string                                  // Which architecture
 }
 
 // CDCCrossing represents a potential clock domain crossing
@@ -243,6 +258,18 @@ package schema
     signal_count:   int & >=0                           // Signals declared inside
     instance_count: int & >=0                           // Instances inside
     process_count:  int & >=0                           // Processes inside
+}
+
+// SignalUsage tracks where signals are read, written, or used in port maps
+// Enables accurate detection of undriven signals (driven by component outputs)
+#SignalUsage: {
+    signal:        string                               // Signal name
+    is_read:       bool                                 // Signal is read
+    is_written:    bool                                 // Signal is written
+    in_process:    string                               // Process where usage occurs (empty if concurrent)
+    in_port_map:   bool                                 // Used as actual in component port map
+    instance_name: string                               // Instance name if in port map
+    line:          int & >=1                            // Line number
 }
 
 // =========================================================================
@@ -319,7 +346,7 @@ package schema
 // SubprogramParameter represents a parameter in a function or procedure
 #SubprogramParameter: {
     name:       string & =~"^[a-zA-Z_][a-zA-Z0-9_]*$"
-    direction?: "in" | "out" | "inout" | ""             // Empty defaults to "in"
+    direction?: "in" | "out" | "inout" | "buffer" | "linkage" | ""  // Empty defaults to "in"
     type:       string & !=""
     class?:     "signal" | "variable" | "constant" | "file" | ""
     default?:   string                                  // Default value expression

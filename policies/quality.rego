@@ -226,8 +226,107 @@ extract_filename(path) = name {
     name := trim_suffix(trim_suffix(file_with_ext, ".vhdl"), ".vhd")
 } else = path
 
+# Rule: Generate block without label
+unlabeled_generate[violation] {
+    gen := input.generates[_]
+    gen.label == ""
+    violation := {
+        "rule": "unlabeled_generate",
+        "severity": "warning",
+        "file": gen.file,
+        "line": gen.line,
+        "message": "Generate block without label - labels are required for generate blocks"
+    }
+}
+
+# Rule: Too many signals in entity (complexity)
+many_signals[violation] {
+    entity := input.entities[_]
+    signals := count([s | s := input.signals[_]; s.in_entity == entity.name])
+    signals > 50
+    violation := {
+        "rule": "many_signals",
+        "severity": "info",
+        "file": entity.file,
+        "line": entity.line,
+        "message": sprintf("Entity '%s' has %d signals - consider refactoring into sub-modules", [entity.name, signals])
+    }
+}
+
+# Rule: Deep nesting (many generate levels)
+deep_generate_nesting[violation] {
+    gen := input.generates[_]
+    # Count dots in in_arch to estimate nesting depth
+    parts := split(gen.in_arch, ".")
+    dots := count(parts) - 1
+    dots > 3  # More than arch.gen1.gen2.gen3
+    violation := {
+        "rule": "deep_generate_nesting",
+        "severity": "info",
+        "file": gen.file,
+        "line": gen.line,
+        "message": sprintf("Generate block '%s' is deeply nested (%d levels) - consider flattening", [gen.label, dots])
+    }
+}
+
+# Rule: Magic number in signal width (should use constant)
+magic_width_number[violation] {
+    sig := input.signals[_]
+    regex.match(".*\\([0-9]+ (downto|to) [0-9]+\\).*", lower(sig.type))
+    # Extract the width
+    matches := regex.find_all_string_submatch_n("\\(([0-9]+) downto ([0-9]+)\\)", lower(sig.type), 1)
+    count(matches) > 0
+    high := to_number(matches[0][1])
+    low := to_number(matches[0][2])
+    width := high - low + 1
+    width > 8  # Only flag for non-trivial widths
+    width != 16
+    width != 32
+    width != 64
+    width != 128
+    violation := {
+        "rule": "magic_width_number",
+        "severity": "info",
+        "file": sig.file,
+        "line": sig.line,
+        "message": sprintf("Signal '%s' has magic width %d - consider using a constant", [sig.name, width])
+    }
+}
+
+# Rule: Duplicate signal names in same entity (confusing)
+duplicate_signal_in_entity[violation] {
+    sig1 := input.signals[i]
+    sig2 := input.signals[j]
+    i < j
+    sig1.in_entity == sig2.in_entity
+    lower(sig1.name) == lower(sig2.name)
+    violation := {
+        "rule": "duplicate_signal_in_entity",
+        "severity": "error",
+        "file": sig1.file,
+        "line": sig2.line,
+        "message": sprintf("Signal '%s' declared multiple times in same scope (first at line %d)", [sig1.name, sig1.line])
+    }
+}
+
+# Rule: Hardcoded generics (should be parameterized)
+hardcoded_generic[violation] {
+    inst := input.instances[_]
+    generic_val := inst.generic_map[_]
+    # Check if it's a literal number (not a signal/constant name)
+    regex.match("^[0-9]+$", generic_val)
+    to_number(generic_val) > 8  # Only flag non-trivial values
+    violation := {
+        "rule": "hardcoded_generic",
+        "severity": "info",
+        "file": inst.file,
+        "line": inst.line,
+        "message": sprintf("Instance '%s' has hardcoded generic value '%s' - consider using a constant or generic", [inst.name, generic_val])
+    }
+}
+
 # Aggregate quality violations
-violations := buffer_port | trivial_architecture | file_entity_mismatch
+violations := buffer_port | trivial_architecture | file_entity_mismatch | unlabeled_generate | duplicate_signal_in_entity
 
 # Optional violations (style preferences)
-optional_violations := very_long_file | large_package | short_signal_name | long_signal_name | short_port_name | entity_name_with_numbers | mixed_port_directions | bidirectional_port
+optional_violations := very_long_file | large_package | short_signal_name | long_signal_name | short_port_name | entity_name_with_numbers | mixed_port_directions | bidirectional_port | many_signals | deep_generate_nesting | magic_width_number | hardcoded_generic
