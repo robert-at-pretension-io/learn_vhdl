@@ -40,6 +40,7 @@ sensitivity_list_incomplete[violation] {
     read_sig := proc.read_signals[_]
     not helpers.sig_in_sensitivity(read_sig, proc.sensitivity_list)
     not helpers.is_skip_name(read_sig)  # Skip constants, loop vars, types
+    not helpers.process_in_testbench(proc)
     violation := {
         "rule": "sensitivity_list_incomplete",
         "severity": "error",

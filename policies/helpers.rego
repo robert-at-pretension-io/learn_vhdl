@@ -140,6 +140,32 @@ is_skip_name(name) {
 }
 
 # =============================================================================
+# Testbench Helpers
+# =============================================================================
+
+is_testbench_name(name) {
+    contains(lower(name), "_tb")
+}
+is_testbench_name(name) {
+    contains(lower(name), "tb_")
+}
+is_testbench_name(name) {
+    endswith(lower(name), "tb")
+}
+is_testbench_name(name) {
+    contains(lower(name), "test")
+}
+is_testbench_name(name) {
+    contains(lower(name), "bench")
+}
+
+process_in_testbench(proc) {
+    arch := input.architectures[_]
+    lower(arch.name) == lower(proc.in_arch)
+    is_testbench_name(arch.entity_name)
+}
+
+# =============================================================================
 # Sensitivity List Helpers
 # =============================================================================
 

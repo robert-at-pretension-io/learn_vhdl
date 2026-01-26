@@ -131,7 +131,8 @@ type Process struct {
 	InArch          string // Which architecture this process belongs to
 	// Semantic info
 	IsSequential    bool     // Has clock edge (rising_edge/falling_edge)
-	IsCombinational bool     // No clock edge
+	IsCombinational bool     // No clock edge and no wait statements
+	HasWait         bool     // Contains wait statements (not combinational)
 	ClockSignal     string   // Clock signal if sequential
 	ClockEdge       string   // "rising" or "falling"
 	HasReset        bool     // Has reset logic
@@ -425,6 +426,7 @@ func New() *Extractor {
 // Creates a new parser per call for thread safety
 func (e *Extractor) Extract(filePath string) (FileFacts, error) {
 	facts := FileFacts{File: filePath}
+	declaredSignals := make(map[string]bool)
 
 	// Read file
 	content, err := os.ReadFile(filePath)
@@ -449,7 +451,7 @@ func (e *Extractor) Extract(filePath string) (FileFacts, error) {
 	defer tree.Close()
 
 	// Walk the tree and extract facts
-	e.walkTree(tree.RootNode(), content, &facts, "")
+	e.walkTree(tree.RootNode(), content, &facts, "", declaredSignals)
 
 	// Detect clock domain crossings
 	facts.CDCCrossings = DetectCDCCrossings(&facts)
@@ -460,12 +462,12 @@ func (e *Extractor) Extract(filePath string) (FileFacts, error) {
 // walkTree traverses the syntax tree and extracts relevant nodes
 // context is the current architecture name (for scoping signals, processes, etc.)
 // We also need to track package context separately for type declarations
-func (e *Extractor) walkTree(node *sitter.Node, source []byte, facts *FileFacts, context string) {
-	e.walkTreeWithPkg(node, source, facts, "", context)
+func (e *Extractor) walkTree(node *sitter.Node, source []byte, facts *FileFacts, context string, declaredSignals map[string]bool) {
+	e.walkTreeWithPkg(node, source, facts, "", context, declaredSignals)
 }
 
 // walkTreeWithPkg traverses with both package and architecture context
-func (e *Extractor) walkTreeWithPkg(node *sitter.Node, source []byte, facts *FileFacts, pkgContext, archContext string) {
+func (e *Extractor) walkTreeWithPkg(node *sitter.Node, source []byte, facts *FileFacts, pkgContext, archContext string, declaredSignals map[string]bool) {
 	if node == nil {
 		return
 	}
@@ -477,7 +479,7 @@ func (e *Extractor) walkTreeWithPkg(node *sitter.Node, source []byte, facts *Fil
 		entity := e.extractEntity(node, source)
 		facts.Entities = append(facts.Entities, entity)
 		// Extract ports from entity
-		e.extractPortsFromEntity(node, source, entity.Name, facts)
+		e.extractPortsFromEntity(node, source, entity.Name, facts, declaredSignals)
 		archContext = entity.Name
 
 	case "architecture_body":
@@ -541,6 +543,19 @@ func (e *Extractor) walkTreeWithPkg(node *sitter.Node, source []byte, facts *Fil
 		}
 		signals := e.extractSignals(node, source, signalContext)
 		facts.Signals = append(facts.Signals, signals...)
+		for _, sig := range signals {
+			addDeclaredSignalName(declaredSignals, sig.Name)
+		}
+		if signalDeclarationHasDefault(node, source) {
+			for _, sig := range signals {
+				facts.SignalUsages = append(facts.SignalUsages, SignalUsage{
+					Signal:    sig.Name,
+					IsWritten: true,
+					InProcess: "", // Initialization at declaration
+					Line:      sig.Line,
+				})
+			}
+		}
 
 	case "type_declaration":
 		// Extract full type declaration
@@ -581,7 +596,7 @@ func (e *Extractor) walkTreeWithPkg(node *sitter.Node, source []byte, facts *Fil
 	case "signal_assignment":
 		// Concurrent signal assignment (outside processes)
 		// Note: Sequential assignments inside processes are "sequential_signal_assignment"
-		ca := e.extractConcurrentAssignment(node, source, archContext)
+		ca := e.extractConcurrentAssignment(node, source, archContext, declaredSignals)
 		facts.ConcurrentAssignments = append(facts.ConcurrentAssignments, ca)
 		// Add to signal usages
 		facts.SignalUsages = append(facts.SignalUsages, SignalUsage{
@@ -603,7 +618,7 @@ func (e *Extractor) walkTreeWithPkg(node *sitter.Node, source []byte, facts *Fil
 		facts.SignalDeps = append(facts.SignalDeps, deps...)
 
 	case "process_statement":
-		proc := e.extractProcess(node, source, archContext)
+		proc := e.extractProcess(node, source, archContext, declaredSignals)
 		facts.Processes = append(facts.Processes, proc)
 		// Extract case statements within the process for latch detection
 		e.extractCaseStatementsFromProcess(node, source, archContext, proc.Label, facts)
@@ -656,7 +671,7 @@ func (e *Extractor) walkTreeWithPkg(node *sitter.Node, source []byte, facts *Fil
 
 	case "generate_statement":
 		// Extract generate statement with its nested declarations
-		gen := e.extractGenerateStatement(node, source, archContext)
+		gen := e.extractGenerateStatement(node, source, archContext, declaredSignals)
 		facts.Generates = append(facts.Generates, gen)
 		// Recursively flatten all nested generate contents into facts
 		e.flattenGenerateToFacts(&gen, archContext, facts)
@@ -666,7 +681,7 @@ func (e *Extractor) walkTreeWithPkg(node *sitter.Node, source []byte, facts *Fil
 
 	// Recurse into children
 	for i := 0; i < int(node.ChildCount()); i++ {
-		e.walkTreeWithPkg(node.Child(i), source, facts, pkgContext, archContext)
+		e.walkTreeWithPkg(node.Child(i), source, facts, pkgContext, archContext, declaredSignals)
 	}
 }
 
@@ -925,58 +940,77 @@ func (e *Extractor) extractAssociationList(node *sitter.Node, source []byte, res
 }
 
 // extractAssociationElement extracts formal => actual from an association_element
+// Uses grammar fields directly: field('formal', ...) and field('actual', ...)
 func (e *Extractor) extractAssociationElement(node *sitter.Node, source []byte) (formal, actual string) {
-	// Structure: identifier "=>" (identifier | indexed_name | expression | "open")
-	// Handle complex actuals like cpu_trace(i), sig(7 downto 0), etc.
-	sawArrow := false
-	for i := 0; i < int(node.ChildCount()); i++ {
-		child := node.Child(i)
-		childType := child.Type()
+	// Grammar structure:
+	//   Named:      field('formal', $._name) '=>' field('actual', choice($._expression, $._kw_open))
+	//   Positional: field('actual', $._expression)
 
-		if childType == "=>" {
-			sawArrow = true
-			continue
-		}
+	// Extract formal (only present in named associations)
+	if formalNode := node.ChildByFieldName("formal"); formalNode != nil {
+		formal = formalNode.Content(source)
+	}
 
-		// For formal (before =>), usually just an identifier
-		if !sawArrow {
-			if childType == "identifier" {
-				formal = child.Content(source)
-			}
-			continue
-		}
-
-		// For actual (after =>), capture the full content including indexed_name, selected_name, etc.
-		// This ensures cpu_trace(i) is captured as "cpu_trace(i)" for signal usage tracking
-		switch childType {
-		case "identifier", "number", "character_literal":
-			actual = child.Content(source)
-		case "indexed_name", "selected_name", "attribute_name":
-			// Get full content for complex expressions
-			actual = child.Content(source)
-		case "open", "_kw_open":
+	// Extract actual (always present)
+	if actualNode := node.ChildByFieldName("actual"); actualNode != nil {
+		actualContent := actualNode.Content(source)
+		// Check for 'open' keyword
+		if strings.EqualFold(strings.TrimSpace(actualContent), "open") {
 			actual = "open"
-		default:
-			// For any other expression type, get the full content
-			// This handles things like (others => '0'), type conversions, etc.
-			if actual == "" && childType != "(" && childType != ")" && childType != "," {
-				actual = child.Content(source)
+		} else {
+			actual = actualContent
+		}
+	}
+
+	// Fallback for edge cases where fields aren't populated
+	// (e.g., grammar conflicts or hidden tokens like _kw_open).
+	if actual == "" {
+		sawArrow := false
+		for i := 0; i < int(node.ChildCount()); i++ {
+			child := node.Child(i)
+			childType := child.Type()
+			childContent := child.Content(source)
+
+			if childContent == "=>" {
+				sawArrow = true
+				continue
+			}
+
+			if !sawArrow {
+				// Before arrow: formal
+				if childType == "identifier" && formal == "" {
+					formal = childContent
+				}
+			} else {
+				// After arrow: actual
+				if actual == "" {
+					if strings.EqualFold(childContent, "open") {
+						actual = "open"
+					} else if childType != "(" && childType != ")" && childType != "," {
+						actual = childContent
+					}
+				}
+			}
+		}
+
+		// Handle hidden 'open' keyword (no child node)
+		if sawArrow && actual == "" {
+			parts := strings.SplitN(node.Content(source), "=>", 2)
+			if len(parts) == 2 {
+				if strings.EqualFold(strings.TrimSpace(parts[1]), "open") {
+					actual = "open"
+				}
 			}
 		}
 	}
-	if sawArrow && actual == "" {
-		content := node.Content(source)
-		parts := strings.SplitN(content, "=>", 2)
-		if len(parts) == 2 && strings.EqualFold(strings.TrimSpace(parts[1]), "open") {
-			actual = "open"
-		}
-	}
+
 	return
 }
 
 // extractConcurrentAssignment extracts a concurrent signal assignment
 // Handles: simple (sig <= expr), conditional (sig <= a when c else b), selected (with s select sig <= ...)
-func (e *Extractor) extractConcurrentAssignment(node *sitter.Node, source []byte, context string) ConcurrentAssignment {
+// Uses the grammar's field('target', assignment_target) wrapper for clean extraction
+func (e *Extractor) extractConcurrentAssignment(node *sitter.Node, source []byte, context string, declaredSignals map[string]bool) ConcurrentAssignment {
 	ca := ConcurrentAssignment{
 		Line:   int(node.StartPoint().Row) + 1,
 		InArch: context,
@@ -995,103 +1029,17 @@ func (e *Extractor) extractConcurrentAssignment(node *sitter.Node, source []byte
 		ca.Kind = "selected"
 	}
 
+	// Extract target using grammar's field('target', assignment_target) wrapper
+	if sig, ok := e.extractAssignmentTarget(node, source); ok {
+		ca.Target = sig
+	}
+
+	// Extract reads from the RHS (everything after the assignment target)
 	readSet := make(map[string]bool)
-	foundTarget := false
-	foundArrow := false // <=
-	identifierCount := 0
+	e.extractReadsFromNode(node, source, readSet, true, declaredSignals, nil)
 
-	// Track prefix/suffix pairs to build full signal paths (e.g., trap.cause)
-	// Grammar structure: prefix: (identifier) suffix: (identifier) prefix: (identifier) suffix: (identifier) ...
-	var currentPrefix string
-
-	for i := 0; i < int(node.ChildCount()); i++ {
-		child := node.Child(i)
-		childType := child.Type()
-		childContent := child.Content(source)
-		fieldName := node.FieldNameForChild(i)
-
-		// Track when we pass the assignment operator
-		if childContent == "<=" {
-			foundArrow = true
-			// If we have a pending prefix without suffix, use it
-			if currentPrefix != "" {
-				if !foundTarget {
-					ca.Target = currentPrefix
-					foundTarget = true
-				} else {
-					readSet[currentPrefix] = true
-				}
-				currentPrefix = ""
-			}
-			continue
-		}
-
-		if childType == "identifier" {
-			if fieldName == "prefix" {
-				// Start of a new prefix/suffix pair
-				// If we have a pending prefix, it was a standalone identifier
-				if currentPrefix != "" {
-					if !foundArrow && !foundTarget {
-						ca.Target = currentPrefix
-						foundTarget = true
-					} else if foundArrow {
-						readSet[currentPrefix] = true
-					}
-				}
-				currentPrefix = childContent
-			} else if fieldName == "suffix" || fieldName == "content" {
-				// Suffix completes the full path: prefix.suffix
-				if currentPrefix != "" {
-					fullPath := currentPrefix + "." + childContent
-					if !foundArrow && !foundTarget {
-						ca.Target = fullPath
-						foundTarget = true
-					} else if foundArrow {
-						readSet[fullPath] = true
-					}
-					currentPrefix = "" // Reset for next pair
-				}
-			} else {
-				// Regular identifier (no field name) - common for simple signals
-				if !foundArrow {
-					identifierCount++
-					// For selected assignment: with sel select target <= ...
-					// First identifier is selector (read), second is target
-					if isSelected {
-						if identifierCount == 1 {
-							readSet[childContent] = true
-						} else if identifierCount == 2 && !foundTarget {
-							ca.Target = childContent
-							foundTarget = true
-						}
-					} else {
-						if !foundTarget {
-							ca.Target = childContent
-							foundTarget = true
-						}
-					}
-				} else {
-					readSet[childContent] = true
-				}
-			}
-		} else if childType == "selected_name" || childType == "indexed_name" {
-			// Handle nested structures
-			fullPath := e.extractFullSignalPath(child, source)
-			if fullPath != "" {
-				if !foundArrow && !foundTarget {
-					ca.Target = fullPath
-					foundTarget = true
-				} else if foundArrow {
-					readSet[fullPath] = true
-				}
-			}
-		}
-	}
-
-	// Handle any remaining pending prefix
-	if currentPrefix != "" && foundArrow {
-		readSet[currentPrefix] = true
-	}
+	// Don't count the target as a read
+	delete(readSet, ca.Target)
 
 	// Convert read set to slice
 	for sig := range readSet {
@@ -1106,16 +1054,188 @@ func (e *Extractor) extractConcurrentAssignment(node *sitter.Node, source []byte
 // For "arr(i)" returns "arr"
 // For "a.b.c" returns "a"
 func (e *Extractor) extractBaseSignal(node *sitter.Node, source []byte) string {
-	for i := 0; i < int(node.ChildCount()); i++ {
-		child := node.Child(i)
-		if child.Type() == "identifier" {
-			return child.Content(source)
-		}
-		if child.Type() == "selected_name" || child.Type() == "indexed_name" {
-			return e.extractBaseSignal(child, source)
+	info := e.extractNameInfo(node, source)
+	return info.Base
+}
+
+// extractAssignmentTarget extracts the target signal from a signal assignment node
+// Uses the grammar's field('target', alias(..., $.assignment_target)) wrapper
+// Returns the base signal name and whether extraction was successful
+func (e *Extractor) extractAssignmentTarget(node *sitter.Node, source []byte) (signal string, ok bool) {
+	targetNode := node.ChildByFieldName("target")
+	if targetNode == nil {
+		return "", false
+	}
+
+	// assignment_target wraps: identifier, selected_name, indexed_name, or aggregate
+	for i := 0; i < int(targetNode.ChildCount()); i++ {
+		child := targetNode.Child(i)
+		childType := child.Type()
+
+		switch childType {
+		case "identifier":
+			return child.Content(source), true
+		case "selected_name", "indexed_name":
+			// Extract the base signal (first identifier in the chain)
+			return e.extractBaseSignal(child, source), true
 		}
 	}
-	return ""
+	return "", false
+}
+
+// =============================================================================
+// UNIFIED NAME EXTRACTION
+// =============================================================================
+// The grammar's _name rule produces a recursive structure that can represent:
+//   - Simple identifiers: sig
+//   - Selected names (record fields, package selections): rec.field, pkg.const
+//   - Indexed names (array access, function calls): arr(i), func(x, y)
+//   - Attribute names: sig'range, clk'event
+//
+// This unified helper extracts all relevant info from any name node in one pass.
+// =============================================================================
+
+// NameInfo contains extracted information from a VHDL name node
+type NameInfo struct {
+	Base        string   // Root identifier (e.g., "sig" from "sig.field(i)'range")
+	FullPath    string   // Full dotted path without index/attr (e.g., "sig.field")
+	IsIndexed   bool     // Has (index) or (slice) suffix
+	IsAttribute bool     // Has 'attribute suffix
+	IsCall      bool     // Looks like function call (name followed by '(' in source)
+	AttrName    string   // Attribute name if IsAttribute (e.g., "range", "event")
+	IndexExprs  []string // Index expressions if IsIndexed
+}
+
+// extractNameInfo extracts comprehensive information from a _name node
+// Handles: identifier, selected_name, indexed_name, attribute references
+// This is the preferred way to analyze name nodes - use this instead of
+// extractBaseSignal, extractFullSignalPath, or isFunctionCall
+func (e *Extractor) extractNameInfo(node *sitter.Node, source []byte) NameInfo {
+	info := NameInfo{}
+	if node == nil {
+		return info
+	}
+
+	e.walkNameNode(node, source, &info)
+
+	// Determine if this looks like a function call
+	// A function call is an indexed_name where the base is not a signal
+	// Heuristic: if indexed and the base name looks like a function (no dots, followed by parens)
+	if info.IsIndexed && !strings.Contains(info.FullPath, ".") {
+		// Check source to see if this is immediately followed by '('
+		endByte := int(node.EndByte())
+		if endByte < len(source) {
+			// Already checked in walkNameNode, but double-check
+			if info.IsIndexed {
+				// Could be function or array - leave IsCall based on heuristics
+			}
+		}
+	}
+
+	return info
+}
+
+// walkNameNode recursively walks a name structure and populates NameInfo
+func (e *Extractor) walkNameNode(node *sitter.Node, source []byte, info *NameInfo) {
+	if node == nil {
+		return
+	}
+
+	nodeType := node.Type()
+
+	switch nodeType {
+	case "identifier":
+		ident := node.Content(source)
+		if info.Base == "" {
+			info.Base = ident
+			info.FullPath = ident
+		} else {
+			// This is a suffix - append to path
+			info.FullPath = info.FullPath + "." + ident
+		}
+
+	case "selected_name":
+		// Grammar: field('prefix', $._name) '.' field('suffix', ...)
+		// Walk prefix first, then suffix
+		if prefixNode := node.ChildByFieldName("prefix"); prefixNode != nil {
+			e.walkNameNode(prefixNode, source, info)
+		}
+		if suffixNode := node.ChildByFieldName("suffix"); suffixNode != nil {
+			suffix := suffixNode.Content(source)
+			if info.FullPath != "" {
+				info.FullPath = info.FullPath + "." + suffix
+			} else {
+				info.FullPath = suffix
+			}
+		}
+		// Fallback: walk children if fields not available
+		if info.Base == "" {
+			for i := 0; i < int(node.ChildCount()); i++ {
+				child := node.Child(i)
+				childType := child.Type()
+				if childType == "identifier" {
+					if info.Base == "" {
+						info.Base = child.Content(source)
+						info.FullPath = info.Base
+					} else {
+						info.FullPath = info.FullPath + "." + child.Content(source)
+					}
+				} else if childType == "selected_name" || childType == "indexed_name" {
+					e.walkNameNode(child, source, info)
+				}
+			}
+		}
+
+	case "indexed_name":
+		// Grammar: field('prefix', $._name) '(' field('content', ...) ')'
+		info.IsIndexed = true
+		// Walk the prefix to get the base/path
+		if prefixNode := node.ChildByFieldName("prefix"); prefixNode != nil {
+			e.walkNameNode(prefixNode, source, info)
+		}
+		// Extract index expressions
+		if contentNode := node.ChildByFieldName("content"); contentNode != nil {
+			info.IndexExprs = append(info.IndexExprs, contentNode.Content(source))
+		}
+		// Fallback: walk children
+		if info.Base == "" {
+			for i := 0; i < int(node.ChildCount()); i++ {
+				child := node.Child(i)
+				childType := child.Type()
+				if childType == "identifier" || childType == "selected_name" || childType == "indexed_name" {
+					e.walkNameNode(child, source, info)
+					break // Only take the first name-like child as base
+				}
+			}
+		}
+		// Check if this is a function call based on source position
+		// If identifier immediately precedes '(' in source, it's likely a call
+		if info.Base != "" && !strings.Contains(info.FullPath, ".") {
+			// Simple name with index could be function call
+			// Mark it so callers can decide
+			info.IsCall = true
+		}
+
+	default:
+		// For attribute names: prefix'attribute
+		// Check if node has attribute field
+		if attrNode := node.ChildByFieldName("attribute"); attrNode != nil {
+			info.IsAttribute = true
+			info.AttrName = attrNode.Content(source)
+		}
+		// Walk prefix if present
+		if prefixNode := node.ChildByFieldName("prefix"); prefixNode != nil {
+			e.walkNameNode(prefixNode, source, info)
+		}
+		// Fallback: if this is a simple identifier-like node
+		if info.Base == "" {
+			content := node.Content(source)
+			if content != "" && !strings.ContainsAny(content, "()'.") {
+				info.Base = content
+				info.FullPath = content
+			}
+		}
+	}
 }
 
 // extractFullSignalPath extracts the full path from selected_name
@@ -1125,42 +1245,8 @@ func (e *Extractor) extractBaseSignal(node *sitter.Node, source []byte) string {
 // This is used for loop detection where different record fields should not be considered
 // the same signal (e.g., trap.cause <- trap.exc_buf is not a loop)
 func (e *Extractor) extractFullSignalPath(node *sitter.Node, source []byte) string {
-	switch node.Type() {
-	case "identifier":
-		return node.Content(source)
-	case "selected_name":
-		// selected_name structure: prefix (identifier or selected_name) . suffix (identifier)
-		var prefix, suffix string
-		for i := 0; i < int(node.ChildCount()); i++ {
-			child := node.Child(i)
-			childType := child.Type()
-			if childType == "identifier" || childType == "selected_name" {
-				if prefix == "" {
-					prefix = e.extractFullSignalPath(child, source)
-				} else if suffix == "" {
-					suffix = child.Content(source)
-				}
-			}
-		}
-		if suffix != "" {
-			return prefix + "." + suffix
-		}
-		return prefix
-	case "indexed_name":
-		// For indexed_name like trap.exc_buf(i), return the full path of the base
-		// (trap.exc_buf) not just the root (trap)
-		// The index doesn't change which signal/field it is
-		for i := 0; i < int(node.ChildCount()); i++ {
-			child := node.Child(i)
-			childType := child.Type()
-			if childType == "identifier" || childType == "selected_name" || childType == "indexed_name" {
-				return e.extractFullSignalPath(child, source)
-			}
-		}
-		return ""
-	default:
-		return node.Content(source)
-	}
+	info := e.extractNameInfo(node, source)
+	return info.FullPath
 }
 
 // extractEnumLiterals extracts enum literal names from a type_declaration with enumeration_type_definition
@@ -1396,7 +1482,7 @@ func (e *Extractor) extractSignals(node *sitter.Node, source []byte, context str
 	return signals
 }
 
-func (e *Extractor) extractPortsFromEntity(node *sitter.Node, source []byte, entityName string, facts *FileFacts) {
+func (e *Extractor) extractPortsFromEntity(node *sitter.Node, source []byte, entityName string, facts *FileFacts, declaredSignals map[string]bool) {
 	// Walk through entity looking for parameters (ports)
 	var walkForPorts func(n *sitter.Node)
 	walkForPorts = func(n *sitter.Node) {
@@ -1407,6 +1493,7 @@ func (e *Extractor) extractPortsFromEntity(node *sitter.Node, source []byte, ent
 			ports := e.extractPorts(n, source)
 			for i := range ports {
 				ports[i].InEntity = entityName
+				addDeclaredSignalName(declaredSignals, ports[i].Name)
 			}
 			facts.Ports = append(facts.Ports, ports...)
 		}
@@ -1427,41 +1514,77 @@ func (e *Extractor) extractPorts(node *sitter.Node, source []byte) []Port {
 	if dirNode := node.ChildByFieldName("direction"); dirNode != nil {
 		direction = strings.ToLower(dirNode.Content(source))
 	}
+	// Skip non-port parameters (e.g., generics) that have no direction.
+	if direction == "" {
+		return nil
+	}
 
 	// Collect all identifiers and find where direction appears
-	// Structure: [name1, name2, ...] direction type
-	var identifiers []string
-	directionIndex := -1
+	// Also track the position after direction for type extraction
+	// Structure: [name1, name2, ...] direction type_with_constraint
+	var names []string
+	var portType string
+	foundDirection := false
+	typeStartByte := -1
 
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
 		childType := child.Type()
 
 		if childType == "port_direction" {
-			directionIndex = len(identifiers)
-		} else if childType == "identifier" {
-			identifiers = append(identifiers, child.Content(source))
+			foundDirection = true
+			continue
+		}
+
+		if !foundDirection {
+			// Before direction - these are port names
+			if childType == "identifier" {
+				names = append(names, child.Content(source))
+			}
+		} else {
+			// After direction - this is the type
+			// For types like std_logic_vector(7 downto 0), we need the full text
+			// The first child after direction that's an identifier is the type base
+			// We then capture everything up to the end to get the constraint
+			if typeStartByte < 0 && (childType == "identifier" || childType == "selected_name") {
+				typeStartByte = int(child.StartByte())
+			}
 		}
 	}
 
-	// Determine which identifiers are names vs type
-	// Names come before direction, type comes after
-	var names []string
-	var portType string
-
-	if directionIndex >= 0 && len(identifiers) > directionIndex {
-		// Direction was found - names are before direction, type is after
-		names = identifiers[:directionIndex]
-		if directionIndex < len(identifiers) {
-			portType = identifiers[directionIndex] // First identifier after direction is the type
+	// Extract full type string including constraint (e.g., "std_logic_vector(7 downto 0)")
+	if typeStartByte >= 0 {
+		typeEndByte := int(node.EndByte())
+		rawType := strings.TrimSpace(string(source[typeStartByte:typeEndByte]))
+		rawType = strings.TrimSuffix(rawType, ";")
+		rawType = strings.TrimSpace(rawType)
+		// Only strip trailing ) if parens are unbalanced (more closing than opening)
+		// This handles cases where type like std_logic_vector(7 downto 0) is followed by port list )
+		openCount := strings.Count(rawType, "(")
+		closeCount := strings.Count(rawType, ")")
+		for closeCount > openCount && strings.HasSuffix(rawType, ")") {
+			rawType = strings.TrimSuffix(rawType, ")")
+			rawType = strings.TrimSpace(rawType)
+			closeCount--
 		}
-	} else if len(identifiers) >= 2 {
-		// No direction - all but last are names, last is type
-		names = identifiers[:len(identifiers)-1]
-		portType = identifiers[len(identifiers)-1]
-	} else if len(identifiers) == 1 {
-		// Just one identifier, treat as name
-		names = identifiers
+		portType = rawType
+	}
+
+	// Fallback: if no direction was found, try to parse as name : type
+	if !foundDirection && len(names) == 0 {
+		var identifiers []string
+		for i := 0; i < int(node.ChildCount()); i++ {
+			child := node.Child(i)
+			if child.Type() == "identifier" {
+				identifiers = append(identifiers, child.Content(source))
+			}
+		}
+		if len(identifiers) >= 2 {
+			names = identifiers[:len(identifiers)-1]
+			portType = identifiers[len(identifiers)-1]
+		} else if len(identifiers) == 1 {
+			names = identifiers
+		}
 	}
 
 	// Create a port for each name
@@ -1478,7 +1601,7 @@ func (e *Extractor) extractPorts(node *sitter.Node, source []byte) []Port {
 	return ports
 }
 
-func (e *Extractor) extractProcess(node *sitter.Node, source []byte, context string) Process {
+func (e *Extractor) extractProcess(node *sitter.Node, source []byte, context string, declaredSignals map[string]bool) Process {
 	proc := Process{
 		Line:   int(node.StartPoint().Row) + 1,
 		InArch: context,
@@ -1508,12 +1631,17 @@ func (e *Extractor) extractProcess(node *sitter.Node, source []byte, context str
 	}
 
 	// Semantic analysis: walk the process body for clock edges, resets, and signal usage
-	e.analyzeProcessSemantics(node, source, &proc)
+	e.analyzeProcessSemantics(node, source, &proc, declaredSignals)
 
 	// Determine if combinational or sequential
+	// Sequential: has clock edge (rising_edge/falling_edge)
+	// Combinational: no clock edge AND no wait statements
+	// Wait-based processes are a third category - they're sequential but use wait statements
 	if proc.ClockSignal != "" {
 		proc.IsSequential = true
-	} else {
+	} else if !proc.HasWait {
+		// Only mark as combinational if no wait statements
+		// Processes with wait statements shouldn't have sensitivity lists
 		proc.IsCombinational = true
 	}
 
@@ -1521,7 +1649,7 @@ func (e *Extractor) extractProcess(node *sitter.Node, source []byte, context str
 }
 
 // analyzeProcessSemantics walks the process body to extract semantic information
-func (e *Extractor) analyzeProcessSemantics(node *sitter.Node, source []byte, proc *Process) {
+func (e *Extractor) analyzeProcessSemantics(node *sitter.Node, source []byte, proc *Process, declaredSignals map[string]bool) {
 	assignedSet := make(map[string]bool)
 	readSet := make(map[string]bool)
 
@@ -1565,83 +1693,32 @@ func (e *Extractor) analyzeProcessSemantics(node *sitter.Node, source []byte, pr
 			}
 
 		case "sequential_signal_assignment":
-			// Extract LHS (assigned signal) and RHS (read signals)
+			// Extract LHS (assigned signal) using grammar's target field
 			// LHS can be identifier, selected_name (record.field), or indexed_name (arr(i))
-			for i := 0; i < int(n.ChildCount()); i++ {
-				child := n.Child(i)
-				childType := child.Type()
-				// Stop at the assignment operator - everything after is RHS
-				if childType == "<=" || childType == ":=" {
-					break
-				}
-				if childType == "identifier" {
-					// Simple signal assignment
-					sig := child.Content(source)
-					assignedSet[sig] = true
-					break
-				}
-				if childType == "selected_name" || childType == "indexed_name" {
-					// Record field or array element assignment
-					// Extract the base signal (first identifier in the chain)
-					sig := e.extractBaseSignal(child, source)
-					if sig != "" {
-						assignedSet[sig] = true
-					}
-					break
-				}
+			if sig, ok := e.extractAssignmentTarget(n, source); ok {
+				assignedSet[sig] = true
 			}
 			// Walk RHS for reads
-			e.extractReadsFromNode(n, source, readSet, true)
+			e.extractReadsFromNode(n, source, readSet, true, declaredSignals, variableSet)
 
 		case "assignment_statement":
 			// Variable/generic assignments (tmp := expr) don't assign signals,
 			// but the RHS may read signals that we need to track
-			e.extractReadsFromNode(n, source, readSet, true)
+			e.extractReadsFromNode(n, source, readSet, true, declaredSignals, variableSet)
 
 		case "if_statement":
-			// Check for clock edge pattern in elsif clause
-			// Grammar parses "elsif rising_edge(clk)" with prefix/content fields
-			// NOTE: ChildByFieldName returns the first match, but there may be many
-			// prefix/content fields from record assignments (ctrl.enable, etc.)
-			// We need to look for rising_edge/falling_edge specifically
+			// Check for clock edge pattern in condition
+			// Grammar uses alias($._expression, $.condition) creating a wrapper node
+			// Look for rising_edge/falling_edge calls in the condition
 			if proc.ClockSignal == "" {
-				// Iterate through children looking for clock edge pattern
-				for i := 0; i < int(n.ChildCount()); i++ {
-					child := n.Child(i)
-					if child.Type() == "identifier" {
-						funcName := strings.ToLower(child.Content(source))
-						if funcName == "rising_edge" || funcName == "falling_edge" {
-							// Found clock edge function, look for next identifier (clock signal)
-							for j := i + 1; j < int(n.ChildCount()); j++ {
-								nextChild := n.Child(j)
-								if nextChild.Type() == "identifier" {
-									argName := nextChild.Content(source)
-									if funcName == "rising_edge" {
-										proc.ClockSignal = argName
-										proc.ClockEdge = "rising"
-									} else {
-										proc.ClockSignal = argName
-										proc.ClockEdge = "falling"
-									}
-									break
-								}
-								// Skip non-identifier nodes but stop at statements
-								if strings.Contains(nextChild.Type(), "statement") ||
-									strings.Contains(nextChild.Type(), "assignment") {
-									break
-								}
-							}
-							break
-						}
-					}
-				}
+				e.extractClockEdgeFromIfStatement(n, source, proc)
 			}
 			// Check for reset pattern in if condition
 			// Pattern: if reset = '1' then (before clock edge = async)
 			// Pattern: elsif reset = '1' then (after clock edge = sync)
 			e.checkResetPattern(n, source, proc)
 			// Extract reads from condition (identifiers before first statement)
-			e.extractIfConditionReads(n, source, readSet)
+			e.extractIfConditionReads(n, source, readSet, declaredSignals, variableSet)
 			// Continue walking children for nested statements
 			for i := 0; i < int(n.ChildCount()); i++ {
 				walk(n.Child(i), false)
@@ -1650,12 +1727,27 @@ func (e *Extractor) analyzeProcessSemantics(node *sitter.Node, source []byte, pr
 
 		case "case_statement":
 			// Extract reads from case expression
-			e.extractCaseExpressionReads(n, source, readSet)
+			e.extractCaseExpressionReads(n, source, readSet, declaredSignals, variableSet)
 			// Continue walking children for case alternatives
 			for i := 0; i < int(n.ChildCount()); i++ {
 				walk(n.Child(i), false)
 			}
 			return
+
+		case "procedure_call_statement":
+			// Procedure calls may read signals via arguments (e.g., check_equal(sig, ...))
+			callReads := make(map[string]bool)
+			e.extractReadsFromNode(n, source, callReads, false, declaredSignals, variableSet)
+			for sig := range callReads {
+				if isDeclaredSignalName(sig, declaredSignals, variableSet) {
+					readSet[sig] = true
+				}
+			}
+
+		case "wait_statement":
+			// Process contains wait statement - not combinational
+			// Wait-based processes are sequential and don't need sensitivity lists
+			proc.HasWait = true
 
 		case "identifier":
 			// In expression context, this is a read
@@ -1674,12 +1766,12 @@ func (e *Extractor) analyzeProcessSemantics(node *sitter.Node, source []byte, pr
 
 	// Convert sets to slices, filtering out process-local variables
 	for sig := range assignedSet {
-		if !variableSet[sig] {
+		if !variableSet[strings.ToLower(sig)] {
 			proc.AssignedSignals = append(proc.AssignedSignals, sig)
 		}
 	}
 	for sig := range readSet {
-		if !variableSet[sig] {
+		if !variableSet[strings.ToLower(sig)] {
 			proc.ReadSignals = append(proc.ReadSignals, sig)
 		}
 	}
@@ -1699,7 +1791,7 @@ func (e *Extractor) collectProcessVariables(node *sitter.Node, source []byte, va
 			// Extract the variable name from the "name" field
 			nameNode := n.ChildByFieldName("name")
 			if nameNode != nil && nameNode.Type() == "identifier" {
-				varName := nameNode.Content(source)
+				varName := strings.ToLower(nameNode.Content(source))
 				varSet[varName] = true
 			}
 		}
@@ -1714,107 +1806,184 @@ func (e *Extractor) collectProcessVariables(node *sitter.Node, source []byte, va
 }
 
 // extractCaseExpressionReads extracts signal reads from case expression
-func (e *Extractor) extractCaseExpressionReads(node *sitter.Node, source []byte, readSet map[string]bool) {
-	// Case expression is typically the first identifier/expression after "case" keyword
-	// Structure: case expr is when choice => stmts... end case;
-	for i := 0; i < int(node.ChildCount()); i++ {
-		child := node.Child(i)
-		childType := child.Type()
-		fieldName := node.FieldNameForChild(i)
-
-		// Stop when we hit case_alternative (the "when" clauses)
-		if childType == "case_alternative" {
-			break
-		}
-
-		// Extract identifiers from expression
-		// Skip "suffix" and "content" fields - these are record field names
-		// Skip function calls - identifiers immediately followed by '('
-		if childType == "identifier" {
-			if fieldName != "suffix" && fieldName != "content" && !e.isFunctionCall(child, source) {
-				readSet[child.Content(source)] = true
-			}
-		} else if childType == "indexed_name" || childType == "selected_name" {
-			e.extractReadsFromNode(child, source, readSet, false)
-		}
+func (e *Extractor) extractCaseExpressionReads(node *sitter.Node, source []byte, readSet map[string]bool, declaredSignals map[string]bool, variableSet map[string]bool) {
+	// Grammar: case_statement has field('expression', ...) for the selector expression
+	exprNode := node.ChildByFieldName("expression")
+	if exprNode == nil {
+		return
 	}
+
+	// Extract signal reads from the expression using existing helper
+	e.extractReadsFromNode(exprNode, source, readSet, false, declaredSignals, variableSet)
 }
 
 // isNotSignalRead checks if an identifier should NOT be treated as a signal read
+// Uses AST structure (parent node types and field names) instead of byte inspection.
 // Returns true for:
-// - Function calls: identifier followed by '(' like "func_name(args)"
-// - Attribute expressions: identifier followed by ''' like "type'high"
-// - Aggregate field names: identifier followed by '=>' like "(field => value)"
+// - Function calls: identifier is prefix of indexed_name with function-like name
+// - Qualified expressions: identifier is prefix (type name) like std_logic'('0')
+// - Aggregate field names: identifier is formal in element_association (field => value)
 func (e *Extractor) isNotSignalRead(node *sitter.Node, source []byte) bool {
-	endByte := int(node.EndByte())
-	if endByte < len(source) {
-		nextChar := source[endByte]
-		// Function call: identifier followed by '('
-		if nextChar == '(' {
+	parent := node.Parent()
+	if parent == nil {
+		return false
+	}
+
+	parentType := parent.Type()
+
+	// Find which field this node occupies in the parent
+	fieldName := ""
+	for i := 0; i < int(parent.ChildCount()); i++ {
+		if parent.Child(i) == node {
+			fieldName = parent.FieldNameForChild(i)
+			break
+		}
+	}
+
+	// If this identifier is the prefix of an indexed_name, it might be a function call
+	// VHDL can't syntactically distinguish array(i) from func(x)
+	// Use naming heuristics for common type conversions and functions
+	if parentType == "indexed_name" && fieldName == "prefix" {
+		name := strings.ToLower(node.Content(source))
+		if e.isCommonVHDLFunction(name) {
 			return true
 		}
-		// Attribute expression: identifier followed by ''' (apostrophe)
-		if nextChar == '\'' {
-			return true
+	}
+
+	// If this identifier is in an element_association as the formal (left side of =>)
+	if parentType == "element_association" && fieldName == "formal" {
+		return true
+	}
+
+	// Qualified expressions: type_name'(value)
+	// e.g., std_logic'('0') - "std_logic" is not a signal read
+	if parentType == "qualified_expression" && fieldName == "prefix" {
+		return true
+	}
+
+	return false
+}
+
+// isCommonVHDLFunction checks if a name is a common VHDL function or type conversion
+// These should not be treated as signal reads when used as indexed_name prefixes
+func (e *Extractor) isCommonVHDLFunction(name string) bool {
+	switch name {
+	// Type conversions
+	case "unsigned", "signed", "std_logic_vector", "std_ulogic_vector":
+		return true
+	case "integer", "natural", "positive", "real":
+		return true
+	// numeric_std functions
+	case "to_unsigned", "to_signed", "to_integer", "to_real":
+		return true
+	case "resize", "shift_left", "shift_right", "rotate_left", "rotate_right":
+		return true
+	// Common functions
+	case "conv_integer", "conv_unsigned", "conv_signed", "conv_std_logic_vector":
+		return true
+	case "rising_edge", "falling_edge", "now", "time":
+		return true
+	default:
+		return false
+	}
+}
+
+// isFunctionCall checks if an identifier appears to be a function call
+// Uses AST structure to determine if this identifier is in a call position
+func (e *Extractor) isFunctionCall(node *sitter.Node, source []byte) bool {
+	parent := node.Parent()
+	if parent == nil {
+		return false
+	}
+
+	// Find which field this node occupies in the parent
+	fieldName := ""
+	for i := 0; i < int(parent.ChildCount()); i++ {
+		if parent.Child(i) == node {
+			fieldName = parent.FieldNameForChild(i)
+			break
 		}
-		// Aggregate field name: identifier followed by '=>'
-		// Skip whitespace first
-		pos := endByte
-		for pos < len(source) && (source[pos] == ' ' || source[pos] == '\t') {
-			pos++
-		}
-		if pos+1 < len(source) && source[pos] == '=' && source[pos+1] == '>' {
+	}
+
+	// If this identifier is the prefix of an indexed_name, check if it looks like a function
+	if parent.Type() == "indexed_name" && fieldName == "prefix" {
+		name := strings.ToLower(node.Content(source))
+		return e.isCommonVHDLFunction(name)
+	}
+
+	return false
+}
+
+// extractIfConditionReads extracts signal reads from if/elsif conditions
+// In tree-sitter, condition elements appear as direct children before any statement nodes
+func (e *Extractor) extractIfConditionReads(node *sitter.Node, source []byte, readSet map[string]bool, declaredSignals map[string]bool, variableSet map[string]bool) {
+	// Grammar: if_statement has field('condition', alias($._expression, $.condition))
+	// The alias creates a visible wrapper node that ChildByFieldName can return
+	if condNode := node.ChildByFieldName("condition"); condNode != nil {
+		e.extractReadsFromNode(condNode, source, readSet, false, declaredSignals, variableSet)
+	}
+}
+
+func addDeclaredSignalName(declaredSignals map[string]bool, name string) {
+	if declaredSignals == nil || name == "" {
+		return
+	}
+	declaredSignals[strings.ToLower(name)] = true
+}
+
+func isDeclaredSignalName(name string, declaredSignals map[string]bool, variableSet map[string]bool) bool {
+	if name == "" {
+		return false
+	}
+	lower := strings.ToLower(name)
+	if declaredSignals != nil && declaredSignals[lower] {
+		return true
+	}
+	if variableSet != nil && variableSet[lower] {
+		return true
+	}
+	return false
+}
+
+func nodeHasField(node *sitter.Node, fieldName string) bool {
+	if node == nil {
+		return false
+	}
+	for i := 0; i < int(node.ChildCount()); i++ {
+		if node.FieldNameForChild(i) == fieldName {
 			return true
 		}
 	}
 	return false
 }
 
-// isFunctionCall is an alias for backward compatibility
-func (e *Extractor) isFunctionCall(node *sitter.Node, source []byte) bool {
-	return e.isNotSignalRead(node, source)
+func identifierFollowedByParen(node *sitter.Node, source []byte) bool {
+	if node == nil {
+		return false
+	}
+	idx := int(node.EndByte())
+	for idx < len(source) {
+		b := source[idx]
+		if b == ' ' || b == '\t' || b == '\n' || b == '\r' {
+			idx++
+			continue
+		}
+		return b == '('
+	}
+	return false
 }
 
-// extractIfConditionReads extracts signal reads from if/elsif conditions
-// In tree-sitter, condition elements appear as direct children before any statement nodes
-func (e *Extractor) extractIfConditionReads(node *sitter.Node, source []byte, readSet map[string]bool) {
-	childCount := int(node.ChildCount())
-	for i := 0; i < childCount; i++ {
-		child := node.Child(i)
-		childType := child.Type()
-		fieldName := node.FieldNameForChild(i)
-
-		// Stop when we hit a statement or another if_statement (elsif/else body)
-		if childType == "sequential_signal_assignment" ||
-			childType == "if_statement" ||
-			childType == "case_statement" ||
-			childType == "loop_statement" ||
-			childType == "return_statement" ||
-			childType == "null_statement" ||
-			childType == "wait_statement" ||
-			childType == "assertion_statement" ||
-			childType == "report_statement" ||
-			childType == "assignment_statement" {
-			break
-		}
-
-		// Extract identifiers from condition
-		// Skip "suffix" and "content" fields - these are record field names (e.g., ".enable" in "ctrl.enable")
-		// Skip function calls - identifiers immediately followed by '('
-		if childType == "identifier" {
-			if fieldName != "suffix" && fieldName != "content" && !e.isFunctionCall(child, source) {
-				readSet[child.Content(source)] = true
-			}
-		} else if childType == "indexed_name" || childType == "selected_name" {
-			// Handle function calls and record access in conditions
-			e.extractReadsFromNode(child, source, readSet, false)
-		}
+func signalDeclarationHasDefault(node *sitter.Node, source []byte) bool {
+	if node == nil {
+		return false
 	}
+	return strings.Contains(node.Content(source), ":=")
 }
 
 // extractReadsFromNode finds all identifiers read in an expression
-// It handles selected_name (record field access) by only extracting the base signal
-func (e *Extractor) extractReadsFromNode(node *sitter.Node, source []byte, readSet map[string]bool, skipFirst bool) {
+// Uses extractNameInfo for unified handling of name structures (identifier, selected_name, indexed_name)
+// Handles flat prefix/suffix patterns from wrapper nodes (like condition wrapper)
+func (e *Extractor) extractReadsFromNode(node *sitter.Node, source []byte, readSet map[string]bool, skipFirst bool, declaredSignals map[string]bool, variableSet map[string]bool) {
 	first := true
 	var walk func(n *sitter.Node, parent *sitter.Node, childIdx int)
 	walk = func(n *sitter.Node, parent *sitter.Node, childIdx int) {
@@ -1822,48 +1991,79 @@ func (e *Extractor) extractReadsFromNode(node *sitter.Node, source []byte, readS
 			return
 		}
 
-		// For selected_name (e.g., a_req_i.stb) or indexed_name (e.g., arr(i)),
-		// only extract the first identifier (base signal)
-		// The field name (.stb) or index (i) are not signals - the base signal is
-		if n.Type() == "selected_name" || n.Type() == "indexed_name" {
-			for i := 0; i < int(n.ChildCount()); i++ {
-				child := n.Child(i)
-				if child.Type() == "identifier" {
-					// Skip function calls - identifiers immediately followed by '('
-					if e.isFunctionCall(child, source) {
-						continue
-					}
-					if skipFirst && first {
-						first = false
-					} else {
-						readSet[child.Content(source)] = true
-					}
-					break // Only take the first identifier (base signal)
-				}
-				// If the first child is another selected_name or indexed_name, recurse
-				if child.Type() == "selected_name" || child.Type() == "indexed_name" {
-					walk(child, n, i)
-					break
-				}
-			}
-			return // Don't recurse into children - we've handled it
+		nodeType := n.Type()
+
+		// Skip external_name nodes - they contain hierarchical paths, not signal reads
+		// VHDL-2008: << signal .tb_external_names.dut_inst.local_sig : bit >>
+		if nodeType == "external_name" {
+			return
 		}
 
-		if n.Type() == "identifier" {
-			// Skip suffix/content fields - these are record field names (e.g., ".enable" in "ctrl.enable")
-			fieldName := ""
-			if parent != nil && childIdx >= 0 {
-				fieldName = parent.FieldNameForChild(childIdx)
+		// Skip physical_literal nodes - the identifier inside is a unit (ns, ps, etc), not a signal
+		// Example: "after 5 ns" - ns is a time unit, not a signal
+		if nodeType == "physical_literal" {
+			return
+		}
+
+		// Check if this identifier is a "suffix" field - if so, skip it
+		// The prefix should have already been added as the base signal
+		// This handles flat selected_name patterns in wrapper nodes (e.g., condition)
+		if nodeType == "identifier" && parent != nil {
+			fieldName := parent.FieldNameForChild(childIdx)
+			if fieldName == "suffix" {
+				// This is a record field access suffix - the prefix is the base signal
+				// We should have already processed the prefix, so skip this
+				return
 			}
-			// Skip function calls - identifiers immediately followed by '('
-			if fieldName != "suffix" && fieldName != "content" && !e.isFunctionCall(n, source) {
+			if fieldName == "prefix" && nodeHasField(parent, "content") {
+				// Prefix with parentheses: func(arg) or arr(idx)
+				// If the base isn't a declared signal/variable, treat as a call and skip.
+				if !isDeclaredSignalName(n.Content(source), declaredSignals, variableSet) {
+					return
+				}
+			}
+			if identifierFollowedByParen(n, source) && !isDeclaredSignalName(n.Content(source), declaredSignals, variableSet) {
+				// Heuristic: name followed by '(' with no declaration -> likely a call.
+				return
+			}
+		}
+
+		// For any name-like node, use extractNameInfo to get the base signal
+		if nodeType == "selected_name" || nodeType == "indexed_name" || nodeType == "identifier" {
+			info := e.extractNameInfo(n, source)
+
+			// Skip if it looks like a function call (type conversion, built-in function)
+			if info.IsCall && e.isCommonVHDLFunction(strings.ToLower(info.Base)) {
+				return
+			}
+
+			skipBase := false
+			if nodeType == "indexed_name" && info.IsCall && !isDeclaredSignalName(info.Base, declaredSignals, variableSet) {
+				skipBase = true
+			}
+
+			// Add the base signal to read set
+			if info.Base != "" && !skipBase {
 				if skipFirst && first {
 					first = false
 				} else {
-					readSet[n.Content(source)] = true
+					readSet[info.Base] = true
 				}
 			}
+
+			// For indexed_name, also need to extract reads from index expressions
+			// Walk children to find expression nodes that aren't part of the name prefix
+			if nodeType == "indexed_name" {
+				if contentNode := n.ChildByFieldName("content"); contentNode != nil {
+					// Recursively extract reads from index expression
+					walk(contentNode, n, -1)
+				}
+			}
+
+			return // Don't recurse further - we've extracted the base signal
 		}
+
+		// Recurse into other node types
 		for i := 0; i < int(n.ChildCount()); i++ {
 			walk(n.Child(i), n, i)
 		}
@@ -1879,56 +2079,150 @@ func isResetName(name string) bool {
 
 // checkResetPattern looks for reset patterns in if statements
 // Pattern: if reset = '1' then (async if first condition before clock edge)
+// Uses grammar: field('condition', alias($._expression, $.condition)) creates a wrapper node
 func (e *Extractor) checkResetPattern(node *sitter.Node, source []byte, proc *Process) {
-	// node is an if_statement - look at immediate children
-	// The tree structure is: identifier, relational_op, literal, [statements...], indexed_name (elsif cond), [statements...]
-	// We want to detect the FIRST condition (before any clock edge check)
+	// Get the condition wrapper node via ChildByFieldName
+	condNode := node.ChildByFieldName("condition")
+	if condNode == nil {
+		return
+	}
 
-	var firstIdentifier string
-	var sawRelOp bool
-	var firstValue string
-	var sawClockEdgeFirst bool
-	foundFirstCondition := false
+	// Check if this is a clock edge condition (not a reset)
+	condContent := strings.ToLower(condNode.Content(source))
+	if strings.Contains(condContent, "rising_edge") || strings.Contains(condContent, "falling_edge") {
+		return
+	}
 
-	for i := 0; i < int(node.ChildCount()); i++ {
-		child := node.Child(i)
+	// Walk the condition wrapper's children to find reset pattern
+	var resetSignal string
+	var hasComparison bool
+	var hasValue bool
+
+	for i := 0; i < int(condNode.ChildCount()); i++ {
+		child := condNode.Child(i)
 		childType := child.Type()
+		childContent := child.Content(source)
 
-		// Stop collecting the first condition when we hit a statement or another condition marker
-		if childType == "sequential_signal_assignment" || childType == "if_statement" {
-			foundFirstCondition = true
-		}
-
-		if !foundFirstCondition {
-			switch childType {
-			case "identifier":
-				if firstIdentifier == "" {
-					firstIdentifier = child.Content(source)
+		switch childType {
+		case "identifier":
+			if resetSignal == "" {
+				resetSignal = childContent
+			}
+		case "relational_operator":
+			hasComparison = true
+		case "character_literal":
+			hasValue = true
+		case "relational_expression":
+			// If we have a structured relational_expression, use its fields
+			if leftNode := child.ChildByFieldName("left"); leftNode != nil {
+				info := e.extractNameInfo(leftNode, source)
+				if info.Base != "" {
+					resetSignal = info.Base
 				}
-			case "relational_operator":
-				sawRelOp = true
-			case "character_literal":
-				if firstValue == "" {
-					firstValue = child.Content(source)
-				}
-			case "indexed_name":
-				// If the FIRST condition is a clock edge, not a reset
-				content := strings.ToLower(child.Content(source))
-				if strings.Contains(content, "rising_edge") || strings.Contains(content, "falling_edge") {
-					sawClockEdgeFirst = true
+			}
+			hasComparison = true
+			if rightNode := child.ChildByFieldName("right"); rightNode != nil {
+				if rightNode.Type() == "character_literal" {
+					hasValue = true
 				}
 			}
 		}
 	}
 
-	// If the first condition is a simple comparison (not a clock edge), it might be reset
-	// But we also check that the signal name actually looks like a reset to avoid false positives
-	if firstIdentifier != "" && sawRelOp && firstValue != "" && !sawClockEdgeFirst {
-		if !proc.HasReset && isResetName(firstIdentifier) {
+	// If we found a comparison with a reset-named signal, mark it as reset
+	if resetSignal != "" && hasComparison && hasValue {
+		if !proc.HasReset && isResetName(resetSignal) {
 			proc.HasReset = true
-			proc.ResetSignal = firstIdentifier
+			proc.ResetSignal = resetSignal
 			// Async reset pattern: reset check is FIRST (before clock edge in elsif)
 			proc.ResetAsync = true
+		}
+	}
+}
+
+// extractClockEdgeFromIfStatement checks for clock edge patterns in if_statement conditions
+// Handles both main condition and elsif conditions
+// Grammar uses alias($._expression, $.condition) creating wrapper nodes
+func (e *Extractor) extractClockEdgeFromIfStatement(node *sitter.Node, source []byte, proc *Process) {
+	// Check all condition nodes (main if and elsif clauses)
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+
+		// Look for condition wrapper nodes (both named field and type)
+		if child.Type() == "condition" {
+			e.extractClockEdgeFromCondition(child, source, proc)
+			if proc.ClockSignal != "" {
+				return // Found clock, done
+			}
+		}
+	}
+}
+
+// extractClockEdgeFromCondition extracts clock edge from a condition wrapper node
+// Looks for rising_edge(clk) or falling_edge(clk) patterns
+func (e *Extractor) extractClockEdgeFromCondition(condNode *sitter.Node, source []byte, proc *Process) {
+	condContent := strings.ToLower(condNode.Content(source))
+
+	// Quick check: does this condition contain a clock edge?
+	if !strings.Contains(condContent, "rising_edge") && !strings.Contains(condContent, "falling_edge") {
+		return
+	}
+
+	// The condition may have flat children: identifier, "(", identifier, ")"
+	// Or it may have an indexed_name structure
+	// Look for both patterns
+	for i := 0; i < int(condNode.ChildCount()); i++ {
+		child := condNode.Child(i)
+
+		if child.Type() == "indexed_name" {
+			// Structured indexed_name: prefix="rising_edge", content=clock_signal
+			funcName := ""
+			argName := ""
+
+			if prefixNode := child.ChildByFieldName("prefix"); prefixNode != nil {
+				funcName = strings.ToLower(prefixNode.Content(source))
+			}
+			if contentNode := child.ChildByFieldName("content"); contentNode != nil {
+				argName = contentNode.Content(source)
+			}
+
+			// Fallback: iterate children
+			if funcName == "" || argName == "" {
+				for j := 0; j < int(child.ChildCount()); j++ {
+					c := child.Child(j)
+					if c.Type() == "identifier" {
+						if funcName == "" {
+							funcName = strings.ToLower(c.Content(source))
+						} else if argName == "" {
+							argName = c.Content(source)
+						}
+					}
+				}
+			}
+
+			if (funcName == "rising_edge" || funcName == "falling_edge") && argName != "" {
+				proc.ClockSignal = argName
+				proc.ClockEdge = map[bool]string{true: "rising", false: "falling"}[funcName == "rising_edge"]
+				proc.IsSequential = true
+				return
+			}
+		}
+
+		// Flat pattern: identifier("rising_edge"), "(", identifier(clk), ")"
+		if child.Type() == "identifier" {
+			funcName := strings.ToLower(child.Content(source))
+			if funcName == "rising_edge" || funcName == "falling_edge" {
+				// Look for next identifier (skipping parentheses)
+				for j := i + 1; j < int(condNode.ChildCount()); j++ {
+					nextChild := condNode.Child(j)
+					if nextChild.Type() == "identifier" {
+						proc.ClockSignal = nextChild.Content(source)
+						proc.ClockEdge = map[bool]string{true: "rising", false: "falling"}[funcName == "rising_edge"]
+						proc.IsSequential = true
+						return
+					}
+				}
+			}
 		}
 	}
 }
@@ -1936,7 +2230,22 @@ func (e *Extractor) checkResetPattern(node *sitter.Node, source []byte, proc *Pr
 func (e *Extractor) extractSensitivityList(node *sitter.Node, source []byte) []string {
 	var signals []string
 
-	for i := 0; i < int(node.ChildCount()); i++ {
+	// Grammar: sensitivity_list: $ => choice($._kw_all, seq($._signal_name, ...))
+	// Check for VHDL-2008 "all" first - it may be a hidden token with no children.
+	childCount := int(node.ChildCount())
+	if childCount > 0 {
+		firstChild := node.Child(0)
+		firstContent := strings.ToLower(strings.TrimSpace(firstChild.Content(source)))
+		if firstContent == "all" {
+			return []string{"all"}
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(node.Content(source)), "all") {
+		return []string{"all"}
+	}
+
+	// Otherwise, collect signal names
+	for i := 0; i < childCount; i++ {
 		child := node.Child(i)
 		childType := child.Type()
 
@@ -1947,12 +2256,6 @@ func (e *Extractor) extractSensitivityList(node *sitter.Node, source []byte) []s
 			// For complex signal names like rec.field or arr(i)
 			signals = append(signals, child.Content(source))
 		}
-	}
-
-	// Check for VHDL-2008 "all" - represented as the raw content
-	content := strings.TrimSpace(node.Content(source))
-	if strings.ToLower(content) == "all" {
-		return []string{"all"}
 	}
 
 	return signals
@@ -2042,30 +2345,40 @@ func (e *Extractor) extractComparisonsFromProcess(node *sitter.Node, source []by
 			nodeType == "_conditional_signal_assignment" ||
 			nodeType == "_selected_signal_assignment" ||
 			nodeType == "_simple_signal_assignment" {
-			// First identifier is typically the target
-			for i := 0; i < int(n.ChildCount()); i++ {
-				child := n.Child(i)
-				if child.Type() == "identifier" {
-					currentAssignment = child.Content(source)
-					break
-				}
+			// Use grammar's target field
+			if sig, ok := e.extractAssignmentTarget(n, source); ok {
+				currentAssignment = sig
 			}
 		}
 
 		// First try: structured relational_expression node (preferred if grammar provides it)
+		// Grammar: relational_expression { field('left'), field('operator'), field('right') }
 		if nodeType == "relational_expression" {
 			comp := e.extractComparisonStructured(n, source, archContext, processLabel, currentAssignment)
 			if comp.LeftOperand != "" {
 				facts.Comparisons = append(facts.Comparisons, comp)
 			}
+			// Don't recurse into children - we've already handled this comparison
+			// This prevents the fallback from also firing for the operator child
+			for i := 0; i < int(n.ChildCount()); i++ {
+				child := n.Child(i)
+				// Skip the operator node, recurse into operands for nested comparisons
+				if child.Type() != "relational_operator" {
+					walk(child, currentAssignment, n)
+				}
+			}
+			return
 		}
 
 		// Fallback: Find relational_operator nodes and look at siblings
-		// This handles the flat structure: parent(identifier, relational_operator, identifier)
+		// Only fires when operator is NOT inside a relational_expression (flat structure)
 		if nodeType == "relational_operator" && parent != nil {
-			comp := e.extractComparisonFromSiblings(n, parent, source, archContext, processLabel, currentAssignment)
-			if comp.LeftOperand != "" && comp.Operator != "" {
-				facts.Comparisons = append(facts.Comparisons, comp)
+			// Skip if parent is relational_expression (already handled above)
+			if parent.Type() != "relational_expression" {
+				comp := e.extractComparisonFromSiblings(n, parent, source, archContext, processLabel, currentAssignment)
+				if comp.LeftOperand != "" && comp.Operator != "" {
+					facts.Comparisons = append(facts.Comparisons, comp)
+				}
 			}
 		}
 
@@ -2309,12 +2622,18 @@ func (e *Extractor) extractArithmeticOpsFromProcess(node *sitter.Node, source []
 
 		// Track if conditions as potential guards
 		if nodeType == "if_statement" {
-			// Extract first identifier from condition as potential guard
-			for i := 0; i < int(n.ChildCount()); i++ {
-				child := n.Child(i)
-				if child.Type() == "identifier" {
-					guardStack = append(guardStack, child.Content(source))
-					break
+			if cond := n.ChildByFieldName("condition"); cond != nil {
+				if guard := e.extractExpressionSignal(cond, source); guard != "" {
+					guardStack = append(guardStack, guard)
+				}
+			} else {
+				// Fallback: extract first identifier if condition field is missing
+				for i := 0; i < int(n.ChildCount()); i++ {
+					child := n.Child(i)
+					if child.Type() == "identifier" {
+						guardStack = append(guardStack, child.Content(source))
+						break
+					}
 				}
 			}
 		}
@@ -2327,6 +2646,14 @@ func (e *Extractor) extractArithmeticOpsFromProcess(node *sitter.Node, source []
 			if op.Operator != "" {
 				facts.ArithmeticOps = append(facts.ArithmeticOps, op)
 			}
+			// Recurse into operands for nested operations, skip the operator node
+			for i := 0; i < int(n.ChildCount()); i++ {
+				child := n.Child(i)
+				if child.Type() != "multiplicative_operator" && child.Type() != "arithmetic_operator" {
+					walk(child)
+				}
+			}
+			return
 		}
 
 		if nodeType == "exponential_expression" {
@@ -2334,14 +2661,26 @@ func (e *Extractor) extractArithmeticOpsFromProcess(node *sitter.Node, source []
 			if op.Operator != "" {
 				facts.ArithmeticOps = append(facts.ArithmeticOps, op)
 			}
+			// Recurse into operands for nested operations
+			for i := 0; i < int(n.ChildCount()); i++ {
+				child := n.Child(i)
+				if child.Type() != "arithmetic_operator" {
+					walk(child)
+				}
+			}
+			return
 		}
 
 		// Fallback: flat arithmetic operators (when expressions are not structured)
-		if nodeType == "arithmetic_operator" {
+		// Only fires when operator is NOT inside a structured expression
+		if nodeType == "arithmetic_operator" || nodeType == "multiplicative_operator" {
 			if parent := n.Parent(); parent != nil {
-				op := e.extractArithmeticOpFromSiblings(n, parent, source, archContext, processLabel, guardStack)
-				if op.Operator != "" {
-					facts.ArithmeticOps = append(facts.ArithmeticOps, op)
+				// Skip if parent is a structured expression (already handled above)
+				if parent.Type() != "multiplicative_expression" && parent.Type() != "exponential_expression" {
+					op := e.extractArithmeticOpFromSiblings(n, parent, source, archContext, processLabel, guardStack)
+					if op.Operator != "" {
+						facts.ArithmeticOps = append(facts.ArithmeticOps, op)
+					}
 				}
 			}
 		}
@@ -2506,16 +2845,20 @@ func (e *Extractor) extractSignalDepsFromAssignment(node *sitter.Node, source []
 	var target string
 	readSet := make(map[string]bool)
 
-	// First pass: find target with full path (e.g., "trap.cause" not just "trap")
-	for i := 0; i < int(node.ChildCount()); i++ {
-		child := node.Child(i)
-		if child.Type() == "identifier" {
-			target = child.Content(source)
-			break
-		}
-		if child.Type() == "selected_name" || child.Type() == "indexed_name" {
-			target = e.extractFullSignalPath(child, source)
-			break
+	// Use grammar's field('target', assignment_target) wrapper to find target
+	targetNode := node.ChildByFieldName("target")
+	if targetNode != nil {
+		// Extract full path from inside the wrapper
+		for i := 0; i < int(targetNode.ChildCount()); i++ {
+			child := targetNode.Child(i)
+			if child.Type() == "identifier" {
+				target = child.Content(source)
+				break
+			}
+			if child.Type() == "selected_name" || child.Type() == "indexed_name" {
+				target = e.extractFullSignalPath(child, source)
+				break
+			}
 		}
 	}
 
@@ -2630,7 +2973,7 @@ func (e *Extractor) extractSignalDepsFromConcurrent(ca ConcurrentAssignment, arc
 // extractGenerateStatement extracts a generate statement with its nested declarations
 // Handles for-generate, if-generate, and case-generate (VHDL-2008)
 // Requires grammar to expose visible nodes: for_generate, if_generate, case_generate
-func (e *Extractor) extractGenerateStatement(node *sitter.Node, source []byte, context string) GenerateStatement {
+func (e *Extractor) extractGenerateStatement(node *sitter.Node, source []byte, context string, declaredSignals map[string]bool) GenerateStatement {
 	gen := GenerateStatement{
 		Line:      int(node.StartPoint().Row) + 1,
 		InArch:    context,
@@ -2677,7 +3020,7 @@ func (e *Extractor) extractGenerateStatement(node *sitter.Node, source []byte, c
 	// Extract nested declarations from the generate body
 	// Pass the for_generate/if_generate/case_generate node, NOT the generate_statement
 	if bodyNode != nil {
-		e.extractGenerateBody(bodyNode, source, &gen)
+		e.extractGenerateBody(bodyNode, source, &gen, declaredSignals)
 	}
 
 	return gen
@@ -2691,15 +3034,67 @@ func (e *Extractor) extractForGenerateDetails(node *sitter.Node, source []byte, 
 		gen.LoopVar = loopVarNode.Content(source)
 	}
 
-	// Extract range info from the full for_generate content
-	// The grammar hides "to"/"downto" keywords, so we parse from text
-	// Pattern: for LOOP_VAR in LOW to/downto HIGH generate
-	content := node.Content(source)
-	e.parseForGenerateRange(content, gen)
+	// Use grammar field for range - the range node contains the bounds and direction
+	if rangeNode := node.ChildByFieldName("range"); rangeNode != nil {
+		e.extractRangeFromNode(rangeNode, source, gen)
+	} else {
+		// Fallback: parse from text if grammar doesn't provide range field
+		content := node.Content(source)
+		e.parseForGenerateRange(content, gen)
+	}
 
 	// Initialize elaboration fields
 	gen.IterationCount = -1
 	gen.CanElaborate = false
+}
+
+// extractRangeFromNode extracts low/high/direction from a range AST node
+// Uses grammar's discrete_range with range_expression child that has low/direction/high fields
+// Or just an expression for attribute ranges like vec'range
+func (e *Extractor) extractRangeFromNode(node *sitter.Node, source []byte, gen *GenerateStatement) {
+	// The node is discrete_range which wraps either:
+	// 1. range_expression with fields: low, direction, high
+	// 2. Just an expression (for attribute ranges)
+
+	// Look for range_expression child with named fields
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		if child.Type() == "range_expression" {
+			// Use grammar fields for clean extraction
+			if lowNode := child.ChildByFieldName("low"); lowNode != nil {
+				gen.RangeLow = strings.TrimSpace(lowNode.Content(source))
+			}
+			if dirNode := child.ChildByFieldName("direction"); dirNode != nil {
+				gen.RangeDir = strings.ToLower(strings.TrimSpace(dirNode.Content(source)))
+			}
+			if highNode := child.ChildByFieldName("high"); highNode != nil {
+				gen.RangeHigh = strings.TrimSpace(highNode.Content(source))
+			}
+			return
+		}
+	}
+
+	// Fallback: attribute range like vec'range - store the entire expression
+	content := strings.TrimSpace(node.Content(source))
+	if content != "" {
+		gen.RangeLow = content
+	}
+}
+
+// isVHDLKeyword checks if a string is a VHDL keyword (used to filter out keywords in range extraction)
+func isVHDLKeyword(s string) bool {
+	switch s {
+	case "for", "in", "generate", "loop", "if", "then", "else", "elsif", "end",
+		"begin", "is", "when", "case", "of", "signal", "variable", "constant",
+		"type", "subtype", "array", "record", "range", "others", "null",
+		"process", "function", "procedure", "package", "entity", "architecture",
+		"component", "port", "generic", "map", "use", "library", "all",
+		"and", "or", "not", "xor", "nand", "nor", "xnor",
+		"abs", "mod", "rem", "sll", "srl", "sla", "sra", "rol", "ror":
+		return true
+	default:
+		return false
+	}
 }
 
 // parseForGenerateRange extracts low/high/dir from for-generate text
@@ -2759,7 +3154,7 @@ func (e *Extractor) extractIfGenerateDetails(node *sitter.Node, source []byte, g
 }
 
 // extractGenerateBody extracts signals, instances, and processes from generate body
-func (e *Extractor) extractGenerateBody(node *sitter.Node, source []byte, gen *GenerateStatement) {
+func (e *Extractor) extractGenerateBody(node *sitter.Node, source []byte, gen *GenerateStatement, declaredSignals map[string]bool) {
 	var walk func(n *sitter.Node)
 	walk = func(n *sitter.Node) {
 		if n == nil {
@@ -2772,6 +3167,19 @@ func (e *Extractor) extractGenerateBody(node *sitter.Node, source []byte, gen *G
 		case "signal_declaration":
 			signals := e.extractSignals(n, source, gen.Label)
 			gen.Signals = append(gen.Signals, signals...)
+			for _, sig := range signals {
+				addDeclaredSignalName(declaredSignals, sig.Name)
+			}
+			if signalDeclarationHasDefault(n, source) {
+				for _, sig := range signals {
+					gen.SignalUsages = append(gen.SignalUsages, SignalUsage{
+						Signal:    sig.Name,
+						IsWritten: true,
+						InProcess: "",
+						Line:      sig.Line,
+					})
+				}
+			}
 			return // Don't recurse into signal declaration
 
 		case "component_instantiation":
@@ -2780,13 +3188,13 @@ func (e *Extractor) extractGenerateBody(node *sitter.Node, source []byte, gen *G
 			return // Don't recurse into instance
 
 		case "process_statement":
-			proc := e.extractProcess(n, source, gen.Label)
+			proc := e.extractProcess(n, source, gen.Label, declaredSignals)
 			gen.Processes = append(gen.Processes, proc)
 			return // Don't recurse into process
 
 		case "signal_assignment":
 			// Concurrent signal assignment inside generate block
-			ca := e.extractConcurrentAssignment(n, source, gen.InArch+"."+gen.Label)
+			ca := e.extractConcurrentAssignment(n, source, gen.InArch+"."+gen.Label, declaredSignals)
 			gen.ConcurrentAssignments = append(gen.ConcurrentAssignments, ca)
 			// Track signal usages
 			gen.SignalUsages = append(gen.SignalUsages, SignalUsage{
@@ -2807,7 +3215,7 @@ func (e *Extractor) extractGenerateBody(node *sitter.Node, source []byte, gen *G
 
 		case "generate_statement":
 			// Nested generate - extract recursively
-			nested := e.extractGenerateStatement(n, source, gen.InArch+"."+gen.Label)
+			nested := e.extractGenerateStatement(n, source, gen.InArch+"."+gen.Label, declaredSignals)
 			gen.Generates = append(gen.Generates, nested)
 			return // Don't recurse - already handled
 		}
@@ -3493,10 +3901,10 @@ func DetectCDCCrossings(facts *FileFacts) []CDCCrossing {
 	}
 	signalWriters := make(map[string][]writeInfo)
 
-	// Build map: signal -> bit width estimate (for multi-bit detection)
+	// Build map: signal -> bit width (for multi-bit detection)
 	signalWidths := make(map[string]int)
 	for _, sig := range facts.Signals {
-		signalWidths[strings.ToLower(sig.Name)] = estimateSignalWidth(sig.Type)
+		signalWidths[strings.ToLower(sig.Name)] = CalculateWidth(sig.Type)
 	}
 
 	// Collect all sequential processes and their writes
@@ -3627,24 +4035,26 @@ func detectSynchronizers(processes []Process) map[string]int {
 	return result
 }
 
-// estimateSignalWidth guesses the bit width from a VHDL type string
-func estimateSignalWidth(typeStr string) int {
-	typeLower := strings.ToLower(typeStr)
+// CalculateWidth computes the exact bit width from a VHDL type string
+// Returns the width in bits, or 0 if the width cannot be determined
+// (e.g., parameterized types like std_logic_vector(WIDTH-1 downto 0))
+func CalculateWidth(typeStr string) int {
+	typeLower := strings.ToLower(strings.TrimSpace(typeStr))
 
-	// Single-bit types
-	if typeLower == "std_logic" || typeLower == "std_ulogic" ||
-		typeLower == "bit" || typeLower == "boolean" {
+	// Single-bit types - exact width known
+	switch typeLower {
+	case "std_logic", "std_ulogic", "bit", "boolean":
 		return 1
 	}
 
-	// Vector types - try to extract width
+	// Vector types with explicit numeric range
 	// std_logic_vector(7 downto 0) -> 8 bits
-	// std_logic_vector(WIDTH-1 downto 0) -> unknown, assume multi-bit
+	// unsigned(15 downto 0) -> 16 bits
 	if strings.Contains(typeLower, "vector") ||
-		strings.Contains(typeLower, "unsigned") ||
-		strings.Contains(typeLower, "signed") {
-		// Try to find numeric range
-		if match := regexp.MustCompile(`(\d+)\s+(?:downto|to)\s+(\d+)`).FindStringSubmatch(typeLower); match != nil {
+		strings.HasPrefix(typeLower, "unsigned") ||
+		strings.HasPrefix(typeLower, "signed") {
+		// Match: (number downto/to number)
+		if match := regexp.MustCompile(`\(\s*(\d+)\s+(?:downto|to)\s+(\d+)\s*\)`).FindStringSubmatch(typeLower); match != nil {
 			high, _ := strconv.Atoi(match[1])
 			low, _ := strconv.Atoi(match[2])
 			width := high - low
@@ -3653,17 +4063,38 @@ func estimateSignalWidth(typeStr string) int {
 			}
 			return width + 1
 		}
-		// Has a range but couldn't parse - assume multi-bit
-		return 8 // Conservative guess
+		// Parameterized range (e.g., WIDTH-1 downto 0) - cannot calculate
+		return 0
 	}
 
-	// Integer types
+	// Integer subtypes with explicit range
+	// integer range 0 to 255 -> 8 bits (ceil(log2(256)))
+	// natural range 0 to 7 -> 3 bits
+	if match := regexp.MustCompile(`(?:integer|natural|positive)\s+range\s+(\d+)\s+to\s+(\d+)`).FindStringSubmatch(typeLower); match != nil {
+		low, _ := strconv.Atoi(match[1])
+		high, _ := strconv.Atoi(match[2])
+		rangeSize := high - low + 1
+		if rangeSize <= 0 {
+			return 0
+		}
+		// Calculate bits needed: ceil(log2(rangeSize))
+		bits := 0
+		for n := rangeSize - 1; n > 0; n >>= 1 {
+			bits++
+		}
+		if bits == 0 {
+			bits = 1
+		}
+		return bits
+	}
+
+	// Unconstrained integer types - implementation defined, return 0
 	if typeLower == "integer" || typeLower == "natural" || typeLower == "positive" {
-		return 32
+		return 0 // Width is implementation-defined
 	}
 
-	// Unknown type - assume single bit to avoid false positives
-	return 1
+	// Unknown or custom type - return 0 (need type lookup)
+	return 0
 }
 
 // extractBaseSignalName extracts the base signal name from an expression

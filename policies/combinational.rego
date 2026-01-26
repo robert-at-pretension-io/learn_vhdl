@@ -68,6 +68,7 @@ empty_sensitivity_combinational[violation] {
     proc.is_combinational == true
     count(proc.sensitivity_list) == 0
     count(proc.assigned_signals) > 0
+    not helpers.process_in_testbench(proc)
     violation := {
         "rule": "empty_sensitivity_combinational",
         "severity": "error",
@@ -225,8 +226,10 @@ is_loop_false_positive(sig) {
 cross_process_loop[violation] {
     proc1 := input.processes[_]
     proc1.is_combinational == true
+    not helpers.process_in_testbench(proc1)
     proc2 := input.processes[_]
     proc2.is_combinational == true
+    not helpers.process_in_testbench(proc2)
     proc1.label != proc2.label
 
     # proc1 writes sig_a, reads sig_b

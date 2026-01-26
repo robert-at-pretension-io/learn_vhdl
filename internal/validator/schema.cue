@@ -8,6 +8,7 @@ package schema
 // Input is the root structure passed to OPA
 // This MUST match policy.Input in Go exactly
 #Input: {
+    standard:              "1993" | "2002" | "2008" | "2019"
     entities:               [...#Entity]
     architectures:          [...#Architecture]
     packages:               [...#Package]

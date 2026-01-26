@@ -83,6 +83,7 @@ output_port_read[violation] {
     port := input.ports[_]
     port.direction == "out"
     port_is_read(port.name, port.in_entity)
+    is_legacy_standard
     violation := {
         "rule": "output_port_read",
         "severity": "info",
@@ -90,6 +91,13 @@ output_port_read[violation] {
         "line": port.line,
         "message": sprintf("Output port '%s' is read internally (use buffer or internal signal for VHDL-93 compatibility)", [port.name])
     }
+}
+
+is_legacy_standard {
+    input.standard == "1993"
+}
+is_legacy_standard {
+    input.standard == "2002"
 }
 
 # Rule: Inout port used as output only (consider using 'out' direction)

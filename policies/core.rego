@@ -8,6 +8,7 @@ import data.vhdl.helpers
 missing_ports[violation] {
     entity := input.entities[_]
     count(entity.ports) == 0
+    not helpers.is_testbench_name(entity.name)
     violation := {
         "rule": "entity_has_ports",
         "severity": "warning",
@@ -54,13 +55,22 @@ unresolved_component[violation] {
 # Helper: Check if component or entity exists
 component_or_entity_exists(name) {
     entity := input.entities[_]
-    lower(entity.name) == lower(name)
+    lower(entity.name) == base_entity_name(name)
 }
 
 component_or_entity_exists(name) {
     comp := input.components[_]
     comp.is_instance == false
-    lower(comp.name) == lower(name)
+    lower(comp.name) == base_entity_name(name)
+}
+
+base_entity_name(name) := lower(name) {
+    not contains(name, ".")
+}
+
+base_entity_name(name) := lower(parts[count(parts) - 1]) {
+    parts := split(name, ".")
+    count(parts) > 1
 }
 
 # Rule: Unresolved dependencies (excluding standard libraries)

@@ -298,6 +298,7 @@ duplicate_signal_in_entity[violation] {
     sig1 := input.signals[i]
     sig2 := input.signals[j]
     i < j
+    sig1.file == sig2.file
     sig1.in_entity == sig2.in_entity
     lower(sig1.name) == lower(sig2.name)
     violation := {

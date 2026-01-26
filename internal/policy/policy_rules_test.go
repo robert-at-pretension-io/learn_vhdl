@@ -17,8 +17,12 @@ func TestPolicyRuleFixtures(t *testing.T) {
 	repoRoot := findRepoRoot(t)
 	fixturesDir := filepath.Join(repoRoot, "testdata", "policy_rules")
 	manifestPath := filepath.Join(fixturesDir, "manifest.json")
+	negativeManifestPath := filepath.Join(fixturesDir, "manifest_negative.json")
 
 	manifest := loadManifest(t, manifestPath)
+	negativeManifest := loadManifest(t, negativeManifestPath)
+	ensureManifestParity(t, manifest, negativeManifest)
+
 	byFile := map[string][]string{}
 	for rule, file := range manifest {
 		byFile[file] = append(byFile[file], rule)
@@ -33,6 +37,25 @@ func TestPolicyRuleFixtures(t *testing.T) {
 			for _, rule := range rules {
 				if !hasRule(result, rule) {
 					t.Fatalf("expected rule %q for %s; got rules: %v", rule, relFile, collectRules(result))
+				}
+			}
+		})
+	}
+
+	negativeByFile := map[string][]string{}
+	for rule, file := range negativeManifest {
+		negativeByFile[file] = append(negativeByFile[file], rule)
+	}
+
+	for relFile, rules := range negativeByFile {
+		relFile := relFile
+		rules := rules
+		t.Run(relFile+"_negative", func(t *testing.T) {
+			filePath := filepath.Join(fixturesDir, relFile)
+			result := lintFile(t, repoRoot, filePath)
+			for _, rule := range rules {
+				if hasRule(result, rule) {
+					t.Fatalf("did not expect rule %q for %s; got rules: %v", rule, relFile, collectRules(result))
 				}
 			}
 		})
@@ -127,6 +150,26 @@ func collectRules(result indexer.LintResult) []string {
 		rules = append(rules, v.Rule)
 	}
 	return rules
+}
+
+func ensureManifestParity(t *testing.T, positive, negative ruleManifest) {
+	t.Helper()
+
+	if len(positive) != len(negative) {
+		t.Fatalf("manifest mismatch: %d positive rules, %d negative rules", len(positive), len(negative))
+	}
+
+	for rule := range positive {
+		if _, ok := negative[rule]; !ok {
+			t.Fatalf("negative manifest missing rule %q", rule)
+		}
+	}
+
+	for rule := range negative {
+		if _, ok := positive[rule]; !ok {
+			t.Fatalf("positive manifest missing rule %q", rule)
+		}
+	}
 }
 
 func findRepoRoot(t *testing.T) string {

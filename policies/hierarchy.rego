@@ -170,8 +170,97 @@ port_connected_in_instance(inst, port_name) {
     lower(k) == lower(port_name)
 }
 
+# Rule: Port width mismatch - connected signal width differs from port width
+# This catches silent truncation bugs where a 12-bit signal connects to a 10-bit port
+port_width_mismatch[violation] {
+    inst := input.instances[_]
+    # Find the entity being instantiated
+    entity := input.entities[_]
+    inst_target_lower := lower(inst.target)
+    target_matches_entity(inst_target_lower, lower(entity.name))
+    # For each port connection
+    port := entity.ports[_]
+    port.width > 0  # Only check if port width is known
+    # Get the connected signal name from port map
+    actual_signal := get_port_connection(inst, port.name)
+    actual_signal != ""
+    actual_signal != "open"
+    # Skip literals and expressions (only check signals)
+    not is_literal_or_expr(actual_signal)
+    # Find the connected signal's width
+    signal_width := get_signal_width(actual_signal)
+    signal_width > 0  # Only check if signal width is known
+    # Check for mismatch
+    signal_width != port.width
+    violation := {
+        "rule": "port_width_mismatch",
+        "severity": "error",
+        "file": inst.file,
+        "line": inst.line,
+        "message": sprintf("Width mismatch: signal '%s' (%d bits) connected to port '%s' (%d bits) in instance '%s'",
+            [actual_signal, signal_width, port.name, port.width, inst.name])
+    }
+}
+
+# Helper: Get the actual signal connected to a port (case-insensitive lookup)
+get_port_connection(inst, port_name) = actual {
+    actual := inst.port_map[port_name]
+}
+get_port_connection(inst, port_name) = actual {
+    actual := inst.port_map[k]
+    lower(k) == lower(port_name)
+}
+
+# Helper: Check if a string looks like a literal or expression (not a signal name)
+is_literal_or_expr(s) {
+    # Starts with digit (numeric literal)
+    regex.match(`^[0-9]`, s)
+}
+is_literal_or_expr(s) {
+    # Contains operators (expression)
+    contains(s, "+")
+}
+is_literal_or_expr(s) {
+    contains(s, "-")
+}
+is_literal_or_expr(s) {
+    contains(s, "*")
+}
+is_literal_or_expr(s) {
+    contains(s, "&")
+}
+is_literal_or_expr(s) {
+    # Bit string literal
+    regex.match(`^[xXbBoO]"`, s)
+}
+is_literal_or_expr(s) {
+    # Character literal
+    regex.match(`^'.'$`, s)
+}
+is_literal_or_expr(s) {
+    # others aggregate
+    contains(lower(s), "others")
+}
+
+# Helper: Get width of a signal by name (case-insensitive)
+# Returns the width from signals or ports - takes the max if multiple matches
+get_signal_width(signal_name) = width {
+    # Collect all matching widths from signals and ports
+    all_widths := {w |
+        sig := input.signals[_]
+        lower(sig.name) == lower(signal_name)
+        w := sig.width
+    } | {w |
+        port := input.ports[_]
+        lower(port.name) == lower(signal_name)
+        w := port.width
+    }
+    count(all_widths) > 0
+    width := max(all_widths)  # Deterministic: return max width
+}
+
 # Aggregate hierarchy violations
-violations := empty_port_map | floating_instance_input
+violations := empty_port_map | floating_instance_input | port_width_mismatch
 
 # Optional violations (mostly informational)
 optional_violations := sparse_port_map | instance_name_matches_component | repeated_component_instantiation | many_instances | hardcoded_port_value | open_port_connection

@@ -176,13 +176,20 @@ signal_is_assigned(sig_name) {
     usage.in_port_map == true
     lower(usage.signal) == lower(sig_name)
 }
+signal_is_assigned(sig_name) {
+    # Initialized at declaration or tracked as written usage
+    usage := input.signal_usages[_]
+    usage.is_written == true
+    lower(usage.signal) == lower(sig_name)
+}
 
 # Rule: Signal assigned in multiple places (potential multi-driver)
 # Now checks both processes and concurrent assignments
+# Scoped to same entity to avoid cross-entity false positives
 # Severity: warning (not error) because record field assignments create false positives
 multi_driven_signal[violation] {
     sig := input.signals[_]
-    driver_count := count_drivers(sig.name)
+    driver_count := count_drivers_in_entity(sig.name, sig.in_entity)
     driver_count > 1
     violation := {
         "rule": "multi_driven_signal",
@@ -248,12 +255,17 @@ undeclared_signal_usage[violation] {
 }
 
 # Rule: Input port driven inside architecture (illegal)
+# Must scope to same entity - process in architecture of entity E can only drive ports of E
 input_port_driven[violation] {
     port := input.ports[_]
     lower(port.direction) == "in"
     proc := input.processes[_]
     assigned := proc.assigned_signals[_]
     lower(assigned) == lower(port.name)
+    # Check that the process is in an architecture of the same entity as the port
+    arch := input.architectures[_]
+    arch.name == proc.in_arch
+    lower(arch.entity_name) == lower(port.in_entity)
     violation := {
         "rule": "input_port_driven",
         "severity": "error",
@@ -267,6 +279,10 @@ input_port_driven[violation] {
     lower(port.direction) == "in"
     ca := input.concurrent_assignments[_]
     lower(ca.target) == lower(port.name)
+    # Check that the concurrent assignment is in an architecture of the same entity as the port
+    arch := input.architectures[_]
+    arch.name == ca.in_arch
+    lower(arch.entity_name) == lower(port.in_entity)
     violation := {
         "rule": "input_port_driven",
         "severity": "error",
@@ -276,7 +292,7 @@ input_port_driven[violation] {
     }
 }
 
-# Helper: Count total drivers for a signal
+# Helper: Count total drivers for a signal (global - used by some rules)
 # Assignments inside the same generate block count as 1 driver (not N)
 count_drivers(sig_name) = total {
     proc_drivers := count([p | p := input.processes[_]; sig_assigned_in_process(sig_name, p)])
@@ -292,6 +308,39 @@ count_drivers(sig_name) = total {
         lower(ca.target) == lower(sig_name)
         ca.in_generate
         label := ca.generate_label
+    })
+    total := proc_drivers + non_gen_drivers + gen_drivers
+}
+
+# Helper: Count drivers for a signal scoped to a specific entity
+# Prevents cross-entity false positives (e.g., signal 'clk' in different entities)
+count_drivers_in_entity(sig_name, entity_name) = total {
+    # Count processes in architectures of this entity that assign this signal
+    proc_drivers := count([p |
+        p := input.processes[_]
+        sig_assigned_in_process(sig_name, p)
+        arch := input.architectures[_]
+        arch.name == p.in_arch
+        lower(arch.entity_name) == lower(entity_name)
+    ])
+    # Count non-generate concurrent assignments in architectures of this entity
+    non_gen_drivers := count([ca |
+        ca := input.concurrent_assignments[_]
+        lower(ca.target) == lower(sig_name)
+        not ca.in_generate
+        arch := input.architectures[_]
+        arch.name == ca.in_arch
+        lower(arch.entity_name) == lower(entity_name)
+    ])
+    # Count distinct generate blocks that assign this signal in this entity
+    gen_drivers := count({label |
+        ca := input.concurrent_assignments[_]
+        lower(ca.target) == lower(sig_name)
+        ca.in_generate
+        label := ca.generate_label
+        arch := input.architectures[_]
+        arch.name == ca.in_arch
+        lower(arch.entity_name) == lower(entity_name)
     })
     total := proc_drivers + non_gen_drivers + gen_drivers
 }

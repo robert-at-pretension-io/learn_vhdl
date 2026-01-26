@@ -40,6 +40,7 @@ type Summary struct {
 
 // Input is the data structure passed to OPA
 type Input struct {
+	Standard              string               `json:"standard"`
 	Entities              []Entity               `json:"entities"`
 	Architectures         []Architecture         `json:"architectures"`
 	Packages              []Package              `json:"packages"`

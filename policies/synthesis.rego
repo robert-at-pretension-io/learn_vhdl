@@ -110,6 +110,7 @@ is_critical_signal_name(name) {
 gated_clock_detection[violation] {
     ca := input.concurrent_assignments[_]
     helpers.is_clock_name(ca.target)
+    not is_testbench_arch(ca.in_arch)
     violation := {
         "rule": "gated_clock_detection",
         "severity": "warning",
@@ -124,6 +125,7 @@ gated_clock_detection[violation] {
     proc.is_combinational == true
     assigned := proc.assigned_signals[_]
     helpers.is_clock_name(assigned)
+    not helpers.process_in_testbench(proc)
     violation := {
         "rule": "gated_clock_detection",
         "severity": "warning",
@@ -131,6 +133,12 @@ gated_clock_detection[violation] {
         "line": proc.line,
         "message": sprintf("Clock signal '%s' assigned in combinational process - potential gated clock", [assigned])
     }
+}
+
+is_testbench_arch(arch_name) {
+    arch := input.architectures[_]
+    lower(arch.name) == lower(arch_name)
+    helpers.is_testbench_name(arch.entity_name)
 }
 
 # Rule: Async reset generated combinationally

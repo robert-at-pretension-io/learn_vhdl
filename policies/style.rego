@@ -104,12 +104,14 @@ architecture_naming_convention[violation] {
 # Disabled by default - too noisy
 empty_architecture[violation] {
     arch := input.architectures[_]
-    signals_in_arch := [s | s := input.signals[_]; s.in_entity == arch.entity_name]
+    signals_in_arch := [s | s := input.signals[_]; s.in_entity == arch.name]
     instances_in_arch := [i | i := input.instances[_]; i.in_arch == arch.name]
     processes_in_arch := [p | p := input.processes[_]; p.in_arch == arch.name]
+    assigns_in_arch := [a | a := input.concurrent_assignments[_]; a.in_arch == arch.name]
     count(signals_in_arch) == 0
     count(instances_in_arch) == 0
     count(processes_in_arch) == 0
+    count(assigns_in_arch) == 0
     violation := {
         "rule": "empty_architecture",
         "severity": "warning",

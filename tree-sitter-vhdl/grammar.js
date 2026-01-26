@@ -198,7 +198,7 @@ module.exports = grammar({
   conflicts: $ => [
     [$.package_declaration, $._package_declarative_item],
     [$._type_name, $._simple_name],
-    [$._type_name, $._function_call_in_expr, $._simple_name],
+    [$._type_name, $.function_call, $._simple_name],
     [$._primary_expression, $._expression_term],
     [$._index_spec, $._primary_expression],
     [$.association_element, $._index_expression_item],
@@ -207,7 +207,7 @@ module.exports = grammar({
     [$._array_index_constraint, $._simple_name],
     [$._type_name, $._array_index_constraint, $._simple_name],
     [$._index_spec, $._primary_expression, $._expression_term],
-    [$._function_call_in_expr, $._simple_name],
+    [$.function_call, $._simple_name],
     [$._index_spec, $._index_expression_item],
     [$._constant_value, $._simple_name],
     [$._entity_aspect, $._simple_name],
@@ -596,7 +596,7 @@ module.exports = grammar({
       repeat(seq(',', $.identifier)),  // Multiple names: a, b : integer
       ':',
       field('type', $._type_mark),
-      optional(seq(':=', field('value', $._constant_value))),
+      optional(seq(':=', $._constant_value)),
       ';'
     ),
 
@@ -1211,16 +1211,18 @@ module.exports = grammar({
       $.character_literal,
       $.qualified_expression,
       $._name,
-      seq($._function_call_in_expr, '.', choice($.identifier, $._kw_all)),
-      $._function_call_in_expr,  // Function calls like to_hstring(x)
+      seq($.function_call, '.', choice($.identifier, $._kw_all)),
+      $.function_call,  // Function calls like to_hstring(x)
       '&'  // String concatenation operator
     )),
 
     // Function call in expression context: func(arg) or func(a, b)
-    _function_call_in_expr: $ => seq(
-      $.identifier,
+    // Note: VHDL syntax is ambiguous - this can't distinguish func(x) from arr(i)
+    // at parse time. Semantic analysis is needed for definitive classification.
+    function_call: $ => seq(
+      field('name', $.identifier),
       '(',
-      optional(seq($._expression, repeat(seq(',', $._expression)))),
+      field('arguments', optional(seq($._expression, repeat(seq(',', $._expression))))),
       ')'
     ),
 
@@ -1752,7 +1754,7 @@ module.exports = grammar({
       repeat(seq(',', $.identifier)),
       ':',
       $._signal_type_indication,
-      optional(seq(':=', $._constant_value)),
+      optional(seq(':=', field('value', $._constant_value))),
       ';'
     ),
 
@@ -1818,7 +1820,7 @@ module.exports = grammar({
       $._kw_for,
       field('loop_var', $.identifier),
       $._kw_in,
-      field('range', $._discrete_range),
+      field('range', alias($._discrete_range, $.discrete_range)),  // Visible wrapper for ChildByFieldName
       $._kw_generate,
       optional($._generate_body),
       $._kw_end, $._kw_generate, optional($.identifier), ';'
@@ -1902,10 +1904,19 @@ module.exports = grammar({
       $._expression  // Attribute like vec'range
     ),
 
+    // Visible range expression with named fields for low/high/direction
+    // Used for easier extraction of for-generate ranges
+    range_expression: $ => seq(
+      field('low', $._expression),
+      field('direction', alias(choice($._kw_to, $._kw_downto), $.direction)),  // Visible wrapper for direction
+      field('high', $._expression)
+    ),
+
     // Discrete range: range or subtype indication (used in loops/slices)
     _discrete_range: $ => choice(
       $._index_subtype_indication,
-      $._range_or_expression
+      $.range_expression,  // Use visible range_expression for explicit ranges
+      $._expression  // Attribute like vec'range (fallback)
     ),
 
     // Block statement with optional generic/port interface
@@ -1939,7 +1950,7 @@ module.exports = grammar({
     // Simple signal assignment with waveform: signal <= [transport] value [after time] {, value [after time]};
     _simple_signal_assignment: $ => seq(
       optional(seq($.identifier, ':')),
-      $._assignment_target,  // Can be indexed or aggregate
+      field('target', alias($._assignment_target, $.assignment_target)),  // Visible wrapper for ChildByFieldName
       '<=',
       optional($._kw_guarded),  // For guarded signal assignments in blocks
       optional($._delay_mechanism),  // Optional delay mechanism
@@ -1955,7 +1966,7 @@ module.exports = grammar({
     // target <= expr [after time] when cond else expr [after time] when cond else expr [after time];
     _conditional_signal_assignment: $ => prec.dynamic(5, seq(
       optional(seq($.identifier, ':')),
-      $._assignment_target,  // Can be indexed or aggregate
+      field('target', alias($._assignment_target, $.assignment_target)),  // Visible wrapper for ChildByFieldName
       '<=',
       optional($._kw_guarded),
       optional($._delay_mechanism),
@@ -1972,7 +1983,7 @@ module.exports = grammar({
       $._kw_with,
       $._expression,
       $._kw_select,
-      $._assignment_target,  // Can be indexed or aggregate
+      field('target', alias($._assignment_target, $.assignment_target)),  // Visible wrapper for ChildByFieldName
       '<=',
       optional($._delay_mechanism),
       $._waveform,
@@ -1997,7 +2008,7 @@ module.exports = grammar({
     // VHDL-2008 force/release
     _force_release_assignment: $ => prec.dynamic(1, seq(
       optional(seq($.identifier, ':')),
-      $._name,  // Can be indexed: data(i) <= force ...
+      field('target', alias($._name, $.assignment_target)),  // Visible wrapper for ChildByFieldName
       '<=',
       choice($._kw_force, $._kw_release),
       optional($._expression),
@@ -2195,7 +2206,7 @@ module.exports = grammar({
     // Supports waveform: signal <= value [after time] {, value [after time]};
     sequential_signal_assignment: $ => prec.dynamic(10, seq(
       optional(seq($.identifier, ':')),
-      $._assignment_target,  // Includes unified names and aggregates
+      field('target', alias($._assignment_target, $.assignment_target)),  // Visible wrapper for ChildByFieldName
       '<=',
       optional($._delay_mechanism),
       $._waveform_element,
@@ -2421,12 +2432,12 @@ module.exports = grammar({
     if_statement: $ => seq(
       optional(seq(field('label', $.identifier), ':')),  // VHDL-2008: optional label
       $._kw_if,
-      $._expression,  // condition
+      field('condition', alias($._expression, $.condition)),  // Wrapper node for ChildByFieldName
       $._kw_then,
       repeat($._sequential_statement),
       repeat(seq(  // elsif clauses
         $._kw_elsif,
-        $._expression,
+        alias($._expression, $.condition),  // elsif conditions also wrapped
         $._kw_then,
         repeat($._sequential_statement)
       )),

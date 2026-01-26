@@ -768,6 +768,7 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 	// Initialize all slices to empty (not nil) to ensure JSON serialization
 	// produces [] instead of null - the CUE contract requires arrays
 	input := policy.Input{
+		Standard:              idx.Config.Standard,
 		Entities:              []policy.Entity{},
 		Architectures:         []policy.Architecture{},
 		Packages:              []policy.Package{},
@@ -822,6 +823,7 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 						Type:      p.Type,
 						Line:      p.Line,
 						InEntity:  p.InEntity,
+						Width:     extractor.CalculateWidth(p.Type),
 					})
 				}
 			}
@@ -871,6 +873,7 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 				File:     facts.File,
 				Line:     s.Line,
 				InEntity: s.InEntity,
+				Width:    extractor.CalculateWidth(s.Type),
 			})
 		}
 
@@ -881,6 +884,7 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 				Type:      p.Type,
 				Line:      p.Line,
 				InEntity:  p.InEntity,
+				Width:     extractor.CalculateWidth(p.Type),
 			})
 		}
 
