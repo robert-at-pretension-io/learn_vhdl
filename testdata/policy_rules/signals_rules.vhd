@@ -12,7 +12,7 @@ architecture rtl of signals_rules is
   signal dup_sig       : std_logic;
   signal sig_unused    : std_logic;
   signal sig_read_only : std_logic;
-  signal sig_multi     : std_logic;
+  signal sig_multi     : bit;
   signal wide_bus      : std_logic_vector(255 downto 0);
 begin
   p_read: process(sig_read_only, in_p)

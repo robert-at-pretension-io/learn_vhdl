@@ -52,6 +52,41 @@ begin
   null;
 end quality_misc;
 
+entity dup_ports is
+  port (
+    p : in std_logic;
+    p : out std_logic
+  );
+end dup_ports;
+
+architecture dup_ports of dup_ports is
+begin
+  null;
+end dup_ports;
+
+entity dup_entity is
+  port (
+    a : in std_logic
+  );
+end dup_entity;
+
+architecture impl1 of dup_entity is
+begin
+  null;
+end impl1;
+
+entity dup_entity is
+  port (
+    a : in std_logic;
+    b : out std_logic
+  );
+end dup_entity;
+
+architecture impl2 of dup_entity is
+begin
+  b <= a;
+end impl2;
+
 entity gen_child is
   generic (
     WIDTH : integer := 8

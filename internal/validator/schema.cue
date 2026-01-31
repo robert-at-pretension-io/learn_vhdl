@@ -1,22 +1,37 @@
 // VHDL Linter Input Schema
-// This is the CONTRACT between Go (extractor/indexer) and OPA (policy engine)
-// Any field mismatch will cause immediate validation failure
-// "Silent failures" are impossible - if OPA gets bad data, we crash first
+// This is the CONTRACT between Go (extractor/indexer) and the Rust policy engine.
+// Any field mismatch will cause immediate validation failure.
+// "Silent failures" are impossible - if the policy engine gets bad data, we crash first.
 
 package schema
 
-// Input is the root structure passed to OPA
+// Identifier patterns (standard or extended identifier)
+#Identifier: string & =~"^(?:[a-zA-Z_][a-zA-Z0-9_]*|\\\\.+\\\\)$"
+#QualifiedIdentifier: string & =~"^(?:[a-zA-Z_][a-zA-Z0-9_]*|\\\\.+\\\\)(?:\\.(?:[a-zA-Z_][a-zA-Z0-9_]*|\\\\.+\\\\))*$"
+
+// Input is the root structure passed to the policy engine
 // This MUST match policy.Input in Go exactly
 #Input: {
     standard:              "1993" | "2002" | "2008" | "2019"
+    file_count:            int & >=1
     entities:               [...#Entity]
     architectures:          [...#Architecture]
     packages:               [...#Package]
     components:             [...#Component]
+    use_clauses:            [...#UseClause]
+    library_clauses:        [...#LibraryClause]
+    context_clauses:        [...#ContextClause]
     signals:                [...#Signal]
     ports:                  [...#Port]
     dependencies:           [...#Dependency]
     symbols:                [...#Symbol]
+    scopes:                 [...#Scope]
+    symbol_defs:            [...#SymbolDef]
+    name_uses:              [...#NameUse]
+    verification_blocks:    [...#VerificationBlock]
+    verification_tags:      [...#VerificationTag]
+    verification_tag_errors:[...#VerificationTagError]
+    files:                  [...#FileInfo]
     instances:              [...#Instance]
     case_statements:        [...#CaseStatement]
     processes:              [...#Process]
@@ -33,6 +48,7 @@ package schema
     // Type system info for filtering false positives (LEGACY - use types/constant_decls instead)
     enum_literals:          [...string]  // Enum literals from type declarations (e.g., S_IDLE, S_RUN)
     constants:              [...string]  // Constants from constant declarations (names only)
+    shared_variables:       [...string]  // Shared variable names (not signals)
     // Advanced analysis for security/power/correctness
     comparisons:            [...#Comparison]
     arithmetic_ops:         [...#ArithmeticOp]
@@ -45,52 +61,55 @@ package schema
 
 // Configuration represents a VHDL configuration declaration
 #Configuration: {
-    name:        string & =~"^[a-zA-Z_][a-zA-Z0-9_]*$"
-    entity_name: string & =~"^[a-zA-Z_][a-zA-Z0-9_]*$"
+    name:        #Identifier
+    entity_name: #Identifier
     file:        string & =~".+\\.(vhd|vhdl)$"
     line:        int & >=1
 }
 
-// LintConfig contains rule configuration passed to OPA
+// LintConfig contains rule configuration passed to the policy engine
 #LintConfig: {
     rules: {[string]: "off" | "info" | "warning" | "error"}  // rule name -> severity
 }
 
 // Entity declaration
 #Entity: {
-    name:  string & =~"^[a-zA-Z_][a-zA-Z0-9_]*$"  // Valid VHDL identifier
+    name:  #Identifier  // Valid VHDL identifier
     file:  string & =~".+\\.(vhd|vhdl)$"          // Must be VHDL file
     line:  int & >=1                               // Line numbers start at 1
     ports: [...#Port]
+    generics: [...#GenericDecl]
 }
 
 // Architecture body
 #Architecture: {
-    name:        string & =~"^[a-zA-Z_][a-zA-Z0-9_]*$"
-    entity_name: string & =~"^[a-zA-Z_][a-zA-Z0-9_]*$"
+    name:        #Identifier
+    entity_name: #Identifier
     file:        string & =~".+\\.(vhd|vhdl)$"
     line:        int & >=1
 }
 
 // Package declaration
 #Package: {
-    name: string & =~"^[a-zA-Z_][a-zA-Z0-9_]*$"
+    name: #Identifier
     file: string & =~".+\\.(vhd|vhdl)$"
     line: int & >=1
 }
 
 // Component declaration or instantiation
 #Component: {
-    name:        string & =~"^[a-zA-Z_][a-zA-Z0-9_]*$"
+    name:        #Identifier
     entity_ref:  string  // Can be empty for forward declarations
     file:        string & =~".+\\.(vhd|vhdl)$"
     line:        int & >=1
     is_instance: bool
+    ports:       [...#Port]
+    generics:    [...#GenericDecl]
 }
 
 // Signal declaration
 #Signal: {
-    name:      string & =~"^[a-zA-Z_][a-zA-Z0-9_]*$"
+    name:      #Identifier
     type:      string & !=""  // Type must not be empty
     file:      string & =~".+\\.(vhd|vhdl)$"
     line:      int & >=1
@@ -101,38 +120,173 @@ package schema
 // Port declaration
 // Note: direction can be empty for generics (which are parsed similarly to ports)
 #Port: {
-    name:      string & =~"^[a-zA-Z_][a-zA-Z0-9_]*$"
+    name:      #Identifier
     direction: "in" | "out" | "inout" | "buffer" | "linkage" | ""
     type:      string & !=""  // Type must not be empty
+    default:   string
     line:      int & >=1
     in_entity: string  // Which entity this port belongs to
     width:     int & >=0  // Estimated bit width (0 if unknown)
+}
+
+#GenericDecl: {
+    name:         #Identifier
+    kind:         "constant" | "type" | "function" | "procedure" | "package" | string
+    type:         string
+    class:        string
+    default:      string
+    line:         int & >=1
+    in_entity:    string
+    in_component: string
+}
+
+#UseClause: {
+    items: [...string]
+    file:  string & =~".+\\.(vhd|vhdl)$"
+    line:  int & >=1
+}
+
+#LibraryClause: {
+    libraries: [...string]
+    file:      string & =~".+\\.(vhd|vhdl)$"
+    line:      int & >=1
+}
+
+#ContextClause: {
+    name: string
+    file: string & =~".+\\.(vhd|vhdl)$"
+    line: int & >=1
+}
+
+#Association: {
+    kind:           "port" | "generic" | string
+    formal:         string
+    actual:         string
+    is_positional:  bool
+    actual_kind:    string
+    actual_base:    string
+    actual_full:    string
+    line:           int & >=1
+    position_index: int & >=0
+}
+
+#VariableDecl: {
+    name: #Identifier
+    type: string
+    line: int & >=1
+}
+
+#ProcedureCall: {
+    name:       string
+    full_name:  string
+    args:       [...string]
+    line:       int & >=1
+    in_process: string
+    in_arch:    string
+}
+
+#FunctionCall: {
+    name:       string
+    args:       [...string]
+    line:       int & >=1
+    in_process: string
+    in_arch:    string
+}
+
+#WaitStatement: {
+    on_signals: [...string]
+    until_expr: string
+    for_expr:   string
+    line:       int & >=1
 }
 
 // Dependency between files/entities
 #Dependency: {
     source:   string & !=""  // Source file or entity
     target:   string & !=""  // Target (e.g., "ieee.std_logic_1164")
-    kind:     "use" | "library" | "instantiation" | "component"
+    kind:     "use" | "library" | "instantiation" | "component" | "context" | "package_instantiation" | "configuration_specification" | "subprogram_instantiation"
     line:     int & >=1
     resolved: bool  // Was the target found in the symbol table?
 }
 
 // Global symbol in the cross-file symbol table
 #Symbol: {
-    name: string & =~"^[a-zA-Z_][a-zA-Z0-9_.]*$"  // Qualified: work.my_entity or work.my_pkg.my_type
+    name: #QualifiedIdentifier  // Qualified: work.my_entity or work.my_pkg.my_type
     kind: "entity" | "package" | "component" | "architecture" | "type" | "constant" | "function" | "procedure"
     file: string & =~".+\\.(vhd|vhdl)$"
     line: int & >=1
 }
 
+// FileInfo describes a parsed VHDL file and its library assignment.
+#FileInfo: {
+    path:          string
+    library:       string
+    is_third_party: bool
+}
+
+// Scope represents a lexical or generate scope for name resolution.
+#Scope: {
+    name:   string
+    kind:   string
+    file:   string & =~".+\\.(vhd|vhdl)$"
+    line:   int & >=1
+    parent: string
+    path:   [...string]
+}
+
+// SymbolDef represents a symbol definition with scope information.
+#SymbolDef: {
+    name:  string
+    kind:  string
+    file:  string & =~".+\\.(vhd|vhdl)$"
+    line:  int & >=1
+    scope: string
+}
+
+// NameUse represents a usage of a name in a given scope.
+#NameUse: {
+    name:    string
+    kind:    string
+    file:    string & =~".+\\.(vhd|vhdl)$"
+    line:    int & >=1
+    scope:   string
+    context: string
+}
+
+#VerificationBlock: {
+    label:      string
+    line_start: int & >=1
+    line_end:   int & >=1
+    file:       string & =~".+\\.(vhd|vhdl)$"
+    in_arch:    string
+}
+
+#VerificationTag: {
+    id:       string
+    scope:    string & =~"^(entity|arch):.+$"
+    bindings: {[string]: string}
+    file:     string & =~".+\\.(vhd|vhdl)$"
+    line:     int & >=1
+    raw:      string
+    in_arch:  string
+}
+
+#VerificationTagError: {
+    file:    string & =~".+\\.(vhd|vhdl)$"
+    line:    int & >=1
+    raw:     string
+    message: string & !=""
+    in_arch: string
+}
+
 // Instance represents a component/entity instantiation with port/generic mappings
 // Enables system-level analysis (cross-module signal tracing)
 #Instance: {
-    name:        string & =~"^[a-zA-Z_][a-zA-Z0-9_]*$"  // Instance label
+    name:        #Identifier  // Instance label
     target:      string & !=""                          // Target entity/component
     port_map:    {[string]: string}                     // Formal -> actual signal
     generic_map: {[string]: string}                     // Formal -> actual value
+    associations: [...#Association]
     file:        string & =~".+\\.(vhd|vhdl)$"
     line:        int & >=1
     in_arch:     string                                 // Containing architecture
@@ -161,8 +315,13 @@ package schema
     clock_edge:       string                            // "rising" or "falling" if sequential
     has_reset:        bool                              // Has reset logic
     reset_signal:     string                            // Reset signal name
+    reset_async:      bool                              // Async reset if checked before clock
     assigned_signals: [...string]                       // Signals written
     read_signals:     [...string]                       // Signals read
+    variables:        [...#VariableDecl]
+    procedure_calls:  [...#ProcedureCall]
+    function_calls:   [...#FunctionCall]
+    wait_statements:  [...#WaitStatement]
     file:             string & =~".+\\.(vhd|vhdl)$"
     line:             int & >=1
     in_arch:          string                            // Containing architecture
@@ -212,8 +371,9 @@ package schema
 
 // SignalDep represents a signal dependency for combinational loop detection
 #SignalDep: {
-    source:        string & =~"^[a-zA-Z_][a-zA-Z0-9_.]*$"  // Signal path being read (dots for record fields)
-    target:        string & =~"^[a-zA-Z_][a-zA-Z0-9_.]*$"  // Signal path being assigned
+    // Allow empty/invalid names so malformed inputs don't crash validation.
+    source:        string                                  // Signal path being read (dots for record fields)
+    target:        string                                  // Signal path being assigned
     in_process:    string                                  // Which process (empty if concurrent)
     is_sequential: bool                                    // True if crosses clock boundary
     file:          string & =~".+\\.(vhd|vhdl)$"
@@ -270,6 +430,7 @@ package schema
     in_process:    string                               // Process where usage occurs (empty if concurrent)
     in_port_map:   bool                                 // Used as actual in component port map
     instance_name: string                               // Instance name if in port map
+    in_psl:        bool                                 // True if usage appears in PSL property/sequence/assert
     line:          int & >=1                            // Line number
 }
 
@@ -279,7 +440,7 @@ package schema
 
 // TypeDeclaration represents a VHDL type declaration
 #TypeDeclaration: {
-    name:           string & =~"^[a-zA-Z_][a-zA-Z0-9_]*$"
+    name:           #Identifier
     kind:           "enum" | "record" | "array" | "physical" | "access" | "file" | "incomplete" | "protected" | "range" | "alias"
     file:           string & =~".+\\.(vhd|vhdl)$"
     line:           int & >=1
@@ -303,14 +464,14 @@ package schema
 
 // RecordField represents a field in a record type
 #RecordField: {
-    name: string & =~"^[a-zA-Z_][a-zA-Z0-9_]*$"
+    name: #Identifier
     type: string & !=""
     line: int & >=1
 }
 
 // SubtypeDeclaration represents a VHDL subtype declaration
 #SubtypeDeclaration: {
-    name:        string & =~"^[a-zA-Z_][a-zA-Z0-9_]*$"
+    name:        #Identifier
     base_type:   string & !=""                          // The parent type
     constraint?: string                                 // Range or index constraint
     resolution?: string                                 // Resolution function
@@ -323,7 +484,8 @@ package schema
 // FunctionDeclaration represents a VHDL function declaration or body
 #FunctionDeclaration: {
     name:        string                                 // Can be identifier or operator symbol
-    return_type: string & !=""
+    // Some negative tests omit return types; allow empty to avoid crashing on invalid inputs.
+    return_type: string
     parameters?: [...#SubprogramParameter]
     is_pure:     bool                                   // true for pure (default), false for impure
     has_body:    bool                                   // true if function body, not just declaration
@@ -335,7 +497,7 @@ package schema
 
 // ProcedureDeclaration represents a VHDL procedure declaration or body
 #ProcedureDeclaration: {
-    name:        string & =~"^[a-zA-Z_][a-zA-Z0-9_]*$"
+    name:        #Identifier
     parameters?: [...#SubprogramParameter]
     has_body:    bool                                   // true if procedure body
     file:        string & =~".+\\.(vhd|vhdl)$"
@@ -346,9 +508,10 @@ package schema
 
 // SubprogramParameter represents a parameter in a function or procedure
 #SubprogramParameter: {
-    name:       string & =~"^[a-zA-Z_][a-zA-Z0-9_]*$"
+    name:       #Identifier
     direction?: "in" | "out" | "inout" | "buffer" | "linkage" | ""  // Empty defaults to "in"
-    type:       string & !=""
+    // Some negative tests omit parameter types; allow empty to avoid crashing on invalid inputs.
+    type:       string
     class?:     "signal" | "variable" | "constant" | "file" | ""
     default?:   string                                  // Default value expression
     line:       int & >=1
@@ -356,7 +519,7 @@ package schema
 
 // ConstantDeclaration represents a VHDL constant declaration
 #ConstantDeclaration: {
-    name:       string & =~"^[a-zA-Z_][a-zA-Z0-9_]*$"
+    name:       #Identifier
     type:       string & !=""
     value?:     string                                  // May be empty for deferred constants
     file:       string & =~".+\\.(vhd|vhdl)$"

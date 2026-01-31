@@ -5,7 +5,7 @@ import (
 )
 
 // TestCUEContractEnforcement demonstrates the CUE contract validation.
-// This ensures "silent failures" cannot happen in OPA.
+// This ensures "silent failures" cannot happen in the policy engine.
 func TestCUEContractEnforcement(t *testing.T) {
 	v, err := New()
 	if err != nil {
@@ -79,7 +79,7 @@ func TestCUEContractEnforcement(t *testing.T) {
 					map[string]interface{}{
 						"name":      "bad_signal",
 						"type":      "", // Empty type - schema says type != ""
-						"file":     "test.vhd",
+						"file":      "test.vhd",
 						"line":      1,
 						"in_entity": "test",
 					},

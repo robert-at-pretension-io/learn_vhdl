@@ -12,6 +12,9 @@ type Config struct {
 	// Standard specifies the VHDL standard to use: "1993", "2002", "2008", "2019"
 	Standard string `json:"standard,omitempty"`
 
+	// Files is an explicit list of files with optional library/language overrides
+	Files []FileEntry `json:"files,omitempty"`
+
 	// Libraries maps library names to their configuration
 	Libraries map[string]LibraryConfig `json:"libraries,omitempty"`
 
@@ -34,6 +37,14 @@ type LibraryConfig struct {
 	IsThirdParty bool `json:"isThirdParty,omitempty"`
 }
 
+// FileEntry is an explicit file entry with optional library and language metadata
+type FileEntry struct {
+	File         string `json:"file"`
+	Library      string `json:"library,omitempty"`
+	Language     string `json:"language,omitempty"`
+	IsThirdParty bool   `json:"isThirdParty,omitempty"`
+}
+
 // LintConfig contains linting configuration
 type LintConfig struct {
 	// Rules maps rule names to severity: "off", "warning", "error"
@@ -47,6 +58,16 @@ type LintConfig struct {
 }
 
 // AnalysisConfig contains analysis options
+// CacheConfig controls incremental indexing cache behavior
+type CacheConfig struct {
+	// Enabled turns on incremental cache usage
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// Dir is the cache directory (relative to project root if not absolute)
+	Dir string `json:"dir,omitempty"`
+}
+
+// AnalysisConfig contains analysis options
 type AnalysisConfig struct {
 	// MaxParallelFiles limits concurrent file processing (0 = auto)
 	MaxParallelFiles int `json:"maxParallelFiles,omitempty"`
@@ -56,6 +77,9 @@ type AnalysisConfig struct {
 
 	// ResolveDefaultBinding computes component to entity default binding
 	ResolveDefaultBinding bool `json:"resolveDefaultBinding,omitempty"`
+
+	// Cache controls incremental indexing cache behavior
+	Cache CacheConfig `json:"cache,omitempty"`
 }
 
 // DefaultConfig returns a sensible default configuration
@@ -70,17 +94,7 @@ func DefaultConfig() *Config {
 			},
 		},
 		Lint: LintConfig{
-			Rules: map[string]string{
-				"unused_signal":           "warning",
-				"unused_port":             "warning",
-				"sensitivity_incomplete":  "warning",
-				"latch_inferred":          "warning",
-				"unresolved_dependency":   "error",
-				"naming_convention":       "off",
-				"missing_default":         "warning",
-				"multi_driven":            "error",
-				"combinational_loop":      "error",
-			},
+			Rules:          map[string]string{},
 			IgnorePatterns: []string{},
 			IgnoreRegions:  true,
 		},
@@ -88,8 +102,16 @@ func DefaultConfig() *Config {
 			MaxParallelFiles:      0, // auto
 			FollowLibraryUse:      true,
 			ResolveDefaultBinding: true,
+			Cache: CacheConfig{
+				Enabled: boolPtr(true),
+				Dir:     ".vhdl_lint_cache",
+			},
 		},
 	}
+}
+
+func boolPtr(v bool) *bool {
+	return &v
 }
 
 // Load finds and loads the configuration file
@@ -161,10 +183,14 @@ func (c *Config) applyDefaults() {
 	}
 
 	if c.Libraries == nil {
-		c.Libraries = map[string]LibraryConfig{
-			"work": {
-				Files: []string{"*.vhd", "*.vhdl", "**/*.vhd", "**/*.vhdl"},
-			},
+		if len(c.Files) == 0 {
+			c.Libraries = map[string]LibraryConfig{
+				"work": {
+					Files: []string{"*.vhd", "*.vhdl", "**/*.vhd", "**/*.vhdl"},
+				},
+			}
+		} else {
+			c.Libraries = map[string]LibraryConfig{}
 		}
 	}
 
@@ -172,18 +198,11 @@ func (c *Config) applyDefaults() {
 		c.Lint.Rules = make(map[string]string)
 	}
 
-	// Set default severities for known rules if not specified
-	defaultRules := map[string]string{
-		"unused_signal":          "warning",
-		"unused_port":            "warning",
-		"sensitivity_incomplete": "warning",
-		"latch_inferred":         "warning",
-		"unresolved_dependency":  "error",
+	if c.Analysis.Cache.Dir == "" {
+		c.Analysis.Cache.Dir = ".vhdl_lint_cache"
 	}
-	for rule, severity := range defaultRules {
-		if _, ok := c.Lint.Rules[rule]; !ok {
-			c.Lint.Rules[rule] = severity
-		}
+	if c.Analysis.Cache.Enabled == nil {
+		c.Analysis.Cache.Enabled = boolPtr(true)
 	}
 }
 
@@ -219,6 +238,18 @@ func (c *Config) IsRuleEnabled(rule string) bool {
 
 // IsThirdPartyFile checks if a file belongs to a third-party library
 func (c *Config) IsThirdPartyFile(filePath string) bool {
+	for _, entry := range c.Files {
+		if entry.File == "" {
+			continue
+		}
+		path := entry.File
+		if matched, _ := filepath.Match(path, filePath); matched {
+			return entry.IsThirdParty
+		}
+		if matched, _ := filepath.Match(path, filepath.Base(filePath)); matched {
+			return entry.IsThirdParty
+		}
+	}
 	for _, lib := range c.Libraries {
 		if !lib.IsThirdParty {
 			continue

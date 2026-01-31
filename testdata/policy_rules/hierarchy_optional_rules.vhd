@@ -26,6 +26,8 @@ architecture rtl of hier_top is
   signal sig_a : std_logic;
   signal sig_b : std_logic;
   signal sig_y : std_logic;
+  signal vec_in_small : std_logic_vector(3 downto 0);
+  signal vec_out_ok   : std_logic_vector(7 downto 0);
 begin
   sig_a <= a;
   sig_b <= b;
@@ -113,4 +115,37 @@ begin
     port map (a => sig_a, b => sig_b, y => sig_y);
 
   y <= sig_y;
+end rtl;
+
+entity leaf_vec is
+  port (
+    d : in  std_logic_vector(7 downto 0);
+    q : out std_logic_vector(7 downto 0)
+  );
+end leaf_vec;
+
+architecture rtl of leaf_vec is
+begin
+  q <= d;
+end rtl;
+
+entity width_top is
+  port (
+    d : in  std_logic_vector(3 downto 0);
+    q : out std_logic_vector(7 downto 0)
+  );
+end width_top;
+
+architecture rtl of width_top is
+  signal s4 : std_logic_vector(3 downto 0);
+  signal s8 : std_logic_vector(7 downto 0);
+begin
+  s4 <= d;
+  s8 <= (others => '0');
+  u_width: entity work.leaf_vec
+    port map (
+      d => s4,
+      q => s8
+    );
+  q <= s8;
 end rtl;

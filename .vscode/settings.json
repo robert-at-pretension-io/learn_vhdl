@@ -1,0 +1,5 @@
+{
+  "files.exclude": {
+    "**/.vhdl_lint_cache": true
+  }
+}

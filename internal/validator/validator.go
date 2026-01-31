@@ -4,11 +4,11 @@ package validator
 // VALIDATOR PHILOSOPHY: CRASH EARLY, CRASH LOUD
 // =============================================================================
 //
-// The CUE validator is the "contract guard" between Go and OPA.
+// The CUE validator is the "contract guard" between Go and the Rust policy engine.
 //
 // WHY THIS EXISTS:
 // Without validation, if a field name changes or a type is wrong:
-// - OPA silently receives `undefined`
+// - The policy engine silently receives `undefined`
 // - Rules don't fire
 // - You think your code is clean
 // - Silent bugs multiply
@@ -43,10 +43,16 @@ var schemaFS embed.FS
 //go:embed output_schema.cue
 var outputSchemaFS embed.FS
 
+//go:embed facts_schema.cue
+var factsSchemaFS embed.FS
+
+//go:embed daemon_schema.cue
+var daemonSchemaFS embed.FS
+
 // Validator validates extracted data against the CUE schema contract.
-// This is the "strict gatekeeper" that prevents silent failures in OPA.
+// This is the "strict gatekeeper" that prevents silent failures in the policy engine.
 // If the data doesn't match the schema, we crash immediately with a
-// clear error rather than letting OPA silently receive bad data.
+// clear error rather than letting the policy engine silently receive bad data.
 type Validator struct {
 	ctx    *cue.Context
 	schema cue.Value
@@ -74,7 +80,7 @@ func New() (*Validator, error) {
 }
 
 // Validate checks that the input data conforms to the CUE schema.
-// This enforces the contract between Go and OPA.
+// This enforces the contract between Go and the policy engine.
 // Returns nil if valid, or a detailed error explaining what failed.
 func (v *Validator) Validate(data interface{}) error {
 	// Marshal the Go data to JSON
@@ -121,6 +127,29 @@ func (v *Validator) ValidateJSON(jsonBytes []byte) error {
 		return fmt.Errorf("schema validation failed: %w", err)
 	}
 
+	return nil
+}
+
+// ValidateVerificationTag validates a single verification tag against the CUE schema.
+func (v *Validator) ValidateVerificationTag(tag interface{}) error {
+	jsonBytes, err := json.Marshal(tag)
+	if err != nil {
+		return fmt.Errorf("marshaling tag to JSON: %w", err)
+	}
+	dataValue := v.ctx.CompileBytes(jsonBytes)
+	if dataValue.Err() != nil {
+		return fmt.Errorf("compiling tag as CUE: %w", dataValue.Err())
+	}
+
+	tagDef := v.schema.LookupPath(cue.ParsePath("#VerificationTag"))
+	if tagDef.Err() != nil {
+		return fmt.Errorf("looking up #VerificationTag definition: %w", tagDef.Err())
+	}
+
+	unified := tagDef.Unify(dataValue)
+	if err := unified.Validate(); err != nil {
+		return fmt.Errorf("tag schema validation failed: %w", err)
+	}
 	return nil
 }
 
@@ -201,6 +230,112 @@ func (v *OutputValidator) Validate(data interface{}) error {
 	unified := outputDef.Unify(dataValue)
 	if err := unified.Validate(); err != nil {
 		return fmt.Errorf("output schema validation failed: %w", err)
+	}
+
+	return nil
+}
+
+// FactsValidator validates relational fact tables against the facts schema.
+type FactsValidator struct {
+	ctx    *cue.Context
+	schema cue.Value
+}
+
+// NewFactsValidator creates a validator for relational fact tables.
+func NewFactsValidator() (*FactsValidator, error) {
+	ctx := cuecontext.New()
+
+	schemaBytes, err := factsSchemaFS.ReadFile("facts_schema.cue")
+	if err != nil {
+		return nil, fmt.Errorf("loading facts schema: %w", err)
+	}
+
+	schema := ctx.CompileBytes(schemaBytes)
+	if schema.Err() != nil {
+		return nil, fmt.Errorf("compiling facts schema: %w", schema.Err())
+	}
+
+	return &FactsValidator{
+		ctx:    ctx,
+		schema: schema,
+	}, nil
+}
+
+// Validate checks that the fact tables conform to the facts schema.
+func (v *FactsValidator) Validate(data interface{}) error {
+	jsonBytes, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("marshaling facts to JSON: %w", err)
+	}
+
+	dataValue := v.ctx.CompileBytes(jsonBytes)
+	if dataValue.Err() != nil {
+		return fmt.Errorf("compiling facts as CUE: %w", dataValue.Err())
+	}
+
+	factsDef := v.schema.LookupPath(cue.ParsePath("#FactTables"))
+	if factsDef.Err() != nil {
+		return fmt.Errorf("looking up #FactTables definition: %w", factsDef.Err())
+	}
+
+	unified := factsDef.Unify(dataValue)
+	if err := unified.Validate(); err != nil {
+		return fmt.Errorf("facts schema validation failed: %w", err)
+	}
+
+	return nil
+}
+
+// PolicyDaemonValidator validates vhdl_policyd command/response payloads.
+type PolicyDaemonValidator struct {
+	ctx    *cue.Context
+	schema cue.Value
+}
+
+// NewPolicyDaemonValidator creates a validator for policy daemon protocol payloads.
+func NewPolicyDaemonValidator() (*PolicyDaemonValidator, error) {
+	ctx := cuecontext.New()
+
+	schemaBytes, err := daemonSchemaFS.ReadFile("daemon_schema.cue")
+	if err != nil {
+		return nil, fmt.Errorf("loading daemon schema: %w", err)
+	}
+
+	schema := ctx.CompileBytes(schemaBytes)
+	if schema.Err() != nil {
+		return nil, fmt.Errorf("compiling daemon schema: %w", schema.Err())
+	}
+
+	return &PolicyDaemonValidator{
+		ctx:    ctx,
+		schema: schema,
+	}, nil
+}
+
+// ValidateCommandJSON validates a command JSON payload.
+func (v *PolicyDaemonValidator) ValidateCommandJSON(jsonBytes []byte) error {
+	return v.validateJSON(jsonBytes, "#PolicyDaemonCommand")
+}
+
+// ValidateResponseJSON validates a response JSON payload.
+func (v *PolicyDaemonValidator) ValidateResponseJSON(jsonBytes []byte) error {
+	return v.validateJSON(jsonBytes, "#PolicyDaemonResponse")
+}
+
+func (v *PolicyDaemonValidator) validateJSON(jsonBytes []byte, path string) error {
+	dataValue := v.ctx.CompileBytes(jsonBytes)
+	if dataValue.Err() != nil {
+		return fmt.Errorf("compiling JSON as CUE: %w", dataValue.Err())
+	}
+
+	def := v.schema.LookupPath(cue.ParsePath(path))
+	if def.Err() != nil {
+		return fmt.Errorf("looking up %s definition: %w", path, def.Err())
+	}
+
+	unified := def.Unify(dataValue)
+	if err := unified.Validate(); err != nil {
+		return fmt.Errorf("daemon schema validation failed: %w", err)
 	}
 
 	return nil

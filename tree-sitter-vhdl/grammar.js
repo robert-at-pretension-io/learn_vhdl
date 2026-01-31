@@ -121,7 +121,7 @@
 //    - Signals list includes VHDL keywords
 //    - Read/write analysis is corrupted
 //
-// 3. OPA rules fire false positives
+// 3. Policy rules fire false positives
 //    - "Signal 'downto' is unused" - obviously wrong!
 //    - Users lose trust in the tool
 //
@@ -235,8 +235,8 @@ module.exports = grammar({
     [$.subprogram_declaration, $.subprogram_body],
     [$.concurrent_procedure_call, $.component_instantiation],
     [$._force_release_assignment, $._assignment_target],
-    [$._block_configuration, $._component_configuration],
-    [$._configuration_item_or_component, $._component_configuration],
+    [$.block_configuration, $.component_configuration],
+    [$._configuration_item_or_component, $.component_configuration],
     [$.record_type_definition],
     [$.protected_type_declaration],
     [$.protected_type_body],
@@ -986,6 +986,19 @@ module.exports = grammar({
       ')'
     ),
 
+    // Simple comma-separated identifier list
+    identifier_list: $ => seq(
+      $.identifier,
+      repeat(seq(',', $.identifier))
+    ),
+
+    // Port clause with visible parameter list for extraction
+    port_clause: $ => seq(
+      $._kw_port,
+      field('ports', alias($._parameter_list, $.parameter_list)),
+      ';'
+    ),
+
     // parameter: [signal|variable|constant] name[, name...] : [in|out|inout] type [:= default]
     parameter: $ => choice(
       seq(
@@ -1002,14 +1015,13 @@ module.exports = grammar({
       ),
       seq(
         optional(field('class', $.parameter_class)),
-        $.identifier,
-        repeat(seq(',', $.identifier)),
+        field('names', $.identifier_list),
         ':',
         optional(field('direction', $.port_direction)),
-        choice(
+        field('type', alias(choice(
           $._parameter_type,
           $.anonymous_type_indication
-        ),
+        ), $.parameter_type)),
         optional(seq(':=', field('default', $.default_value)))  // default value
       )
     ),
@@ -1095,7 +1107,7 @@ module.exports = grammar({
       field('name', $.identifier),
       optional($._kw_is),  // VHDL-93+: optional $._kw_is
       optional(seq($._kw_generic, $._entity_generic_list, optional(';'))),
-      optional(seq($._kw_port, $._parameter_list, ';')),
+      optional($.port_clause),
       $._kw_end,
       optional($._kw_component),
       optional($.identifier),
@@ -1150,7 +1162,7 @@ module.exports = grammar({
       field('name', $.identifier),
       $._kw_is,
       optional(seq($._kw_generic, $._entity_generic_list, optional(';'))),  // VHDL-2008: supports type generics
-      optional(seq($._kw_port, $._parameter_list, ';')),
+      optional($.port_clause),
       repeat($._entity_declarative_item),
       optional(seq(
         $._kw_begin,
@@ -1465,13 +1477,13 @@ module.exports = grammar({
 
     _configuration_item: $ => choice(
       $.use_clause,
-      $._block_configuration
+      $.block_configuration
     ),
 
-    _block_configuration: $ => seq(
+    block_configuration: $ => seq(
       $._kw_for,
-      $.identifier,  // architecture or generate label
-      optional(seq('(', $._range_or_expression, ')')),  // Generate index/range
+      field('label', $.identifier),  // architecture or generate label
+      optional(seq('(', field('index', $._range_or_expression), ')')),  // Generate index/range
       repeat(choice($.use_clause, $._configuration_item_or_component)),
       $._kw_end,
       $._kw_for,
@@ -1479,17 +1491,17 @@ module.exports = grammar({
     ),
 
     _configuration_item_or_component: $ => choice(
-      $._component_configuration,
-      $._block_configuration
+      $.component_configuration,
+      $.block_configuration
     ),
 
-    _component_configuration: $ => seq(
+    component_configuration: $ => seq(
       $._kw_for,
       choice(
-        seq($.identifier, repeat(seq(',', $.identifier)), ':', $.identifier),  // inst1,inst2 : component
-        seq($._kw_all, ':', $.identifier),         // all : component
-        seq($._kw_others, ':', $.identifier),      // others : component
-        $.identifier                           // Just generate label
+        seq($.identifier, repeat(seq(',', $.identifier)), ':', field('component', $.identifier)),  // inst1,inst2 : component
+        seq($._kw_all, ':', field('component', $.identifier)),         // all : component
+        seq($._kw_others, ':', field('component', $.identifier)),      // others : component
+        field('label', $.identifier)                           // Just generate label
       ),
       optional(choice(
         // Full binding indication with use entity
@@ -1502,7 +1514,7 @@ module.exports = grammar({
                 seq($.identifier, '.', $.identifier),
                 $.identifier
               )),
-              optional(seq('(', $.identifier, ')'))  // Optional architecture
+              optional(seq('(', field('architecture', $.identifier), ')'))  // Optional architecture
             ),
             seq(
               $._kw_configuration,
@@ -1525,7 +1537,7 @@ module.exports = grammar({
           ';'  // Semicolon after incremental binding
         )
       )),
-      repeat($._block_configuration),
+      repeat($.block_configuration),
       $._kw_end,
       $._kw_for,
       ';'
@@ -1584,11 +1596,11 @@ module.exports = grammar({
     // Disconnection specification: disconnect signal : type after time;
     disconnect_specification: $ => seq(
       $._kw_disconnect,
-      choice($.identifier, $._kw_all, $._kw_others),
+      field('target', choice($.identifier, $._kw_all, $._kw_others)),
       ':',
-      $._type_mark,
+      field('type', $._type_mark),
       $._kw_after,
-      $._expression,
+      field('time', $._expression),
       ';'
     ),
 
@@ -1750,10 +1762,9 @@ module.exports = grammar({
     // Resolution function comes before type name if present
     signal_declaration: $ => seq(
       $._kw_signal,
-      field('name', $.identifier),
-      repeat(seq(',', $.identifier)),
+      field('names', $.identifier_list),
       ':',
-      $._signal_type_indication,
+      field('type', alias($._signal_type_indication, $.signal_type_indication)),
       optional(seq(':=', field('value', $._constant_value))),
       ';'
     ),
@@ -1802,8 +1813,7 @@ module.exports = grammar({
     // IMPORTANT: for_generate, if_generate, case_generate are VISIBLE nodes (no underscore)
     // This allows the extractor to easily detect generate type
     generate_statement: $ => seq(
-      field('label', $._generate_label),
-      ':',
+      optional(seq(field('label', $._generate_label), ':')),
       choice(
         $.for_generate,
         $.if_generate,
@@ -1928,7 +1938,7 @@ module.exports = grammar({
       optional($._kw_is),
       optional(seq($._kw_generic, $._parameter_list, ';')),  // Generic interface
       optional(seq($._kw_generic, $._kw_map, '(', $.association_list, ')', ';')),  // Generic map
-      optional(seq($._kw_port, $._parameter_list, ';')),  // Port interface
+      optional($.port_clause),  // Port interface
       optional(seq($._kw_port, $._kw_map, '(', $.association_list, ')', ';')),  // Port map
       repeat($._block_declarative_item),
       $._kw_begin,
@@ -2017,10 +2027,10 @@ module.exports = grammar({
     )),
 
     process_statement: $ => seq(
-      optional(seq($.identifier, ':')),  // Optional label
+      optional(seq(field('label', $.identifier), ':')),  // Optional label
       optional($._kw_postponed),
       $._kw_process,
-      optional(seq('(', $.sensitivity_list, ')')),  // Sensitivity list
+      optional(seq('(', field('sensitivity', $.sensitivity_list), ')')),  // Sensitivity list
       optional($._kw_is),
       repeat($._process_declarative_item),
       $._kw_begin,
@@ -2028,7 +2038,7 @@ module.exports = grammar({
       $._kw_end,
       optional($._kw_postponed),
       $._kw_process,
-      optional($.identifier),
+      optional(field('end_label', $.identifier)),
       ';'
     ),
 
@@ -2296,6 +2306,7 @@ module.exports = grammar({
 
     // Wait statement: wait [on signal_list] [until condition] [for time_expression];
     wait_statement: $ => seq(
+      optional(seq($.identifier, ':')),
       $._kw_wait,
       optional(seq($._kw_on, $._signal_name, repeat(seq(',', $._signal_name)))),  // sensitivity clause
       optional(seq($._kw_until, $._expression)),  // condition clause

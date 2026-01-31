@@ -23,6 +23,7 @@ architecture rtl of synthesis_cdc_rules is
   signal mem_array  : array_mem_t;
   signal ready      : std_logic;
   signal sync_sink  : std_logic;
+  signal gate_ff    : std_logic;
 begin
   clk_gate <= clk_a and in_a;
 
@@ -49,6 +50,13 @@ begin
   begin
     if rising_edge(clk_b) then
       sync1 <= cross_sync;
+    end if;
+  end process;
+
+  gated_proc: process(clk_gate)
+  begin
+    if rising_edge(clk_gate) then
+      gate_ff <= in_a;
     end if;
   end process;
 

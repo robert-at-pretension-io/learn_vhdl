@@ -56,7 +56,7 @@
 #   - Reject empty/invalid attribute forms (proc'' / proc'  ')
 #   - Tighten range/index constraints (e.g., downtonatural typos)
 # Many non_compliant and synth/err* tests are semantic-invalid and
-# will remain XPASS unless handled in extractor/OPA, not grammar.
+# will remain XPASS unless handled in extractor/policy engine, not grammar.
 # =============================================================================
 # Test grammar against external test files
 

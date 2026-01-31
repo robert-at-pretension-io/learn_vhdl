@@ -5,9 +5,9 @@ const MAX_ERRORS: usize = 10;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    
+
     let filename = args.get(1).map(|s| s.as_str()).unwrap_or("test.vhdl");
-    
+
     let source_code = match fs::read_to_string(filename) {
         Ok(content) => content,
         Err(e) => {
@@ -43,34 +43,42 @@ fn main() {
 fn walk_errors(cursor: &mut tree_sitter::TreeCursor, source: &str, error_count: &mut usize) {
     loop {
         let node = cursor.node();
-        
+
         if node.is_error() || node.is_missing() || node.kind() == "invalid_bit_string_literal" {
             *error_count += 1;
 
             if *error_count <= MAX_ERRORS {
                 let start = node.start_position();
                 let end = node.end_position();
-                let text = node.utf8_text(source.as_bytes()).unwrap_or("<invalid utf8>");
+                let text = node
+                    .utf8_text(source.as_bytes())
+                    .unwrap_or("<invalid utf8>");
 
                 if node.kind() == "invalid_bit_string_literal" {
                     println!(
                         "ERROR at {}:{}-{}:{}: invalid bit string literal \"{}\"",
-                        start.row + 1, start.column + 1,
-                        end.row + 1, end.column + 1,
+                        start.row + 1,
+                        start.column + 1,
+                        end.row + 1,
+                        end.column + 1,
                         text.chars().take(40).collect::<String>()
                     );
                 } else if node.is_missing() {
                     println!(
                         "MISSING at {}:{}-{}:{}: expected {}",
-                        start.row + 1, start.column + 1,
-                        end.row + 1, end.column + 1,
+                        start.row + 1,
+                        start.column + 1,
+                        end.row + 1,
+                        end.column + 1,
                         node.kind()
                     );
                 } else {
                     println!(
                         "ERROR at {}:{}-{}:{}: \"{}\"",
-                        start.row + 1, start.column + 1,
-                        end.row + 1, end.column + 1,
+                        start.row + 1,
+                        start.column + 1,
+                        end.row + 1,
+                        end.column + 1,
                         text.chars().take(40).collect::<String>()
                     );
                 }

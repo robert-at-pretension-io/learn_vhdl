@@ -12,6 +12,8 @@ package schema
 // LintOutput is the root structure of JSON output
 #LintOutput: {
     violations:   [...#Violation]
+    missing_checks: [...#MissingCheck] | *[]
+    ambiguous_constructs: [...#AmbiguousConstruct] | *[]
     summary:      #Summary
     stats:        #Stats
     files:        [...#FileResult]
@@ -60,4 +62,31 @@ package schema
 #ParseError: {
     file:    string
     message: string & !=""
+}
+
+// MissingCheckTask is a structured task for the verification agent.
+#MissingCheck: {
+    file:        string & =~".+\\.(vhd|vhdl)$"
+    scope:       string & =~"^(arch|entity):.+$"
+    anchor:      #VerificationAnchor
+    missing_ids: [...string]
+    bindings:    {[string]: string} | *{}
+    notes:       [...string] | *[]
+}
+
+// VerificationAnchor identifies the insertion location for tags.
+#VerificationAnchor: {
+    label:      string
+    line_start: int & >=1
+    line_end:   int & >=1
+    exists:     bool
+}
+
+// AmbiguousConstruct reports uncertain detection candidates.
+#AmbiguousConstruct: {
+    kind:       string & !=""
+    scope:      string & =~"^(arch|entity):.+$"
+    file:       string & =~".+\\.(vhd|vhdl)$"
+    line:       int & >=1
+    candidates: {[string]: [...string]}
 }

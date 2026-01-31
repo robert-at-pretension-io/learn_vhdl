@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -15,12 +16,31 @@ type ResolvedLibrary struct {
 
 // ResolveLibraries expands all glob patterns and returns resolved file lists
 func (c *Config) ResolveLibraries(rootPath string) ([]ResolvedLibrary, error) {
-	var result []ResolvedLibrary
+	type libAccumulator struct {
+		Name         string
+		IsThirdParty bool
+		Files        map[string]bool
+	}
 
+	acc := make(map[string]*libAccumulator)
+	ensureLib := func(name string) *libAccumulator {
+		if name == "" {
+			name = "work"
+		}
+		if acc[name] == nil {
+			acc[name] = &libAccumulator{
+				Name:  name,
+				Files: make(map[string]bool),
+			}
+		}
+		return acc[name]
+	}
+
+	// First, resolve library glob patterns
 	for libName, libCfg := range c.Libraries {
-		resolved := ResolvedLibrary{
-			Name:         libName,
-			IsThirdParty: libCfg.IsThirdParty,
+		resolved := ensureLib(libName)
+		if libCfg.IsThirdParty {
+			resolved.IsThirdParty = true
 		}
 
 		// Expand all file patterns
@@ -40,14 +60,13 @@ func (c *Config) ResolveLibraries(rootPath string) ([]ResolvedLibrary, error) {
 
 			for _, match := range matches {
 				// Only include VHDL files
-				ext := strings.ToLower(filepath.Ext(match))
-				if ext == ".vhd" || ext == ".vhdl" {
+				if isVHDLFile(match, "") {
 					fileSet[match] = true
 				}
 			}
 		}
 
-		// Remove excluded files
+		// Remove excluded files (applies to glob matches only)
 		for _, pattern := range libCfg.Exclude {
 			if !filepath.IsAbs(pattern) {
 				pattern = filepath.Join(rootPath, pattern)
@@ -63,11 +82,47 @@ func (c *Config) ResolveLibraries(rootPath string) ([]ResolvedLibrary, error) {
 			}
 		}
 
-		// Convert set to slice
 		for f := range fileSet {
-			resolved.Files = append(resolved.Files, f)
+			resolved.Files[f] = true
+		}
+	}
+
+	// Then add explicit file entries
+	for _, entry := range c.Files {
+		if entry.File == "" || !isVHDLFile(entry.File, entry.Language) {
+			continue
+		}
+		libName := entry.Library
+		if libName == "" {
+			libName = "work"
+		}
+		resolved := ensureLib(libName)
+		if entry.IsThirdParty {
+			resolved.IsThirdParty = true
 		}
 
+		path := entry.File
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(rootPath, path)
+		}
+		resolved.Files[path] = true
+	}
+
+	var result []ResolvedLibrary
+	libNames := make([]string, 0, len(acc))
+	for name := range acc {
+		libNames = append(libNames, name)
+	}
+	sort.Strings(libNames)
+	for _, name := range libNames {
+		lib := acc[name]
+		resolved := ResolvedLibrary{
+			Name:         lib.Name,
+			IsThirdParty: lib.IsThirdParty,
+		}
+		for f := range lib.Files {
+			resolved.Files = append(resolved.Files, f)
+		}
 		result = append(result, resolved)
 	}
 
@@ -162,6 +217,14 @@ func matchSuffix(path, pattern string) bool {
 	}
 
 	return false
+}
+
+func isVHDLFile(path, language string) bool {
+	if language != "" && !strings.EqualFold(language, "vhdl") {
+		return false
+	}
+	ext := strings.ToLower(filepath.Ext(path))
+	return ext == ".vhd" || ext == ".vhdl"
 }
 
 // GetAllFiles returns all VHDL files from all libraries (flattened)

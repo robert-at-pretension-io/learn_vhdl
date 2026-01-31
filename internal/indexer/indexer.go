@@ -8,7 +8,7 @@ package indexer
 // 1. Aggregate facts from multiple files into a unified view
 // 2. Build the cross-file symbol table
 // 3. Resolve dependencies between files
-// 4. Prepare normalized data for OPA policy evaluation
+// 4. Prepare normalized data for Rust policy evaluation
 //
 // IMPORTANT: The indexer should NOT work around extraction bugs!
 //
@@ -18,7 +18,7 @@ package indexer
 // - The EXTRACTOR is missing logic (fix extractor.go second!)
 //
 // The CUE validator (internal/validator) catches schema mismatches between
-// what we produce here and what OPA expects. If validation fails, it means
+// what we produce here and what the Rust policy engine expects. If validation fails, it means
 // our contract is broken - fix the source, don't suppress the error.
 //
 // See: AGENTS.md "The Grammar Improvement Cycle"
@@ -29,11 +29,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/robert-at-pretension-io/vhdl-lint/internal/config"
 	"github.com/robert-at-pretension-io/vhdl-lint/internal/extractor"
+	"github.com/robert-at-pretension-io/vhdl-lint/internal/facts"
 	"github.com/robert-at-pretension-io/vhdl-lint/internal/policy"
 	"github.com/robert-at-pretension-io/vhdl-lint/internal/validator"
 )
@@ -62,8 +65,24 @@ type Indexer struct {
 	// Verbose output
 	Verbose bool
 
+	// Progress output (lightweight, streaming)
+	Progress bool
+
+	// Trace output (progress + per-file fact summaries)
+	Trace bool
+
 	// JSON output mode
 	JSONOutput bool
+
+	// Timing output (JSONL)
+	Timing     bool
+	TimingPath string
+
+	// Optional extractor factory (for tests)
+	extractorFactory func() FactsExtractor
+
+	// Optional cache version override (for tests)
+	cacheVersionOverride *cacheVersions
 }
 
 // LintResult is the structured result of running the linter
@@ -71,6 +90,12 @@ type Indexer struct {
 type LintResult struct {
 	// Violations found by policy evaluation
 	Violations []policy.Violation `json:"violations"`
+
+	// Structured missing-check tasks
+	MissingChecks []policy.MissingCheckTask `json:"missing_checks,omitempty"`
+
+	// Ambiguous construct warnings (structured)
+	AmbiguousConstructs []policy.AmbiguousConstruct `json:"ambiguous_constructs,omitempty"`
 
 	// Summary counts
 	Summary ResultSummary `json:"summary"`
@@ -95,23 +120,23 @@ type ResultSummary struct {
 
 // ExtractionStats provides counts of extracted elements
 type ExtractionStats struct {
-	Files      int `json:"files"`
-	Symbols    int `json:"symbols"`
-	Entities   int `json:"entities"`
-	Packages   int `json:"packages"`
-	Signals    int `json:"signals"`
-	Ports      int `json:"ports"`
-	Processes  int `json:"processes"`
-	Instances  int `json:"instances"`
-	Generates  int `json:"generates"`
+	Files     int `json:"files"`
+	Symbols   int `json:"symbols"`
+	Entities  int `json:"entities"`
+	Packages  int `json:"packages"`
+	Signals   int `json:"signals"`
+	Ports     int `json:"ports"`
+	Processes int `json:"processes"`
+	Instances int `json:"instances"`
+	Generates int `json:"generates"`
 }
 
 // FileResult provides per-file violation counts
 type FileResult struct {
-	Path       string `json:"path"`
-	Errors     int    `json:"errors"`
-	Warnings   int    `json:"warnings"`
-	Info       int    `json:"info"`
+	Path     string `json:"path"`
+	Errors   int    `json:"errors"`
+	Warnings int    `json:"warnings"`
+	Info     int    `json:"info"`
 }
 
 // ParseError represents a file that failed to parse
@@ -128,10 +153,20 @@ type SymbolTable struct {
 
 // Symbol represents an exported VHDL construct
 type Symbol struct {
-	Name     string // Qualified name: work.my_entity
-	Kind     string // entity, package, component, etc.
-	File     string // Source file path
-	Line     int    // Line number
+	Name string // Qualified name: work.my_entity
+	Kind string // entity, package, component, etc.
+	File string // Source file path
+	Line int    // Line number
+}
+
+// FactsExtractor abstracts extraction for caching tests
+type FactsExtractor interface {
+	Extract(path string) (extractor.FileFacts, error)
+}
+
+type cacheVersions struct {
+	parser    string
+	extractor string
 }
 
 // New creates a new Indexer with default configuration
@@ -156,20 +191,120 @@ func NewWithConfig(cfg *config.Config) *Indexer {
 	return idx
 }
 
+func (idx *Indexer) newExtractor() FactsExtractor {
+	if idx.extractorFactory != nil {
+		return idx.extractorFactory()
+	}
+	return extractor.New()
+}
+
+func (idx *Indexer) cacheVersions(rootPath string) cacheVersions {
+	if idx.cacheVersionOverride != nil {
+		return *idx.cacheVersionOverride
+	}
+	return computeCacheVersions(rootPath)
+}
+
+func (idx *Indexer) registerSymbolsForFacts(facts extractor.FileFacts, filePath string) {
+	// Determine the library name for this file
+	// Use actual library from config, or fall back to "work"
+	libName := "work"
+	if libInfo, ok := idx.FileLibraries[filePath]; ok && libInfo.LibraryName != "" {
+		libName = strings.ToLower(libInfo.LibraryName)
+	}
+
+	// Register exports in symbol table with proper library prefix
+	for _, entity := range facts.Entities {
+		idx.Symbols.Add(Symbol{
+			Name: fmt.Sprintf("%s.%s", libName, strings.ToLower(entity.Name)),
+			Kind: "entity",
+			File: filePath,
+			Line: entity.Line,
+		})
+	}
+	for _, pkg := range facts.Packages {
+		idx.Symbols.Add(Symbol{
+			Name: fmt.Sprintf("%s.%s", libName, strings.ToLower(pkg.Name)),
+			Kind: "package",
+			File: filePath,
+			Line: pkg.Line,
+		})
+	}
+
+	// Register package contents in symbol table for cross-file resolution
+	// Format: library.package.item (e.g., work.my_pkg.state_t)
+	for _, t := range facts.Types {
+		if t.InPackage != "" && isValidIdentifierName(t.Name) {
+			idx.Symbols.Add(Symbol{
+				Name: fmt.Sprintf("%s.%s.%s", libName, strings.ToLower(t.InPackage), strings.ToLower(t.Name)),
+				Kind: "type",
+				File: filePath,
+				Line: t.Line,
+			})
+		}
+	}
+	for _, c := range facts.ConstantDecls {
+		if c.InPackage != "" && isValidIdentifierName(c.Name) {
+			idx.Symbols.Add(Symbol{
+				Name: fmt.Sprintf("%s.%s.%s", libName, strings.ToLower(c.InPackage), strings.ToLower(c.Name)),
+				Kind: "constant",
+				File: filePath,
+				Line: c.Line,
+			})
+		}
+	}
+	for _, fn := range facts.Functions {
+		if fn.InPackage != "" && isValidIdentifierName(fn.Name) {
+			idx.Symbols.Add(Symbol{
+				Name: fmt.Sprintf("%s.%s.%s", libName, strings.ToLower(fn.InPackage), strings.ToLower(fn.Name)),
+				Kind: "function",
+				File: filePath,
+				Line: fn.Line,
+			})
+		}
+	}
+	for _, pr := range facts.Procedures {
+		if pr.InPackage != "" && isValidIdentifierName(pr.Name) {
+			idx.Symbols.Add(Symbol{
+				Name: fmt.Sprintf("%s.%s.%s", libName, strings.ToLower(pr.InPackage), strings.ToLower(pr.Name)),
+				Kind: "procedure",
+				File: filePath,
+				Line: pr.Line,
+			})
+		}
+	}
+}
+
 // Run executes the indexing pipeline
 func (idx *Indexer) Run(rootPath string) error {
+	runStart := time.Now()
+	pipelineErrs := make([]error, 0)
+	recordPipelineErr := func(err error) {
+		pipelineErrs = append(pipelineErrs, err)
+	}
+	timing := newTimingRecorder(runStart, idx.resolveTimingPath(rootPath))
+	if err := timing.Err(); err != nil {
+		recordPipelineErr(fmt.Errorf("timing output disabled: %w", err))
+	}
+	defer timing.Close()
+
 	// 0. Load configuration if not already loaded
 	if idx.Config == nil {
 		cfg, err := config.Load(rootPath)
 		if err != nil {
-			fmt.Printf("Warning: Could not load config: %v (using defaults)\n", err)
-			idx.Config = config.DefaultConfig()
-		} else {
-			idx.Config = cfg
+			return fmt.Errorf("load config: %w", err)
 		}
+		idx.Config = cfg
 	}
 
+	// Reset per-run state
+	idx.Symbols = &SymbolTable{symbols: make(map[string]Symbol)}
+	idx.Facts = nil
+	idx.FileLibraries = make(map[string]config.FileLibraryInfo)
+	idx.ThirdPartyFiles = make(map[string]bool)
+
 	// 1. Find all VHDL files using configuration
+	stepStart := time.Now()
 	var files []string
 	var err error
 
@@ -177,7 +312,7 @@ func (idx *Indexer) Run(rootPath string) error {
 	if len(idx.Config.Libraries) > 0 {
 		libs, resolveErr := idx.Config.ResolveLibraries(rootPath)
 		if resolveErr != nil {
-			fmt.Printf("Warning: Error resolving libraries: %v\n", resolveErr)
+			return fmt.Errorf("resolve libraries: %w", resolveErr)
 		}
 
 		// Collect all files and track library info
@@ -235,110 +370,133 @@ func (idx *Indexer) Run(rootPath string) error {
 	if !idx.JSONOutput {
 		fmt.Printf("Found %d VHDL files\n", len(files))
 	}
+	scanDuration := time.Since(stepStart)
+	timing.RecordStage("scan", stepStart, scanDuration, "")
 
-	// 2. Pass 1: Parallel extraction
-	ext := extractor.New()
+	// 2. Pass 1: Parallel extraction (with optional cache)
+	stepStart = time.Now()
+	ext := idx.newExtractor()
+	var cache *factsCache
+	var cacheDir string
+	if cacheEnabled(idx.Config) {
+		cacheDir = resolveCacheDir(rootPath, idx.Config)
+		versions := idx.cacheVersions(rootPath)
+		cache = newFactsCache(cacheDir, versions.parser, versions.extractor)
+		if err := cache.Load(); err != nil {
+			recordPipelineErr(fmt.Errorf("cache disabled: %w", err))
+			cache = nil
+		}
+	}
 	var wg sync.WaitGroup
+	var progressMu sync.Mutex
+	progress := 0
+	progressEnabled := (idx.Verbose || idx.Progress || idx.Trace) && !idx.JSONOutput
+	if progressEnabled {
+		fmt.Printf("\n=== Extraction Progress ===\n")
+	}
 	factsChan := make(chan extractor.FileFacts, len(files))
 	errChan := make(chan error, len(files))
+	pipelineErrChan := make(chan error, len(files))
+	var changedMu sync.Mutex
+	changedFiles := make(map[string]bool)
 
 	for _, file := range files {
 		wg.Add(1)
 		go func(f string) {
 			defer wg.Done()
+			fileStart := time.Now()
+			var contentHash string
+			if cache != nil {
+				h, err := hashFile(f)
+				if err != nil {
+					errChan <- fmt.Errorf("%s: %w", f, err)
+					return
+				}
+				contentHash = h
+				if facts, ok, err := cache.Get(f, contentHash); err == nil && ok {
+					factsChan <- facts
+					idx.registerSymbolsForFacts(facts, f)
+					fileDuration := time.Since(fileStart)
+					timing.RecordFile("extract", f, "cache_hit", fileStart, fileDuration)
+					if progressEnabled {
+						emitProgress(&progressMu, &progress, len(files), facts, "cache hit", idx.Trace, fileDuration)
+					}
+					return
+				} else if err != nil {
+					pipelineErrChan <- fmt.Errorf("cache read failed for %s: %w", f, err)
+				}
+			}
+
 			facts, err := ext.Extract(f)
 			if err != nil {
 				errChan <- fmt.Errorf("%s: %w", f, err)
 				return
 			}
+			if cache != nil && contentHash != "" {
+				if err := cache.Put(f, contentHash, facts); err != nil {
+					pipelineErrChan <- fmt.Errorf("cache write failed for %s: %w", f, err)
+				}
+			}
+			if cache != nil {
+				changedMu.Lock()
+				changedFiles[f] = true
+				changedMu.Unlock()
+			}
+			fileDuration := time.Since(fileStart)
+			timing.RecordFile("extract", f, "extracted", fileStart, fileDuration)
+			if progressEnabled {
+				emitProgress(&progressMu, &progress, len(files), facts, "extracted", idx.Trace, fileDuration)
+			}
 			factsChan <- facts
-
-			// Determine the library name for this file
-			// Use actual library from config, or fall back to "work"
-			libName := "work"
-			if libInfo, ok := idx.FileLibraries[f]; ok && libInfo.LibraryName != "" {
-				libName = strings.ToLower(libInfo.LibraryName)
-			}
-
-			// Register exports in symbol table with proper library prefix
-			for _, entity := range facts.Entities {
-				idx.Symbols.Add(Symbol{
-					Name: fmt.Sprintf("%s.%s", libName, strings.ToLower(entity.Name)),
-					Kind: "entity",
-					File: f,
-					Line: entity.Line,
-				})
-			}
-			for _, pkg := range facts.Packages {
-				idx.Symbols.Add(Symbol{
-					Name: fmt.Sprintf("%s.%s", libName, strings.ToLower(pkg.Name)),
-					Kind: "package",
-					File: f,
-					Line: pkg.Line,
-				})
-			}
-
-			// Register package contents in symbol table for cross-file resolution
-			// Format: library.package.item (e.g., work.my_pkg.state_t)
-			for _, t := range facts.Types {
-				if t.InPackage != "" {
-					idx.Symbols.Add(Symbol{
-						Name: fmt.Sprintf("%s.%s.%s", libName, strings.ToLower(t.InPackage), strings.ToLower(t.Name)),
-						Kind: "type",
-						File: f,
-						Line: t.Line,
-					})
-				}
-			}
-			for _, c := range facts.ConstantDecls {
-				if c.InPackage != "" {
-					idx.Symbols.Add(Symbol{
-						Name: fmt.Sprintf("%s.%s.%s", libName, strings.ToLower(c.InPackage), strings.ToLower(c.Name)),
-						Kind: "constant",
-						File: f,
-						Line: c.Line,
-					})
-				}
-			}
-			for _, fn := range facts.Functions {
-				if fn.InPackage != "" {
-					idx.Symbols.Add(Symbol{
-						Name: fmt.Sprintf("%s.%s.%s", libName, strings.ToLower(fn.InPackage), strings.ToLower(fn.Name)),
-						Kind: "function",
-						File: f,
-						Line: fn.Line,
-					})
-				}
-			}
-			for _, pr := range facts.Procedures {
-				if pr.InPackage != "" {
-					idx.Symbols.Add(Symbol{
-						Name: fmt.Sprintf("%s.%s.%s", libName, strings.ToLower(pr.InPackage), strings.ToLower(pr.Name)),
-						Kind: "procedure",
-						File: f,
-						Line: pr.Line,
-					})
-				}
-			}
+			idx.registerSymbolsForFacts(facts, f)
 		}(file)
 	}
 
 	wg.Wait()
 	close(factsChan)
 	close(errChan)
+	close(pipelineErrChan)
 
 	// Collect errors
 	var errs []error
 	for err := range errChan {
 		errs = append(errs, err)
 	}
+	for err := range pipelineErrChan {
+		recordPipelineErr(err)
+	}
 
 	// Collect facts
+	factsByFile := make(map[string]extractor.FileFacts)
 	for facts := range factsChan {
 		idx.Facts = append(idx.Facts, facts)
+		factsByFile[facts.File] = facts
+	}
+	if cache != nil {
+		if err := cache.Save(); err != nil {
+			recordPipelineErr(fmt.Errorf("cache save failed: %w", err))
+		}
+	}
+	extractDuration := time.Since(stepStart)
+	timing.RecordStage("extract", stepStart, extractDuration, "")
+
+	// Cache impact visualization (verbose/progress/trace)
+	if cache != nil && progressEnabled && len(changedFiles) > 0 {
+		fmt.Printf("\n=== Cache Impact ===\n")
+		dependents := buildDependentsGraph(factsByFile, idx.Symbols, idx.FileLibraries)
+		changedList := make([]string, 0, len(changedFiles))
+		for f := range changedFiles {
+			changedList = append(changedList, f)
+		}
+		sort.Strings(changedList)
+		for _, f := range changedList {
+			report := computeImpact(f, dependents)
+			fmt.Print(formatImpactReport(report))
+		}
 	}
 
 	// Elaborate generate statements using constant values
+	stepStart = time.Now()
 	// Build a global constant map from all extracted constants
 	globalConstants := make(map[string]int)
 	for _, facts := range idx.Facts {
@@ -357,6 +515,23 @@ func (idx *Indexer) Run(rootPath string) error {
 		fmt.Printf("\n=== Verbose: Generate Elaboration ===\n")
 		fmt.Printf("  Elaborated %d for-generates using %d constants\n", elaboratedCount, len(globalConstants))
 	}
+	elabDuration := time.Since(stepStart)
+	timing.RecordStage("elaborate", stepStart, elabDuration, "")
+	var factsValidateDuration time.Duration
+
+	// Validate relational fact tables for Datalog ingestion
+	stepStart = time.Now()
+	factTables := facts.BuildTables(idx.Facts, idx.FileLibraries, idx.ThirdPartyFiles, idx.buildSymbolRows())
+	factFiles := sortedFactFiles(factTables)
+	factsValidator, err := validator.NewFactsValidator()
+	if err != nil {
+		return fmt.Errorf("CRITICAL: Failed to initialize facts validator: %w", err)
+	}
+	if err := factsValidator.Validate(factTables); err != nil {
+		return fmt.Errorf("CRITICAL: Fact table contract violation: %w", err)
+	}
+	factsValidateDuration = time.Since(stepStart)
+	timing.RecordStage("facts_validate", stepStart, factsValidateDuration, "")
 
 	// Verbose output for debugging
 	if idx.Verbose {
@@ -611,6 +786,7 @@ func (idx *Indexer) Run(rootPath string) error {
 	}
 
 	// 3. Pass 2: Resolution (check imports)
+	stepStart = time.Now()
 	// Note: "work" in VHDL is a relative reference to the file's own library.
 	// We translate "work.x" to the file's actual library name for resolution.
 	var missing []string
@@ -628,39 +804,55 @@ func (idx *Indexer) Run(rootPath string) error {
 			if strings.HasPrefix(qualName, "work.") {
 				qualName = fileLib + qualName[4:] // Replace "work" with actual library
 			}
+			// Unqualified names resolve in the local library by default
+			if !strings.Contains(qualName, ".") {
+				qualName = fileLib + "." + qualName
+			}
 
 			if !idx.Symbols.Has(qualName) && !isStandardLibrary(qualName) {
 				missing = append(missing, fmt.Sprintf("%s: missing import %q", facts.File, dep.Target))
 			}
 		}
 	}
+	resolveDuration := time.Since(stepStart)
+	timing.RecordStage("resolve", stepStart, resolveDuration, "")
 
-	// 4. Build OPA input
-	opaInput := idx.buildPolicyInput()
+	// 4. Build policy engine input
+	stepStart = time.Now()
+	policyInput := idx.buildPolicyInput()
+	buildDuration := time.Since(stepStart)
+	timing.RecordStage("build_input", stepStart, buildDuration, "")
 
 	// 5. Validate data structure before policy evaluation (CUE contract enforcement)
+	stepStart = time.Now()
 	v, err := validator.New()
 	if err != nil {
 		return fmt.Errorf("CRITICAL: Failed to initialize CUE validator: %w", err)
 	}
-	if err := v.Validate(opaInput); err != nil {
-		return fmt.Errorf("CRITICAL: Data contract violation (Go -> OPA mismatch): %w", err)
+	if err := validateVerificationTags(v, &policyInput); err != nil {
+		return fmt.Errorf("CRITICAL: Failed to validate verification tags: %w", err)
 	}
+	if err := v.Validate(policyInput); err != nil {
+		return fmt.Errorf("CRITICAL: Data contract violation (Go -> policy engine mismatch): %w", err)
+	}
+	validateDuration := time.Since(stepStart)
+	timing.RecordStage("validate", stepStart, validateDuration, "")
 
 	// 6. Run policy evaluation and build result
+	stepStart = time.Now()
 	lintResult := LintResult{
 		Violations:  []policy.Violation{},
 		ParseErrors: []ParseError{},
 		Stats: ExtractionStats{
 			Files:     len(files),
 			Symbols:   idx.Symbols.Len(),
-			Entities:  len(opaInput.Entities),
-			Packages:  len(opaInput.Packages),
-			Signals:   len(opaInput.Signals),
-			Ports:     len(opaInput.Ports),
-			Processes: len(opaInput.Processes),
-			Instances: len(opaInput.Instances),
-			Generates: len(opaInput.Generates),
+			Entities:  len(policyInput.Entities),
+			Packages:  len(policyInput.Packages),
+			Signals:   len(policyInput.Signals),
+			Ports:     len(policyInput.Ports),
+			Processes: len(policyInput.Processes),
+			Instances: len(policyInput.Instances),
+			Generates: len(policyInput.Generates),
 		},
 		Files: []FileResult{},
 	}
@@ -673,46 +865,67 @@ func (idx *Indexer) Run(rootPath string) error {
 		})
 	}
 
-	policyEngine, err := policy.New("policies")
-	if err != nil {
-		if !idx.JSONOutput {
-			fmt.Printf("Warning: Could not load policies: %v\n", err)
-		}
-	} else {
-		result, err := policyEngine.Evaluate(opaInput)
-		if err != nil {
-			if !idx.JSONOutput {
-				fmt.Printf("Warning: Policy evaluation failed: %v\n", err)
-			}
-		} else {
-			lintResult.Violations = result.Violations
-			lintResult.Summary = ResultSummary{
-				TotalViolations: result.Summary.TotalViolations,
-				Errors:          result.Summary.Errors,
-				Warnings:        result.Summary.Warnings,
-				Info:            result.Summary.Info,
-			}
+	policyCached := false
+	policyUsedDaemon := false
+	policyDelta := false
 
-			// Build per-file breakdown
-			fileViolations := make(map[string]*FileResult)
-			for _, v := range result.Violations {
-				fr, ok := fileViolations[v.File]
-				if !ok {
-					fr = &FileResult{Path: v.File}
-					fileViolations[v.File] = fr
-				}
-				switch v.Severity {
-				case "error":
-					fr.Errors++
-				case "warning":
-					fr.Warnings++
-				case "info":
-					fr.Info++
-				}
+	if envBool("VHDL_POLICY_DAEMON") {
+		if cache == nil {
+			recordPipelineErr(fmt.Errorf("policy daemon requested but cache disabled"))
+		}
+		if result, usedDelta, err := runPolicyDaemon(cacheDir, cache != nil, factTables, changedFiles); err != nil {
+			recordPipelineErr(fmt.Errorf("policy daemon failed: %w", err))
+		} else {
+			applyPolicyResult(&lintResult, result)
+			policyUsedDaemon = true
+			policyDelta = usedDelta
+		}
+	}
+
+	cacheHash := ""
+	if !policyUsedDaemon && cache != nil {
+		if hash, err := policyConfigHash(policyInput); err == nil {
+			cacheHash = hash
+		} else {
+			recordPipelineErr(fmt.Errorf("policy cache disabled: %w", err))
+		}
+	}
+	if !policyUsedDaemon && cache != nil && len(changedFiles) == 0 && cacheHash != "" {
+		if entry, err := loadPolicyCache(cacheDir); err != nil {
+			recordPipelineErr(fmt.Errorf("policy cache load failed: %w", err))
+		} else if ok, err := policyCacheValid(entry, policyInput, factFiles); err == nil && ok {
+			applyPolicyResult(&lintResult, &entry.Result)
+			policyCached = true
+		} else if err != nil {
+			recordPipelineErr(fmt.Errorf("policy cache disabled: %w", err))
+		}
+	}
+
+	if !policyCached && !policyUsedDaemon {
+		policyEngine, err := policy.New(".")
+		if err != nil {
+			return fmt.Errorf("initialize policy engine: %w", err)
+		}
+		result, err := policyEngine.Evaluate(policyInput)
+		if err != nil {
+			return fmt.Errorf("policy evaluation failed: %w", err)
+		}
+		applyPolicyResult(&lintResult, result)
+		if cache != nil && cacheHash != "" {
+			if err := savePolicyCache(cacheDir, policyCacheEntry{
+				Version:    policyCacheVersion,
+				ConfigHash: cacheHash,
+				Files:      factFiles,
+				Result:     *result,
+			}); err != nil {
+				recordPipelineErr(fmt.Errorf("policy cache save failed: %w", err))
 			}
-			for _, fr := range fileViolations {
-				lintResult.Files = append(lintResult.Files, *fr)
-			}
+		}
+	}
+
+	if cache != nil {
+		if err := saveFactTablesCache(cacheDir, factTables); err != nil {
+			recordPipelineErr(fmt.Errorf("fact tables cache save failed: %w", err))
 		}
 	}
 
@@ -759,24 +972,167 @@ func (idx *Indexer) Run(rootPath string) error {
 			}
 		}
 	}
+	policyDuration := time.Since(stepStart)
+	policyStatus := ""
+	if policyUsedDaemon {
+		if policyDelta {
+			policyStatus = "daemon_delta"
+		} else {
+			policyStatus = "daemon_init"
+		}
+	} else if policyCached {
+		policyStatus = "cached"
+	}
+	timing.RecordStage("policy", stepStart, policyDuration, policyStatus)
 
+	if (idx.Verbose || idx.Progress || idx.Trace) && !idx.JSONOutput {
+		fmt.Printf("\n=== Timing Summary ===\n")
+		fmt.Printf("  scan:        %s\n", formatDuration(scanDuration))
+		fmt.Printf("  extract:     %s\n", formatDuration(extractDuration))
+		fmt.Printf("  elaborate:   %s\n", formatDuration(elabDuration))
+		if factsValidateDuration > 0 {
+			fmt.Printf("  facts:       %s\n", formatDuration(factsValidateDuration))
+		}
+		fmt.Printf("  resolve:     %s\n", formatDuration(resolveDuration))
+		fmt.Printf("  build input: %s\n", formatDuration(buildDuration))
+		fmt.Printf("  validate:    %s\n", formatDuration(validateDuration))
+		if policyUsedDaemon {
+			label := "daemon (init)"
+			if policyDelta {
+				label = "daemon (delta)"
+			}
+			fmt.Printf("  policy:      %s (%s)\n", label, formatDuration(policyDuration))
+		} else if policyCached {
+			fmt.Printf("  policy:      cached (%s)\n", formatDuration(policyDuration))
+		} else {
+			fmt.Printf("  policy:      %s\n", formatDuration(policyDuration))
+		}
+		fmt.Printf("  total:       %s\n", formatDuration(time.Since(runStart)))
+	}
+	timing.RecordStage("total", runStart, time.Since(runStart), "")
+
+	if len(pipelineErrs) > 0 {
+		return fmt.Errorf("pipeline errors:\n%s", formatPipelineErrors(pipelineErrs))
+	}
 	return nil
 }
 
-// buildPolicyInput converts extracted facts to OPA input format
+func formatPipelineErrors(errs []error) string {
+	var b strings.Builder
+	for i, err := range errs {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString("- ")
+		b.WriteString(err.Error())
+	}
+	return b.String()
+}
+
+func applyPolicyResult(lintResult *LintResult, result *policy.Result) {
+	if lintResult == nil || result == nil {
+		return
+	}
+	lintResult.Violations = result.Violations
+	lintResult.MissingChecks = result.MissingChecks
+	lintResult.AmbiguousConstructs = result.AmbiguousConstructs
+	lintResult.Summary = ResultSummary{
+		TotalViolations: result.Summary.TotalViolations,
+		Errors:          result.Summary.Errors,
+		Warnings:        result.Summary.Warnings,
+		Info:            result.Summary.Info,
+	}
+
+	fileViolations := make(map[string]*FileResult)
+	for _, v := range result.Violations {
+		fr, ok := fileViolations[v.File]
+		if !ok {
+			fr = &FileResult{Path: v.File}
+			fileViolations[v.File] = fr
+		}
+		switch v.Severity {
+		case "error":
+			fr.Errors++
+		case "warning":
+			fr.Warnings++
+		case "info":
+			fr.Info++
+		}
+	}
+	lintResult.Files = lintResult.Files[:0]
+	for _, fr := range fileViolations {
+		lintResult.Files = append(lintResult.Files, *fr)
+	}
+}
+
+func runPolicyDaemon(cacheDir string, cacheEnabled bool, tables facts.Tables, changedFiles map[string]bool) (*policy.Result, bool, error) {
+	daemon, err := policy.NewDaemon(".")
+	if err != nil {
+		return nil, false, err
+	}
+	defer func() {
+		_ = daemon.Close()
+	}()
+
+	if cacheEnabled {
+		if prev, ok, err := loadFactTablesCache(cacheDir); err != nil {
+			return nil, false, err
+		} else if ok {
+			if _, err := daemon.Init(prev); err != nil {
+				return nil, false, err
+			}
+			delta := facts.ComputeDelta(prev, tables)
+			if len(changedFiles) > 0 {
+				delta = facts.FilterDeltaByFiles(delta, changedFiles)
+			}
+			result, err := daemon.Delta(delta)
+			return result, true, err
+		}
+	}
+
+	result, err := daemon.Init(tables)
+	return result, false, err
+}
+
+func envBool(key string) bool {
+	val := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	return val == "1" || val == "true" || val == "yes" || val == "on"
+}
+
+func sortedFactFiles(tables facts.Tables) []string {
+	files := make([]string, 0, len(tables.Files))
+	for _, file := range tables.Files {
+		files = append(files, file.Path)
+	}
+	sort.Strings(files)
+	return files
+}
+
+// buildPolicyInput converts extracted facts to the policy engine input format
 func (idx *Indexer) buildPolicyInput() policy.Input {
 	// Initialize all slices to empty (not nil) to ensure JSON serialization
 	// produces [] instead of null - the CUE contract requires arrays
 	input := policy.Input{
 		Standard:              idx.Config.Standard,
+		FileCount:             len(idx.Facts),
 		Entities:              []policy.Entity{},
 		Architectures:         []policy.Architecture{},
 		Packages:              []policy.Package{},
 		Components:            []policy.Component{},
+		UseClauses:            []policy.UseClause{},
+		LibraryClauses:        []policy.LibraryClause{},
+		ContextClauses:        []policy.ContextClause{},
 		Signals:               []policy.Signal{},
 		Ports:                 []policy.Port{},
 		Dependencies:          []policy.Dependency{},
 		Symbols:               []policy.Symbol{},
+		Scopes:                []policy.Scope{},
+		SymbolDefs:            []policy.SymbolDef{},
+		NameUses:              []policy.NameUse{},
+		Files:                 []policy.FileInfo{},
+		VerificationBlocks:    []policy.VerificationBlock{},
+		VerificationTags:      []policy.VerificationTag{},
+		VerificationTagErrors: []policy.VerificationTagError{},
 		Instances:             []policy.Instance{},
 		CaseStatements:        []policy.CaseStatement{},
 		Processes:             []policy.Process{},
@@ -790,8 +1146,9 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 		Procedures:    []policy.ProcedureDeclaration{},
 		ConstantDecls: []policy.ConstantDeclaration{},
 		// Type system info for filtering (LEGACY)
-		EnumLiterals: []string{},
-		Constants:    []string{},
+		EnumLiterals:    []string{},
+		Constants:       []string{},
+		SharedVariables: []string{},
 		// Advanced analysis
 		Comparisons:   []policy.Comparison{},
 		ArithmeticOps: []policy.ArithmeticOp{},
@@ -810,28 +1167,61 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 		input.ThirdPartyFiles = append(input.ThirdPartyFiles, f)
 	}
 
+	// Add file/library mappings
+	fileList := make([]string, 0, len(idx.Facts))
+	for _, facts := range idx.Facts {
+		fileList = append(fileList, facts.File)
+	}
+	sort.Strings(fileList)
+	for _, file := range fileList {
+		lib := "work"
+		if info, ok := idx.FileLibraries[file]; ok && info.LibraryName != "" {
+			lib = strings.ToLower(info.LibraryName)
+		}
+		input.Files = append(input.Files, policy.FileInfo{
+			Path:         file,
+			Library:      lib,
+			IsThirdParty: idx.ThirdPartyFiles[file],
+		})
+	}
+
 	// Aggregate facts from all files
 	for _, facts := range idx.Facts {
 		for _, e := range facts.Entities {
 			// Find ports for this entity (initialize to empty, not nil)
 			ports := []policy.Port{}
+			generics := []policy.GenericDecl{}
 			for _, p := range facts.Ports {
 				if p.InEntity == e.Name {
 					ports = append(ports, policy.Port{
 						Name:      p.Name,
 						Direction: p.Direction,
 						Type:      p.Type,
+						Default:   p.Default,
 						Line:      p.Line,
 						InEntity:  p.InEntity,
 						Width:     extractor.CalculateWidth(p.Type),
 					})
 				}
 			}
+			for _, g := range e.Generics {
+				generics = append(generics, policy.GenericDecl{
+					Name:        g.Name,
+					Kind:        g.Kind,
+					Type:        g.Type,
+					Class:       g.Class,
+					Default:     g.Default,
+					Line:        g.Line,
+					InEntity:    g.InEntity,
+					InComponent: g.InComponent,
+				})
+			}
 			input.Entities = append(input.Entities, policy.Entity{
-				Name:  e.Name,
-				File:  facts.File,
-				Line:  e.Line,
-				Ports: ports,
+				Name:     e.Name,
+				File:     facts.File,
+				Line:     e.Line,
+				Ports:    ports,
+				Generics: generics,
 			})
 		}
 
@@ -852,13 +1242,65 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 			})
 		}
 
+		for _, u := range facts.UseClauses {
+			input.UseClauses = append(input.UseClauses, policy.UseClause{
+				Items: u.Items,
+				File:  facts.File,
+				Line:  u.Line,
+			})
+		}
+		for _, l := range facts.LibraryClauses {
+			input.LibraryClauses = append(input.LibraryClauses, policy.LibraryClause{
+				Libraries: l.Libraries,
+				File:      facts.File,
+				Line:      l.Line,
+			})
+		}
+		for _, c := range facts.ContextClauses {
+			input.ContextClauses = append(input.ContextClauses, policy.ContextClause{
+				Name: c.Name,
+				File: facts.File,
+				Line: c.Line,
+			})
+		}
+
+		for _, sharedName := range facts.SharedVariables {
+			input.SharedVariables = append(input.SharedVariables, sharedName)
+		}
+
 		for _, c := range facts.Components {
+			componentPorts := []policy.Port{}
+			componentGenerics := []policy.GenericDecl{}
+			for _, p := range c.Ports {
+				componentPorts = append(componentPorts, policy.Port{
+					Name:      p.Name,
+					Direction: p.Direction,
+					Type:      p.Type,
+					Line:      p.Line,
+					InEntity:  p.InEntity,
+					Width:     extractor.CalculateWidth(p.Type),
+				})
+			}
+			for _, g := range c.Generics {
+				componentGenerics = append(componentGenerics, policy.GenericDecl{
+					Name:        g.Name,
+					Kind:        g.Kind,
+					Type:        g.Type,
+					Class:       g.Class,
+					Default:     g.Default,
+					Line:        g.Line,
+					InEntity:    g.InEntity,
+					InComponent: g.InComponent,
+				})
+			}
 			input.Components = append(input.Components, policy.Component{
 				Name:       c.Name,
 				EntityRef:  c.EntityRef,
 				File:       facts.File,
 				Line:       c.Line,
 				IsInstance: c.IsInstance,
+				Ports:      componentPorts,
+				Generics:   componentGenerics,
 			})
 		}
 
@@ -900,8 +1342,20 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 			if strings.HasPrefix(qualName, "work.") {
 				qualName = fileLib + qualName[4:]
 			}
+			if !strings.Contains(qualName, ".") {
+				qualName = fileLib + "." + qualName
+			}
 
 			resolved := idx.Symbols.Has(qualName) || isStandardLibrary(d.Target)
+			if !resolved && d.Kind == "instantiation" {
+				baseName := qualName
+				if idxDot := strings.LastIndex(baseName, "."); idxDot != -1 {
+					baseName = baseName[idxDot+1:]
+				}
+				if baseName != "" && idx.Symbols.HasSuffix(baseName) {
+					resolved = true
+				}
+			}
 			input.Dependencies = append(input.Dependencies, policy.Dependency{
 				Source:   d.Source,
 				Target:   d.Target,
@@ -921,14 +1375,29 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 			if genericMap == nil {
 				genericMap = make(map[string]string)
 			}
+			associations := []policy.Association{}
+			for _, assoc := range inst.Associations {
+				associations = append(associations, policy.Association{
+					Kind:          assoc.Kind,
+					Formal:        assoc.Formal,
+					Actual:        assoc.Actual,
+					IsPositional:  assoc.IsPositional,
+					ActualKind:    assoc.ActualKind,
+					ActualBase:    assoc.ActualBase,
+					ActualFull:    assoc.ActualFull,
+					Line:          assoc.Line,
+					PositionIndex: assoc.PositionIndex,
+				})
+			}
 			input.Instances = append(input.Instances, policy.Instance{
-				Name:       inst.Name,
-				Target:     inst.Target,
-				PortMap:    portMap,
-				GenericMap: genericMap,
-				File:       facts.File,
-				Line:       inst.Line,
-				InArch:     inst.InArch,
+				Name:         inst.Name,
+				Target:       inst.Target,
+				PortMap:      portMap,
+				GenericMap:   genericMap,
+				Associations: associations,
+				File:         facts.File,
+				Line:         inst.Line,
+				InArch:       inst.InArch,
 			})
 		}
 
@@ -964,6 +1433,56 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 			if read == nil {
 				read = []string{}
 			}
+			vars := []policy.VariableDecl{}
+			for _, v := range proc.Variables {
+				vars = append(vars, policy.VariableDecl{
+					Name: v.Name,
+					Type: v.Type,
+					Line: v.Line,
+				})
+			}
+			procCalls := []policy.ProcedureCall{}
+			for _, c := range proc.ProcedureCalls {
+				args := c.Args
+				if args == nil {
+					args = []string{}
+				}
+				procCalls = append(procCalls, policy.ProcedureCall{
+					Name:      c.Name,
+					FullName:  c.FullName,
+					Args:      args,
+					Line:      c.Line,
+					InProcess: c.InProcess,
+					InArch:    c.InArch,
+				})
+			}
+			funcCalls := []policy.FunctionCall{}
+			for _, c := range proc.FunctionCalls {
+				args := c.Args
+				if args == nil {
+					args = []string{}
+				}
+				funcCalls = append(funcCalls, policy.FunctionCall{
+					Name:      c.Name,
+					Args:      args,
+					Line:      c.Line,
+					InProcess: c.InProcess,
+					InArch:    c.InArch,
+				})
+			}
+			waitStmts := []policy.WaitStatement{}
+			for _, w := range proc.WaitStatements {
+				onSignals := w.OnSignals
+				if onSignals == nil {
+					onSignals = []string{}
+				}
+				waitStmts = append(waitStmts, policy.WaitStatement{
+					OnSignals: onSignals,
+					UntilExpr: w.UntilExpr,
+					ForExpr:   w.ForExpr,
+					Line:      w.Line,
+				})
+			}
 			input.Processes = append(input.Processes, policy.Process{
 				Label:           proc.Label,
 				SensitivityList: sensList,
@@ -973,8 +1492,13 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 				ClockEdge:       proc.ClockEdge,
 				HasReset:        proc.HasReset,
 				ResetSignal:     proc.ResetSignal,
+				ResetAsync:      proc.ResetAsync,
 				AssignedSignals: assigned,
 				ReadSignals:     read,
+				Variables:       vars,
+				ProcedureCalls:  procCalls,
+				FunctionCalls:   funcCalls,
+				WaitStatements:  waitStmts,
 				File:            facts.File,
 				Line:            proc.Line,
 				InArch:          proc.InArch,
@@ -1077,6 +1601,7 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 				InProcess:    usage.InProcess,
 				InPortMap:    usage.InPortMap,
 				InstanceName: usage.InstanceName,
+				InPSL:        usage.InPSL,
 				Line:         usage.Line,
 			})
 		}
@@ -1109,6 +1634,42 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 				EntityName: cfg.EntityName,
 				File:       facts.File,
 				Line:       cfg.Line,
+			})
+		}
+
+		for _, block := range facts.VerificationBlocks {
+			input.VerificationBlocks = append(input.VerificationBlocks, policy.VerificationBlock{
+				Label:     block.Label,
+				LineStart: block.LineStart,
+				LineEnd:   block.LineEnd,
+				File:      facts.File,
+				InArch:    block.InArch,
+			})
+		}
+
+		for _, tag := range facts.VerificationTags {
+			bindings := tag.Bindings
+			if bindings == nil {
+				bindings = map[string]string{}
+			}
+			input.VerificationTags = append(input.VerificationTags, policy.VerificationTag{
+				ID:       tag.ID,
+				Scope:    tag.Scope,
+				Bindings: bindings,
+				File:     facts.File,
+				Line:     tag.Line,
+				Raw:      tag.Raw,
+				InArch:   tag.InArch,
+			})
+		}
+
+		for _, terr := range facts.VerificationTagErrors {
+			input.VerificationTagErrors = append(input.VerificationTagErrors, policy.VerificationTagError{
+				File:    facts.File,
+				Line:    terr.Line,
+				Raw:     terr.Raw,
+				Message: terr.Message,
+				InArch:  terr.InArch,
 			})
 		}
 
@@ -1255,7 +1816,497 @@ func (idx *Indexer) buildPolicyInput() policy.Input {
 		})
 	}
 
+	idx.populateScopesDefsUses(&input)
+
 	return input
+}
+
+func validateVerificationTags(v *validator.Validator, input *policy.Input) error {
+	if len(input.VerificationTags) == 0 {
+		return nil
+	}
+	valid := input.VerificationTags[:0]
+	for _, tag := range input.VerificationTags {
+		if err := v.ValidateVerificationTag(tag); err != nil {
+			input.VerificationTagErrors = append(input.VerificationTagErrors, policy.VerificationTagError{
+				File:    tag.File,
+				Line:    tag.Line,
+				Raw:     tag.Raw,
+				Message: err.Error(),
+				InArch:  tag.InArch,
+			})
+			continue
+		}
+		if tag.Bindings == nil {
+			tag.Bindings = map[string]string{}
+		}
+		valid = append(valid, tag)
+	}
+	input.VerificationTags = valid
+	return nil
+}
+
+func (idx *Indexer) populateScopesDefsUses(input *policy.Input) {
+	scopeByID := make(map[string]policy.Scope)
+	fileScope := make(map[string]string)
+	entityScopes := make(map[string]map[string]string)
+	packageScopes := make(map[string]map[string]string)
+	archScopes := make(map[string]map[string]string)
+	archPathScopes := make(map[string]map[string]string)
+
+	normalize := func(name string) string {
+		return strings.ToLower(strings.TrimSpace(name))
+	}
+
+	ensureMap := func(m map[string]map[string]string, file string) map[string]string {
+		if m[file] == nil {
+			m[file] = make(map[string]string)
+		}
+		return m[file]
+	}
+
+	addScope := func(id, kind, file string, line int, parent string) string {
+		if id == "" {
+			return ""
+		}
+		if existing, ok := scopeByID[id]; ok {
+			if line > 0 && (existing.Line < 1 || (existing.Line == 1 && line != 1)) {
+				existing.Line = line
+				scopeByID[id] = existing
+			}
+			return id
+		}
+		if line < 1 {
+			line = 1
+		}
+		path := []string{id}
+		if parent != "" {
+			if parentScope, ok := scopeByID[parent]; ok && len(parentScope.Path) > 0 {
+				path = append(append([]string{}, parentScope.Path...), id)
+			} else {
+				path = []string{parent, id}
+			}
+		}
+		scopeByID[id] = policy.Scope{
+			Name:   id,
+			Kind:   kind,
+			File:   file,
+			Line:   line,
+			Parent: parent,
+			Path:   path,
+		}
+		return id
+	}
+
+	ensureFileScope := func(file string) string {
+		if file == "" {
+			return ""
+		}
+		if id, ok := fileScope[file]; ok {
+			return id
+		}
+		id := "file:" + file
+		addScope(id, "file", file, 1, "")
+		fileScope[file] = id
+		return id
+	}
+
+	ensureEntityScope := func(file, name string, line int) string {
+		if name == "" {
+			return ensureFileScope(file)
+		}
+		m := ensureMap(entityScopes, file)
+		key := normalize(name)
+		if id, ok := m[key]; ok {
+			return id
+		}
+		parent := ensureFileScope(file)
+		id := parent + "::entity:" + key
+		addScope(id, "entity", file, line, parent)
+		m[key] = id
+		return id
+	}
+
+	ensurePackageScope := func(file, name string, line int) string {
+		if name == "" {
+			return ensureFileScope(file)
+		}
+		m := ensureMap(packageScopes, file)
+		key := normalize(name)
+		if id, ok := m[key]; ok {
+			return id
+		}
+		parent := ensureFileScope(file)
+		id := parent + "::package:" + key
+		addScope(id, "package", file, line, parent)
+		m[key] = id
+		return id
+	}
+
+	ensureArchScope := func(file, name string, line int) string {
+		if name == "" {
+			return ensureFileScope(file)
+		}
+		m := ensureMap(archScopes, file)
+		key := normalize(name)
+		if id, ok := m[key]; ok {
+			return id
+		}
+		parent := ensureFileScope(file)
+		id := parent + "::arch:" + key
+		addScope(id, "architecture", file, line, parent)
+		m[key] = id
+		ensureMap(archPathScopes, file)[key] = id
+		return id
+	}
+
+	splitScopePath := func(path string) []string {
+		raw := strings.Split(path, ".")
+		parts := make([]string, 0, len(raw))
+		for _, part := range raw {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			parts = append(parts, part)
+		}
+		return parts
+	}
+
+	ensureArchPathScope := func(file, archPath string) string {
+		parts := splitScopePath(archPath)
+		if len(parts) == 0 {
+			return ensureFileScope(file)
+		}
+		archName := parts[0]
+		parent := ensureArchScope(file, archName, 1)
+		currentKey := normalize(archName)
+		ensureMap(archPathScopes, file)[currentKey] = parent
+		for _, seg := range parts[1:] {
+			if seg == "" {
+				continue
+			}
+			segKey := normalize(seg)
+			currentKey = currentKey + "." + segKey
+			if id, ok := ensureMap(archPathScopes, file)[currentKey]; ok {
+				parent = id
+				continue
+			}
+			id := parent + "::generate:" + segKey
+			addScope(id, "generate", file, 1, parent)
+			ensureMap(archPathScopes, file)[currentKey] = id
+			parent = id
+		}
+		return parent
+	}
+
+	ensureGenerateScope := func(file string, gen policy.GenerateStatement) string {
+		parent := ensureArchPathScope(file, gen.InArch)
+		label := strings.TrimSpace(gen.Label)
+		if label == "" {
+			label = fmt.Sprintf("gen@%d", gen.Line)
+		}
+		pathKey := normalize(strings.Trim(strings.Join([]string{gen.InArch, label}, "."), "."))
+		if pathKey == "" {
+			return parent
+		}
+		if id, ok := ensureMap(archPathScopes, file)[pathKey]; ok {
+			if scope, ok := scopeByID[id]; ok && gen.Line > 0 && (scope.Line < 1 || (scope.Line == 1 && gen.Line != 1)) {
+				scope.Line = gen.Line
+				scopeByID[id] = scope
+			}
+			return id
+		}
+		id := parent + "::generate:" + normalize(label)
+		addScope(id, "generate", file, gen.Line, parent)
+		ensureMap(archPathScopes, file)[pathKey] = id
+		return id
+	}
+
+	scopeForContext := func(file, context string) string {
+		ctx := normalize(context)
+		if ctx == "" {
+			return ensureFileScope(file)
+		}
+		if scopes := packageScopes[file]; scopes != nil {
+			if id, ok := scopes[ctx]; ok {
+				return id
+			}
+		}
+		if scopes := entityScopes[file]; scopes != nil {
+			if id, ok := scopes[ctx]; ok {
+				return id
+			}
+		}
+		if scopes := archPathScopes[file]; scopes != nil {
+			if id, ok := scopes[ctx]; ok {
+				return id
+			}
+		}
+		if scopes := archScopes[file]; scopes != nil {
+			if id, ok := scopes[ctx]; ok {
+				return id
+			}
+		}
+		return ensureFileScope(file)
+	}
+
+	// Seed file scopes
+	for _, fileInfo := range input.Files {
+		ensureFileScope(fileInfo.Path)
+	}
+
+	// Build scopes for entities, packages, architectures, and generates
+	for _, ent := range input.Entities {
+		ensureEntityScope(ent.File, ent.Name, ent.Line)
+	}
+	for _, pkg := range input.Packages {
+		ensurePackageScope(pkg.File, pkg.Name, pkg.Line)
+	}
+	for _, arch := range input.Architectures {
+		ensureArchScope(arch.File, arch.Name, arch.Line)
+	}
+	for _, gen := range input.Generates {
+		ensureGenerateScope(gen.File, gen)
+	}
+
+	// Export scopes in deterministic order
+	scopeIDs := make([]string, 0, len(scopeByID))
+	for id := range scopeByID {
+		scopeIDs = append(scopeIDs, id)
+	}
+	sort.Strings(scopeIDs)
+	for _, id := range scopeIDs {
+		input.Scopes = append(input.Scopes, scopeByID[id])
+	}
+
+	// Symbol definitions
+	for _, ent := range input.Entities {
+		fileScopeID := ensureFileScope(ent.File)
+		input.SymbolDefs = append(input.SymbolDefs, policy.SymbolDef{
+			Name:  ent.Name,
+			Kind:  "entity",
+			File:  ent.File,
+			Line:  ent.Line,
+			Scope: fileScopeID,
+		})
+		entityScopeID := ensureEntityScope(ent.File, ent.Name, ent.Line)
+		for _, port := range ent.Ports {
+			input.SymbolDefs = append(input.SymbolDefs, policy.SymbolDef{
+				Name:  port.Name,
+				Kind:  "port",
+				File:  ent.File,
+				Line:  port.Line,
+				Scope: entityScopeID,
+			})
+		}
+		for _, gen := range ent.Generics {
+			input.SymbolDefs = append(input.SymbolDefs, policy.SymbolDef{
+				Name:  gen.Name,
+				Kind:  "generic",
+				File:  ent.File,
+				Line:  gen.Line,
+				Scope: entityScopeID,
+			})
+		}
+	}
+
+	for _, arch := range input.Architectures {
+		fileScopeID := ensureFileScope(arch.File)
+		input.SymbolDefs = append(input.SymbolDefs, policy.SymbolDef{
+			Name:  arch.Name,
+			Kind:  "architecture",
+			File:  arch.File,
+			Line:  arch.Line,
+			Scope: fileScopeID,
+		})
+	}
+
+	for _, pkg := range input.Packages {
+		pkgScopeID := ensurePackageScope(pkg.File, pkg.Name, pkg.Line)
+		input.SymbolDefs = append(input.SymbolDefs, policy.SymbolDef{
+			Name:  pkg.Name,
+			Kind:  "package",
+			File:  pkg.File,
+			Line:  pkg.Line,
+			Scope: pkgScopeID,
+		})
+	}
+
+	for _, sig := range input.Signals {
+		scopeID := scopeForContext(sig.File, sig.InEntity)
+		input.SymbolDefs = append(input.SymbolDefs, policy.SymbolDef{
+			Name:  sig.Name,
+			Kind:  "signal",
+			File:  sig.File,
+			Line:  sig.Line,
+			Scope: scopeID,
+		})
+	}
+
+	for _, typ := range input.Types {
+		scopeName := typ.InPackage
+		if scopeName == "" {
+			scopeName = typ.InArch
+		}
+		scopeID := scopeForContext(typ.File, scopeName)
+		input.SymbolDefs = append(input.SymbolDefs, policy.SymbolDef{
+			Name:  typ.Name,
+			Kind:  "type",
+			File:  typ.File,
+			Line:  typ.Line,
+			Scope: scopeID,
+		})
+	}
+
+	for _, st := range input.Subtypes {
+		scopeName := st.InPackage
+		if scopeName == "" {
+			scopeName = st.InArch
+		}
+		scopeID := scopeForContext(st.File, scopeName)
+		input.SymbolDefs = append(input.SymbolDefs, policy.SymbolDef{
+			Name:  st.Name,
+			Kind:  "subtype",
+			File:  st.File,
+			Line:  st.Line,
+			Scope: scopeID,
+		})
+	}
+
+	for _, fn := range input.Functions {
+		scopeName := fn.InPackage
+		if scopeName == "" {
+			scopeName = fn.InArch
+		}
+		scopeID := scopeForContext(fn.File, scopeName)
+		input.SymbolDefs = append(input.SymbolDefs, policy.SymbolDef{
+			Name:  fn.Name,
+			Kind:  "function",
+			File:  fn.File,
+			Line:  fn.Line,
+			Scope: scopeID,
+		})
+	}
+
+	for _, pr := range input.Procedures {
+		scopeName := pr.InPackage
+		if scopeName == "" {
+			scopeName = pr.InArch
+		}
+		scopeID := scopeForContext(pr.File, scopeName)
+		input.SymbolDefs = append(input.SymbolDefs, policy.SymbolDef{
+			Name:  pr.Name,
+			Kind:  "procedure",
+			File:  pr.File,
+			Line:  pr.Line,
+			Scope: scopeID,
+		})
+	}
+
+	for _, c := range input.ConstantDecls {
+		scopeName := c.InPackage
+		if scopeName == "" {
+			scopeName = c.InArch
+		}
+		scopeID := scopeForContext(c.File, scopeName)
+		input.SymbolDefs = append(input.SymbolDefs, policy.SymbolDef{
+			Name:  c.Name,
+			Kind:  "constant",
+			File:  c.File,
+			Line:  c.Line,
+			Scope: scopeID,
+		})
+	}
+
+	// Name uses from processes
+	for _, proc := range input.Processes {
+		scopeID := scopeForContext(proc.File, proc.InArch)
+		context := proc.Label
+		if context == "" {
+			context = fmt.Sprintf("process@%d", proc.Line)
+		}
+		for _, call := range proc.FunctionCalls {
+			name := strings.TrimSpace(call.Name)
+			if name == "" {
+				continue
+			}
+			input.NameUses = append(input.NameUses, policy.NameUse{
+				Name:    name,
+				Kind:    "function_call",
+				File:    proc.File,
+				Line:    call.Line,
+				Scope:   scopeID,
+				Context: context,
+			})
+		}
+		for _, call := range proc.ProcedureCalls {
+			name := strings.TrimSpace(call.FullName)
+			if name == "" {
+				name = strings.TrimSpace(call.Name)
+			}
+			if name == "" {
+				continue
+			}
+			input.NameUses = append(input.NameUses, policy.NameUse{
+				Name:    name,
+				Kind:    "procedure_call",
+				File:    proc.File,
+				Line:    call.Line,
+				Scope:   scopeID,
+				Context: context,
+			})
+		}
+	}
+
+	// Name uses from signal dependencies
+	for _, dep := range input.SignalDeps {
+		scopeID := scopeForContext(dep.File, dep.InArch)
+		context := dep.InProcess
+		if dep.Source != "" {
+			input.NameUses = append(input.NameUses, policy.NameUse{
+				Name:    dep.Source,
+				Kind:    "signal_read",
+				File:    dep.File,
+				Line:    dep.Line,
+				Scope:   scopeID,
+				Context: context,
+			})
+		}
+		if dep.Target != "" {
+			input.NameUses = append(input.NameUses, policy.NameUse{
+				Name:    dep.Target,
+				Kind:    "signal_write",
+				File:    dep.File,
+				Line:    dep.Line,
+				Scope:   scopeID,
+				Context: context,
+			})
+		}
+	}
+}
+
+func (idx *Indexer) buildSymbolRows() []facts.SymbolRow {
+	if idx.Symbols == nil {
+		return nil
+	}
+	all := idx.Symbols.All()
+	rows := make([]facts.SymbolRow, 0, len(all))
+	for _, sym := range all {
+		rows = append(rows, facts.SymbolRow{
+			Name: sym.Name,
+			Kind: sym.Kind,
+			File: sym.File,
+			Line: sym.Line,
+		})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Name == rows[j].Name {
+			return rows[i].File < rows[j].File
+		}
+		return rows[i].Name < rows[j].Name
+	})
+	return rows
 }
 
 func (idx *Indexer) findVHDLFiles(root string) ([]string, error) {
@@ -1293,6 +2344,25 @@ func (st *SymbolTable) Has(name string) bool {
 	return ok
 }
 
+func (st *SymbolTable) HasSuffix(base string) bool {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	suffix := "." + base
+	for name := range st.symbols {
+		if strings.HasSuffix(name, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func (st *SymbolTable) Get(name string) (Symbol, bool) {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	sym, ok := st.symbols[name]
+	return sym, ok
+}
+
 func (st *SymbolTable) All() map[string]Symbol {
 	st.mu.RLock()
 	defer st.mu.RUnlock()
@@ -1322,4 +2392,166 @@ func isStandardLibrary(name string) bool {
 		}
 	}
 	return false
+}
+
+func isValidIdentifierName(name string) bool {
+	if name == "" {
+		return false
+	}
+	if strings.HasPrefix(name, "\\") && strings.HasSuffix(name, "\\") && len(name) > 2 {
+		return true
+	}
+	first := name[0]
+	if first != '_' && !isAlpha(first) {
+		return false
+	}
+	for i := 1; i < len(name); i++ {
+		b := name[i]
+		if !isAlpha(b) && (b < '0' || b > '9') && b != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+func formatDepTargets(deps []extractor.Dependency) string {
+	if len(deps) == 0 {
+		return ""
+	}
+	seen := make(map[string]bool)
+	var targets []string
+	for _, dep := range deps {
+		if dep.Target == "" {
+			continue
+		}
+		if !seen[dep.Target] {
+			seen[dep.Target] = true
+			targets = append(targets, dep.Target)
+		}
+	}
+	if len(targets) == 0 {
+		return ""
+	}
+	sort.Strings(targets)
+	const max = 6
+	if len(targets) > max {
+		return fmt.Sprintf("%s, ... (+%d more)", strings.Join(targets[:max], ", "), len(targets)-max)
+	}
+	return strings.Join(targets, ", ")
+}
+
+func formatDuration(d time.Duration) string {
+	switch {
+	case d < time.Microsecond:
+		return fmt.Sprintf("%dns", d.Nanoseconds())
+	case d < time.Millisecond:
+		return fmt.Sprintf("%dus", d.Microseconds())
+	case d < time.Second:
+		return fmt.Sprintf("%.2fms", float64(d)/float64(time.Millisecond))
+	case d < time.Minute:
+		return fmt.Sprintf("%.2fs", d.Seconds())
+	case d < time.Hour:
+		return fmt.Sprintf("%.2fm", d.Minutes())
+	default:
+		return fmt.Sprintf("%.2fh", d.Hours())
+	}
+}
+
+func emitProgress(mu *sync.Mutex, progress *int, total int, facts extractor.FileFacts, status string, trace bool, duration time.Duration) {
+	deps := formatDepTargets(facts.Dependencies)
+	mu.Lock()
+	defer mu.Unlock()
+	*progress = *progress + 1
+	fmt.Printf("  [%d/%d] %s (%s, %s)\n", *progress, total, facts.File, status, formatDuration(duration))
+	if deps != "" {
+		fmt.Printf("    deps: %s\n", deps)
+	}
+	if trace {
+		for _, line := range formatFactsSummary(facts) {
+			fmt.Printf("    %s\n", line)
+		}
+	}
+}
+
+func formatFactsSummary(facts extractor.FileFacts) []string {
+	lines := []string{
+		fmt.Sprintf("facts: entities=%d packages=%d arch=%d signals=%d ports=%d processes=%d instances=%d generates=%d deps=%d",
+			len(facts.Entities), len(facts.Packages), len(facts.Architectures), len(facts.Signals), len(facts.Ports),
+			len(facts.Processes), len(facts.Instances), len(facts.Generates), len(facts.Dependencies)),
+	}
+
+	if names := summarizeEntities(facts, 6); names != "" {
+		lines = append(lines, "entities: "+names)
+	}
+	if names := summarizePackages(facts, 6); names != "" {
+		lines = append(lines, "packages: "+names)
+	}
+	if names := summarizeArchitectures(facts, 6); names != "" {
+		lines = append(lines, "architectures: "+names)
+	}
+	if names := summarizeInstances(facts, 4); names != "" {
+		lines = append(lines, "instances: "+names)
+	}
+
+	return lines
+}
+
+func summarizeEntities(facts extractor.FileFacts, max int) string {
+	var names []string
+	for _, e := range facts.Entities {
+		if e.Name != "" {
+			names = append(names, e.Name)
+		}
+	}
+	return summarizeList(names, max)
+}
+
+func summarizePackages(facts extractor.FileFacts, max int) string {
+	var names []string
+	for _, p := range facts.Packages {
+		if p.Name != "" {
+			names = append(names, p.Name)
+		}
+	}
+	return summarizeList(names, max)
+}
+
+func summarizeArchitectures(facts extractor.FileFacts, max int) string {
+	var names []string
+	for _, a := range facts.Architectures {
+		if a.Name != "" {
+			names = append(names, a.Name)
+		}
+	}
+	return summarizeList(names, max)
+}
+
+func summarizeInstances(facts extractor.FileFacts, max int) string {
+	var names []string
+	for _, inst := range facts.Instances {
+		if inst.Name == "" {
+			continue
+		}
+		if inst.Target != "" {
+			names = append(names, fmt.Sprintf("%s->%s", inst.Name, inst.Target))
+		} else {
+			names = append(names, inst.Name)
+		}
+	}
+	return summarizeList(names, max)
+}
+
+func summarizeList(items []string, max int) string {
+	if len(items) == 0 {
+		return ""
+	}
+	sort.Strings(items)
+	if len(items) > max {
+		return fmt.Sprintf("%s, ... (+%d more)", strings.Join(items[:max], ", "), len(items)-max)
+	}
+	return strings.Join(items, ", ")
+}
+
+func isAlpha(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
 }

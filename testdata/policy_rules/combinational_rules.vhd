@@ -5,9 +5,9 @@ entity combinational_rules is
 end combinational_rules;
 
 architecture rtl of combinational_rules is
-  signal a : std_logic;
-  signal b : std_logic;
-  signal c : std_logic;
+  signal a : bit;
+  signal b : bit;
+  signal c : bit;
   signal r0 : std_logic;
   signal r1 : std_logic;
   signal r2 : std_logic;

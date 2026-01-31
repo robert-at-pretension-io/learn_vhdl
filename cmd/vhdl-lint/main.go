@@ -11,7 +11,7 @@
 //   2. Extractor extracts semantic facts (entities, signals, processes...)
 //   3. Indexer builds cross-file symbol table and resolves dependencies
 //   4. CUE Validator enforces data contract (crash on schema mismatch)
-//   5. OPA evaluates policy rules against the extracted data
+//   5. Rust policy engine evaluates rules against the extracted data
 //   6. Violations are reported with file/line locations
 //
 // WHEN INVESTIGATING FALSE POSITIVES:
@@ -47,13 +47,51 @@ func main() {
 			printUsage()
 			os.Exit(1)
 		}
-		runLintWithOptions(os.Args[2], true, false)
+		runLintWithFlags(os.Args[2], true, false, false, false, false)
+	case "-p", "--progress":
+		if len(os.Args) < 3 {
+			printUsage()
+			os.Exit(1)
+		}
+		runLintWithFlags(os.Args[2], false, false, true, false, false)
+	case "-t", "--trace":
+		if len(os.Args) < 3 {
+			printUsage()
+			os.Exit(1)
+		}
+		runLintWithFlags(os.Args[2], false, false, true, true, false)
+	case "--policy-trace":
+		if len(os.Args) < 3 {
+			printUsage()
+			os.Exit(1)
+		}
+		_ = os.Setenv("VHDL_POLICY_TRACE_TIMING", "1")
+		runLintWithFlags(os.Args[2], false, false, false, false, false)
+	case "--policy-stream":
+		if len(os.Args) < 3 {
+			printUsage()
+			os.Exit(1)
+		}
+		_ = os.Setenv("VHDL_POLICY_STREAM", "1")
+		runLintWithFlags(os.Args[2], false, false, false, false, false)
 	case "-j", "--json":
 		if len(os.Args) < 3 {
 			printUsage()
 			os.Exit(1)
 		}
-		runLintWithOptions(os.Args[2], false, true)
+		runLintWithFlags(os.Args[2], false, true, false, false, false)
+	case "--timing":
+		if len(os.Args) < 3 {
+			printUsage()
+			os.Exit(1)
+		}
+		runLintWithFlags(os.Args[2], false, false, false, false, true)
+	case "--clear-policy-cache":
+		if len(os.Args) < 3 {
+			printUsage()
+			os.Exit(1)
+		}
+		runClearPolicyCache(os.Args[2])
 	case "-h", "--help", "help":
 		printUsage()
 	case "-c", "--config":
@@ -61,9 +99,9 @@ func main() {
 			printUsage()
 			os.Exit(1)
 		}
-		runLintWithConfig(os.Args[2], os.Args[3], false, false)
+		runLintWithConfig(os.Args[2], os.Args[3], false, false, false, false, false)
 	default:
-		runLintWithOptions(cmd, false, false)
+		runLintWithFlags(cmd, false, false, false, false, false)
 	}
 }
 
@@ -76,7 +114,13 @@ Commands:
 
 Options:
   -v, --verbose     Enable verbose output (extraction details)
+  -p, --progress    Stream per-file progress and dependencies
+  -t, --trace       Progress plus per-file fact summaries
+  --policy-trace    Stream Rust policy timing output (per-rule start/done)
+  --policy-stream   Stream Rust policy stderr without enabling timing
   -j, --json        Output results as JSON (for programmatic parsing)
+  --timing          Emit timing.jsonl with pipeline timing events
+  --clear-policy-cache  Remove cached policy results for the given path
   -c, --config      Specify config file: vhdl-lint -c config.json <path>
   -h, --help        Show this help message
 
@@ -116,26 +160,27 @@ func runInit() {
 	fmt.Println("  - Lint rule severities")
 }
 
-func runLintWithOptions(path string, verbose, jsonOutput bool) {
+func runLintWithFlags(path string, verbose, jsonOutput, progress, trace, timing bool) {
 	// Load config from default locations
 	cfg, err := config.Load(path)
 	if err != nil {
-		if !jsonOutput {
-			fmt.Printf("Warning: Could not load config: %v (using defaults)\n", err)
-		}
-		cfg = config.DefaultConfig()
+		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
+		os.Exit(1)
 	}
 
 	idx := indexer.NewWithConfig(cfg)
 	idx.Verbose = verbose
+	idx.Progress = progress || trace
+	idx.Trace = trace
 	idx.JSONOutput = jsonOutput
+	idx.Timing = timing
 	if err := idx.Run(path); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func runLintWithConfig(configPath, lintPath string, verbose, jsonOutput bool) {
+func runLintWithConfig(configPath, lintPath string, verbose, jsonOutput, progress, trace, timing bool) {
 	cfg, err := config.LoadFile(configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error loading config %s: %v\n", configPath, err)
@@ -144,9 +189,28 @@ func runLintWithConfig(configPath, lintPath string, verbose, jsonOutput bool) {
 
 	idx := indexer.NewWithConfig(cfg)
 	idx.Verbose = verbose
+	idx.Progress = progress || trace
+	idx.Trace = trace
 	idx.JSONOutput = jsonOutput
+	idx.Timing = timing
 	if err := idx.Run(lintPath); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func runClearPolicyCache(path string) {
+	cfg, err := config.Load(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
+		os.Exit(1)
+	}
+
+	cacheDir, err := indexer.ClearPolicyCache(path, cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error clearing policy cache: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Cleared policy cache in %s\n", cacheDir)
 }

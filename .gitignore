@@ -1,6 +1,9 @@
 # Rust (deprecated)
 /target
 /Cargo.lock
+.venv/
+.fp_loop/
+.vhdl_lint_cache/
 
 # Go
 /vhdl-lint

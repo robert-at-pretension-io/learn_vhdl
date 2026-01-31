@@ -28,12 +28,14 @@ func TestPolicyRuleFixtures(t *testing.T) {
 		byFile[file] = append(byFile[file], rule)
 	}
 
+	enabledRules := buildEnabledRules(manifest, negativeManifest)
+
 	for relFile, rules := range byFile {
 		relFile := relFile
 		rules := rules
 		t.Run(relFile, func(t *testing.T) {
 			filePath := filepath.Join(fixturesDir, relFile)
-			result := lintFile(t, repoRoot, filePath)
+			result := lintFile(t, repoRoot, filePath, enabledRules)
 			for _, rule := range rules {
 				if !hasRule(result, rule) {
 					t.Fatalf("expected rule %q for %s; got rules: %v", rule, relFile, collectRules(result))
@@ -52,7 +54,7 @@ func TestPolicyRuleFixtures(t *testing.T) {
 		rules := rules
 		t.Run(relFile+"_negative", func(t *testing.T) {
 			filePath := filepath.Join(fixturesDir, relFile)
-			result := lintFile(t, repoRoot, filePath)
+			result := lintFile(t, repoRoot, filePath, enabledRules)
 			for _, rule := range rules {
 				if hasRule(result, rule) {
 					t.Fatalf("did not expect rule %q for %s; got rules: %v", rule, relFile, collectRules(result))
@@ -76,14 +78,15 @@ func loadManifest(t *testing.T, path string) ruleManifest {
 	return manifest
 }
 
-func lintFile(t *testing.T, repoRoot, filePath string) indexer.LintResult {
+func lintFile(t *testing.T, repoRoot, filePath string, enabledRules map[string]string) indexer.LintResult {
 	absFile, err := filepath.Abs(filePath)
 	if err != nil {
 		t.Fatalf("abs path: %v", err)
 	}
 
 	cfg := config.DefaultConfig()
-	cfg.Lint.Rules = map[string]string{}
+	cfg.Standard = "1993"
+	cfg.Lint.Rules = enabledRules
 	cfg.Libraries = map[string]config.LibraryConfig{
 		"work": {
 			Files:        []string{absFile},
@@ -133,6 +136,19 @@ func lintFile(t *testing.T, repoRoot, filePath string) indexer.LintResult {
 	}
 
 	return result
+}
+
+func buildEnabledRules(positive, negative ruleManifest) map[string]string {
+	enabled := make(map[string]string)
+	for rule := range positive {
+		enabled[rule] = "warning"
+	}
+	for rule := range negative {
+		if _, ok := enabled[rule]; !ok {
+			enabled[rule] = "warning"
+		}
+	}
+	return enabled
 }
 
 func hasRule(result indexer.LintResult, rule string) bool {

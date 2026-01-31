@@ -1,0 +1,9 @@
+[
+  {
+    "id": "fsm.legal_state",
+    "scope_type": "arch",
+    "required_bindings": ["state"],
+    "needs_cover": true,
+    "severity": "violation"
+  }
+]
