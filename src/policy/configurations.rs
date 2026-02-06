@@ -41,6 +41,7 @@ mod tests {
         input.configurations.push(Configuration {
             name: "cfg".to_string(),
             entity_name: "missing".to_string(),
+            arch_name: String::new(),
             file: "a.vhd".to_string(),
             line: 10,
         });
@@ -61,6 +62,7 @@ mod tests {
         input.configurations.push(Configuration {
             name: "cfg".to_string(),
             entity_name: "core".to_string(),
+            arch_name: String::new(),
             file: "a.vhd".to_string(),
             line: 10,
         });

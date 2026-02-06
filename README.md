@@ -1,12 +1,15 @@
 # VHDL Compliance Compiler
 
-A learning-first VHDL linter that behaves like a compiler: resilient parsing, rich fact extraction, and explicit policy checks. The goal is to understand VHDL by building tooling that understands it.
+A VHDL linter built for real RTL codebases. It combines error-tolerant parsing, rich semantic extraction, and a fast policy engine to catch hardware bugs, synthesis issues, and code quality problems before they reach simulation or synthesis.
+
+Born as a learning project, now targeting production use on real FPGA and ASIC designs.
 
 ## Purpose
 
-- Learn VHDL by implementing a real parser, extractor, and rule engine.
-- Learn compiler construction by building an end-to-end pipeline that never silently fails.
-- Turn VHDL text into a queryable fact model so higher‑level checks become possible.
+- Catch real bugs: CDC violations, unintended latches, combinational loops, missing resets, unreachable FSM states.
+- Scale to large codebases: tested against ~18k VHDL files from open-source projects (GHDL, GRLIB, OSVVM, PoC).
+- Stay out of the way: configurable severities, optional rules disabled by default, library-aware analysis that understands multi-library projects.
+- Never lie: false positives are treated as tool bugs. Every rule has positive and negative test fixtures.
 
 ## Ethos
 
@@ -19,7 +22,7 @@ A learning-first VHDL linter that behaves like a compiler: resilient parsing, ri
 
 - **Tree-sitter grammar** for error‑tolerant VHDL parsing (`tree-sitter-vhdl/grammar.js`).
 - **Go extractor + indexer** for semantic facts and cross‑file linking (`internal/extractor`, `internal/indexer`).
-- **CUE schemas** to enforce contracts between stages (`schema/ir.cue`).
+- **CUE schemas** to enforce contracts between stages (`internal/validator/schema.cue`).
 - **Rust policy engine** for fast, declarative rule evaluation (`src/policy`).
 - **Incremental + observable**: progress output, timing traces, and cache/daemon support.
 
@@ -35,20 +38,23 @@ VHDL Files
   -> Violations / Reports
 ```
 
-## Capabilities (Current)
+## Capabilities
 
-- Entities, architectures, packages, signals, ports
-- Processes with sensitivity, clock/reset detection, read/write analysis
-- Component instances with port/generic mappings
-- Cross‑file symbol resolution and dependencies
-- Rule evaluation with configurable severities
+- **170+ rules** across CDC, reset hygiene, FSM analysis, synthesis, latch detection, naming, code quality, and more
+- Entities, architectures, packages, signals, ports, generics, type declarations
+- Processes with sensitivity list analysis, clock/reset detection, read/write tracking
+- Component instances with port/generic mappings and cross-entity validation
+- Cross-file symbol resolution, dependency tracking, and library-aware analysis
+- Configurable rule severities, optional rules, per-library third-party exclusions
+- Incremental daemon mode with delta evaluation for fast re-checks
+- JSON output, timing traces, and Chrome trace export for profiling
 
 ## Project Structure (Where Things Live)
 
 - Grammar: `tree-sitter-vhdl/grammar.js`
 - Extractor: `internal/extractor`
 - Indexer: `internal/indexer`
-- CUE schemas: `schema/`
+- CUE schemas: `internal/validator/schema.cue` (input) + `internal/validator/output_schema.cue` (output)
 - Policy rules: `src/policy`
 - Test fixtures: `testdata/`
 

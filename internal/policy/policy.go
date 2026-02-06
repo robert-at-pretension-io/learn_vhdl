@@ -32,6 +32,7 @@ type Result struct {
 	Summary             Summary              `json:"summary"`
 	MissingChecks       []MissingCheckTask   `json:"missing_checks,omitempty"`
 	AmbiguousConstructs []AmbiguousConstruct `json:"ambiguous_constructs,omitempty"`
+	Waivers             []Waiver             `json:"waivers,omitempty"`
 }
 
 // Summary provides aggregate counts
@@ -69,34 +70,51 @@ type AmbiguousConstruct struct {
 	Candidates map[string][]string `json:"candidates,omitempty"`
 }
 
+// Waiver represents a structured suppression record from verification blocks.
+type Waiver struct {
+	ID      string `json:"id"`
+	Scope   string `json:"scope"`
+	Reason  string `json:"reason"`
+	Owner   string `json:"owner,omitempty"`
+	Expires string `json:"expires,omitempty"`
+	File    string `json:"file"`
+	Line    int    `json:"line"`
+	Raw     string `json:"raw"`
+}
+
 // Input is the data structure passed to the Rust policy engine
 type Input struct {
-	Standard              string                 `json:"standard"`
-	FileCount             int                    `json:"file_count"`
-	Entities              []Entity               `json:"entities"`
-	Architectures         []Architecture         `json:"architectures"`
-	Packages              []Package              `json:"packages"`
-	Components            []Component            `json:"components"`
-	UseClauses            []UseClause            `json:"use_clauses"`
-	LibraryClauses        []LibraryClause        `json:"library_clauses"`
-	ContextClauses        []ContextClause        `json:"context_clauses"`
-	Signals               []Signal               `json:"signals"`
-	Ports                 []Port                 `json:"ports"`
-	Dependencies          []Dependency           `json:"dependencies"`
-	Symbols               []Symbol               `json:"symbols"`
-	Scopes                []Scope                `json:"scopes"`
-	SymbolDefs            []SymbolDef            `json:"symbol_defs"`
-	NameUses              []NameUse              `json:"name_uses"`
-	Files                 []FileInfo             `json:"files"`
-	VerificationBlocks    []VerificationBlock    `json:"verification_blocks"`
-	VerificationTags      []VerificationTag      `json:"verification_tags"`
-	VerificationTagErrors []VerificationTagError `json:"verification_tag_errors"`
-	Instances             []Instance             `json:"instances"`              // Component/entity instantiations with port maps
-	CaseStatements        []CaseStatement        `json:"case_statements"`        // Case statements for latch detection
-	Processes             []Process              `json:"processes"`              // Process statements for sensitivity/clock analysis
-	ConcurrentAssignments []ConcurrentAssignment `json:"concurrent_assignments"` // Concurrent signal assignments (outside processes)
-	Generates             []GenerateStatement    `json:"generates"`              // Generate statements (for/if/case generate)
-	Configurations        []Configuration        `json:"configurations"`         // Configuration declarations
+	Standard                 string                    `json:"standard"`
+	FileCount                int                       `json:"file_count"`
+	Entities                 []Entity                  `json:"entities"`
+	Architectures            []Architecture            `json:"architectures"`
+	Packages                 []Package                 `json:"packages"`
+	PackageBodies            []PackageBody             `json:"package_bodies"`
+	Components               []Component               `json:"components"`
+	UseClauses               []UseClause               `json:"use_clauses"`
+	LibraryClauses           []LibraryClause           `json:"library_clauses"`
+	ContextClauses           []ContextClause           `json:"context_clauses"`
+	ContextDeclarations      []ContextDeclaration      `json:"context_declarations"`
+	Signals                  []Signal                  `json:"signals"`
+	Ports                    []Port                    `json:"ports"`
+	Dependencies             []Dependency              `json:"dependencies"`
+	Symbols                  []Symbol                  `json:"symbols"`
+	Scopes                   []Scope                   `json:"scopes"`
+	SymbolDefs               []SymbolDef               `json:"symbol_defs"`
+	NameUses                 []NameUse                 `json:"name_uses"`
+	Files                    []FileInfo                `json:"files"`
+	VerificationBlocks       []VerificationBlock       `json:"verification_blocks"`
+	VerificationTags         []VerificationTag         `json:"verification_tags"`
+	VerificationTagErrors    []VerificationTagError    `json:"verification_tag_errors"`
+	VerificationWaivers      []VerificationWaiver      `json:"verification_waivers"`
+	VerificationWaiverErrors []VerificationWaiverError `json:"verification_waiver_errors"`
+	Instances                []Instance                `json:"instances"`              // Component/entity instantiations with port maps
+	CaseStatements           []CaseStatement           `json:"case_statements"`        // Case statements for latch detection
+	Processes                []Process                 `json:"processes"`              // Process statements for sensitivity/clock analysis
+	ConcurrentAssignments    []ConcurrentAssignment    `json:"concurrent_assignments"` // Concurrent signal assignments (outside processes)
+	Generates                []GenerateStatement       `json:"generates"`              // Generate statements (for/if/case generate)
+	Configurations           []Configuration           `json:"configurations"`         // Configuration declarations
+	ConfigurationBindings    []ConfigurationBinding    `json:"configuration_bindings"` // Configuration bindings inside declarations
 	// Type system
 	Types         []TypeDeclaration      `json:"types"`          // Type declarations (enum, record, array, etc.)
 	Subtypes      []SubtypeDeclaration   `json:"subtypes"`       // Subtype declarations
@@ -135,9 +153,11 @@ type Process struct {
 	HasReset        bool            `json:"has_reset"`
 	ResetSignal     string          `json:"reset_signal"`
 	ResetAsync      bool            `json:"reset_async"`
-	AssignedSignals []string        `json:"assigned_signals"`
-	ReadSignals     []string        `json:"read_signals"`
-	Variables       []VariableDecl  `json:"variables"`
+	AssignedSignals   []string        `json:"assigned_signals"`
+	ReadSignals       []string        `json:"read_signals"`
+	AssignedVariables []string        `json:"assigned_variables"`
+	ReadVariables     []string        `json:"read_variables"`
+	Variables         []VariableDecl  `json:"variables"`
 	ProcedureCalls  []ProcedureCall `json:"procedure_calls"`
 	FunctionCalls   []FunctionCall  `json:"function_calls"`
 	WaitStatements  []WaitStatement `json:"wait_statements"`
@@ -163,6 +183,13 @@ type Architecture struct {
 }
 
 type Package struct {
+	Name   string `json:"name"`
+	File   string `json:"file"`
+	Line   int    `json:"line"`
+	InArch string `json:"in_arch,omitempty"`
+}
+
+type PackageBody struct {
 	Name string `json:"name"`
 	File string `json:"file"`
 	Line int    `json:"line"`
@@ -192,6 +219,7 @@ type Port struct {
 	Direction string `json:"direction"`
 	Type      string `json:"type"`
 	Default   string `json:"default"`
+	File      string `json:"file"`
 	Line      int    `json:"line"`
 	InEntity  string `json:"in_entity"`
 	Width     int    `json:"width"` // Estimated bit width (0 if unknown)
@@ -224,6 +252,16 @@ type ContextClause struct {
 	Name string `json:"name"`
 	File string `json:"file"`
 	Line int    `json:"line"`
+}
+
+// ContextDeclaration represents a VHDL context declaration
+type ContextDeclaration struct {
+	Name        string   `json:"name"`
+	File        string   `json:"file"`
+	Line        int      `json:"line"`
+	Libraries   []string `json:"libraries"`
+	UseItems    []string `json:"use_items"`
+	ContextRefs []string `json:"context_refs"`
 }
 
 type Association struct {
@@ -348,11 +386,34 @@ type VerificationTagError struct {
 	InArch  string `json:"in_arch"`
 }
 
+// VerificationWaiver represents a parsed waiver line.
+type VerificationWaiver struct {
+	ID      string `json:"id"`
+	Scope   string `json:"scope"`
+	Reason  string `json:"reason"`
+	Owner   string `json:"owner,omitempty"`
+	Expires string `json:"expires,omitempty"`
+	File    string `json:"file"`
+	Line    int    `json:"line"`
+	Raw     string `json:"raw"`
+	InArch  string `json:"in_arch"`
+}
+
+// VerificationWaiverError represents a malformed waiver line.
+type VerificationWaiverError struct {
+	File    string `json:"file"`
+	Line    int    `json:"line"`
+	Raw     string `json:"raw"`
+	Message string `json:"message"`
+	InArch  string `json:"in_arch"`
+}
+
 // Instance represents a component/entity instantiation with port/generic mappings
 // Enables system-level analysis (cross-module signal tracing, clock mismatch detection)
 type Instance struct {
 	Name         string            `json:"name"`        // Instance label (e.g., "u_cpu")
 	Target       string            `json:"target"`      // Target entity/component (e.g., "work.cpu")
+	TargetArch   string            `json:"target_arch"` // Target architecture (if specified)
 	PortMap      map[string]string `json:"port_map"`    // Formal port -> actual signal
 	GenericMap   map[string]string `json:"generic_map"` // Formal generic -> actual value
 	Associations []Association     `json:"associations"`
@@ -484,8 +545,20 @@ type GenerateStatement struct {
 type Configuration struct {
 	Name       string `json:"name"`
 	EntityName string `json:"entity_name"`
+	ArchName   string `json:"arch_name"`
 	File       string `json:"file"`
 	Line       int    `json:"line"`
+}
+
+// ConfigurationBinding represents a binding inside a configuration declaration
+type ConfigurationBinding struct {
+	ScopePath     []string `json:"scope_path"`
+	InstanceLabel string   `json:"instance_label"`
+	ComponentName string   `json:"component_name"`
+	TargetEntity  string   `json:"target_entity"`
+	TargetArch    string   `json:"target_arch"`
+	File          string   `json:"file"`
+	Line          int      `json:"line"`
 }
 
 // =============================================================================
@@ -624,6 +697,10 @@ func ensurePolicyBinary(policyDir string) (string, error) {
 	}
 
 	base := filepath.Dir(policyDir)
+	sourceRoot, hasSources := findPolicySourceRoot(base)
+	if hasSources {
+		base = sourceRoot
+	}
 	profile := os.Getenv("VHDL_POLICY_PROFILE")
 	if profile == "" {
 		profile = "release"
@@ -642,9 +719,35 @@ func ensurePolicyBinary(policyDir string) (string, error) {
 	}
 	for _, candidate := range candidates {
 		if existsExecutable(candidate) {
-			return candidate, nil
+			if hasSources {
+				extra := []string{
+					filepath.Join(base, "Cargo.toml"),
+					filepath.Join(base, "Cargo.lock"),
+					filepath.Join(base, "src", "bin", "vhdl_policy.rs"),
+				}
+				outdated, err := policyBinaryOutdated(candidate, base, extra)
+				if err == nil && !outdated {
+					return candidate, nil
+				}
+			} else {
+				return candidate, nil
+			}
+			break
 		}
 	}
+
+	if hasSources {
+		if err := buildPolicyBinary(base, profile); err != nil {
+			return "", err
+		}
+		for _, candidate := range candidates {
+			if existsExecutable(candidate) {
+				return candidate, nil
+			}
+		}
+		return "", fmt.Errorf("vhdl_policy binary not found after build")
+	}
+
 	if path, err := exec.LookPath("vhdl_policy"); err == nil {
 		return path, nil
 	}

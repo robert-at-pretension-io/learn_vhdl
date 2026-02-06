@@ -27,6 +27,7 @@ package indexer
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -56,6 +57,9 @@ type Indexer struct {
 	// Extracted facts from all files
 	Facts []extractor.FileFacts
 
+	// KeepFacts retains extracted facts in memory (tests/debugging only).
+	KeepFacts bool
+
 	// Resolved library information (file -> library mapping)
 	FileLibraries map[string]config.FileLibraryInfo
 
@@ -74,6 +78,9 @@ type Indexer struct {
 	// JSON output mode
 	JSONOutput bool
 
+	// SymbolsJSON includes symbol index in JSON output (for LSP)
+	SymbolsJSON bool
+
 	// Timing output (JSONL)
 	Timing     bool
 	TimingPath string
@@ -83,6 +90,9 @@ type Indexer struct {
 
 	// Optional cache version override (for tests)
 	cacheVersionOverride *cacheVersions
+
+	// Optional output sink for JSON output (defaults to stdout)
+	Output io.Writer
 }
 
 // LintResult is the structured result of running the linter
@@ -97,6 +107,9 @@ type LintResult struct {
 	// Ambiguous construct warnings (structured)
 	AmbiguousConstructs []policy.AmbiguousConstruct `json:"ambiguous_constructs,omitempty"`
 
+	// Structured waiver records
+	Waivers []policy.Waiver `json:"waivers,omitempty"`
+
 	// Summary counts
 	Summary ResultSummary `json:"summary"`
 
@@ -108,6 +121,9 @@ type LintResult struct {
 
 	// Parse errors encountered
 	ParseErrors []ParseError `json:"parse_errors,omitempty"`
+
+	// Symbol index for IDE navigation (populated when SymbolsJSON is set)
+	SymbolIndex *SymbolIndex `json:"symbol_index,omitempty"`
 }
 
 // ResultSummary provides aggregate violation counts
@@ -230,6 +246,16 @@ func (idx *Indexer) registerSymbolsForFacts(facts extractor.FileFacts, filePath 
 			Line: pkg.Line,
 		})
 	}
+	for _, ctx := range facts.ContextDecls {
+		if isValidIdentifierName(ctx.Name) {
+			idx.Symbols.Add(Symbol{
+				Name: fmt.Sprintf("%s.%s", libName, strings.ToLower(ctx.Name)),
+				Kind: "context",
+				File: filePath,
+				Line: ctx.Line,
+			})
+		}
+	}
 
 	// Register package contents in symbol table for cross-file resolution
 	// Format: library.package.item (e.g., work.my_pkg.state_t)
@@ -296,6 +322,20 @@ func (idx *Indexer) Run(rootPath string) error {
 		}
 		idx.Config = cfg
 	}
+	if idx.Config != nil {
+		if project, ok := idx.Config.ApplyProjectOverrides(rootPath); ok && !idx.JSONOutput {
+			fmt.Printf("Applied project config: %s\n", project)
+		}
+	}
+	if !idx.JSONOutput {
+		emitPolicyRuleConfigSummary(idx.Config)
+		if idx.Config != nil {
+			mode := strings.ToLower(strings.TrimSpace(idx.Config.Analysis.PolicyInputMode))
+			if mode != "" && mode != "full" {
+				fmt.Printf("Policy input mode: %s (heavy facts omitted)\n", mode)
+			}
+		}
+	}
 
 	// Reset per-run state
 	idx.Symbols = &SymbolTable{symbols: make(map[string]Symbol)}
@@ -307,6 +347,8 @@ func (idx *Indexer) Run(rootPath string) error {
 	stepStart := time.Now()
 	var files []string
 	var err error
+	var proMap *proMapping
+	fileSet := make(map[string]bool)
 
 	// Check if config has library definitions
 	if len(idx.Config.Libraries) > 0 {
@@ -316,7 +358,6 @@ func (idx *Indexer) Run(rootPath string) error {
 		}
 
 		// Collect all files and track library info
-		fileSet := make(map[string]bool)
 		for _, lib := range libs {
 			for _, f := range lib.Files {
 				if !fileSet[f] {
@@ -350,6 +391,56 @@ func (idx *Indexer) Run(rootPath string) error {
 		}
 	}
 
+	if idx.Config != nil && idx.Config.Analysis.UseProLibraries {
+		mapping, mapErr := loadProLibraryMapping(rootPath, idx.Config)
+		if mapping != nil {
+			proMap = mapping
+			if !idx.JSONOutput && len(mapping.entrypoints) > 0 {
+				fmt.Printf("Using .pro entrypoint(s): %s\n", strings.Join(mapping.entrypoints, ", "))
+			}
+			stats := applyProLibraryMapping(idx, mapping, fileSet, &files)
+			if !idx.JSONOutput && (stats.files > 0 || stats.packages > 0) {
+				fmt.Printf("Applied .pro library mapping: %d files, %d libraries, %d generated packages\n",
+					stats.files, stats.libraries, stats.packages)
+			}
+		}
+		if mapErr != nil {
+			recordPipelineErr(fmt.Errorf("pro library mapping partial: %w", mapErr))
+		}
+	}
+
+	if proMap != nil && idx.Config != nil && idx.Config.Analysis.UseProLibraries {
+		proLibs := make(map[string]bool)
+		for _, lib := range proMap.fileLibraries {
+			if lib == "" {
+				continue
+			}
+			proLibs[strings.ToLower(lib)] = true
+		}
+		if len(proLibs) > 0 {
+			filtered := make([]string, 0, len(files))
+			for _, f := range files {
+				libInfo, ok := idx.FileLibraries[f]
+				if !ok {
+					filtered = append(filtered, f)
+					continue
+				}
+				libName := strings.ToLower(libInfo.LibraryName)
+				if proLibs[libName] {
+					if _, ok := proMap.fileLibraries[f]; ok {
+						filtered = append(filtered, f)
+					}
+					continue
+				}
+				filtered = append(filtered, f)
+			}
+			if !idx.JSONOutput && len(filtered) != len(files) {
+				fmt.Printf("Filtered files via .pro mapping: %d -> %d\n", len(files), len(filtered))
+			}
+			files = filtered
+		}
+	}
+
 	// Fallback to directory scan if no files from config
 	if len(files) == 0 {
 		files, err = idx.findVHDLFiles(rootPath)
@@ -372,6 +463,16 @@ func (idx *Indexer) Run(rootPath string) error {
 	}
 	scanDuration := time.Since(stepStart)
 	timing.RecordStage("scan", stepStart, scanDuration, "")
+	if len(files) == 0 {
+		msg := "No VHDL files found. Nothing to lint. " +
+			"Action: verify the lint path and your config (libraries/files globs or ignorePatterns) include *.vhd/*.vhdl."
+		if idx.JSONOutput {
+			fmt.Fprintln(os.Stderr, msg)
+		} else {
+			fmt.Println(msg)
+		}
+		return nil
+	}
 
 	// 2. Pass 1: Parallel extraction (with optional cache)
 	stepStart = time.Now()
@@ -387,14 +488,23 @@ func (idx *Indexer) Run(rootPath string) error {
 			cache = nil
 		}
 	}
+	store, err := newFactsStore(cacheDir)
+	if err != nil {
+		return fmt.Errorf("facts store: %w", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			recordPipelineErr(fmt.Errorf("facts store cleanup failed: %w", err))
+		}
+	}()
 	var wg sync.WaitGroup
 	var progressMu sync.Mutex
 	progress := 0
 	progressEnabled := (idx.Verbose || idx.Progress || idx.Trace) && !idx.JSONOutput
+	var factsMu sync.Mutex
 	if progressEnabled {
 		fmt.Printf("\n=== Extraction Progress ===\n")
 	}
-	factsChan := make(chan extractor.FileFacts, len(files))
 	errChan := make(chan error, len(files))
 	pipelineErrChan := make(chan error, len(files))
 	var changedMu sync.Mutex
@@ -414,7 +524,15 @@ func (idx *Indexer) Run(rootPath string) error {
 				}
 				contentHash = h
 				if facts, ok, err := cache.Get(f, contentHash); err == nil && ok {
-					factsChan <- facts
+					if err := store.Put(f, facts); err != nil {
+						errChan <- fmt.Errorf("%s: store facts: %w", f, err)
+						return
+					}
+					if idx.KeepFacts {
+						factsMu.Lock()
+						idx.Facts = append(idx.Facts, facts)
+						factsMu.Unlock()
+					}
 					idx.registerSymbolsForFacts(facts, f)
 					fileDuration := time.Since(fileStart)
 					timing.RecordFile("extract", f, "cache_hit", fileStart, fileDuration)
@@ -437,6 +555,15 @@ func (idx *Indexer) Run(rootPath string) error {
 					pipelineErrChan <- fmt.Errorf("cache write failed for %s: %w", f, err)
 				}
 			}
+			if err := store.Put(f, facts); err != nil {
+				errChan <- fmt.Errorf("%s: store facts: %w", f, err)
+				return
+			}
+			if idx.KeepFacts {
+				factsMu.Lock()
+				idx.Facts = append(idx.Facts, facts)
+				factsMu.Unlock()
+			}
 			if cache != nil {
 				changedMu.Lock()
 				changedFiles[f] = true
@@ -447,13 +574,11 @@ func (idx *Indexer) Run(rootPath string) error {
 			if progressEnabled {
 				emitProgress(&progressMu, &progress, len(files), facts, "extracted", idx.Trace, fileDuration)
 			}
-			factsChan <- facts
 			idx.registerSymbolsForFacts(facts, f)
 		}(file)
 	}
 
 	wg.Wait()
-	close(factsChan)
 	close(errChan)
 	close(pipelineErrChan)
 
@@ -466,11 +591,10 @@ func (idx *Indexer) Run(rootPath string) error {
 		recordPipelineErr(err)
 	}
 
-	// Collect facts
-	factsByFile := make(map[string]extractor.FileFacts)
-	for facts := range factsChan {
-		idx.Facts = append(idx.Facts, facts)
-		factsByFile[facts.File] = facts
+	if added, err := injectGeneratedPackagesStreaming(idx, proMap, store); err != nil {
+		return fmt.Errorf("inject generated packages: %w", err)
+	} else if added > 0 && !idx.JSONOutput {
+		fmt.Printf("Injected %d generated package(s) from .pro scripts\n", added)
 	}
 	if cache != nil {
 		if err := cache.Save(); err != nil {
@@ -479,19 +603,29 @@ func (idx *Indexer) Run(rootPath string) error {
 	}
 	extractDuration := time.Since(stepStart)
 	timing.RecordStage("extract", stepStart, extractDuration, "")
+	factFiles := store.Files()
 
 	// Cache impact visualization (verbose/progress/trace)
 	if cache != nil && progressEnabled && len(changedFiles) > 0 {
 		fmt.Printf("\n=== Cache Impact ===\n")
-		dependents := buildDependentsGraph(factsByFile, idx.Symbols, idx.FileLibraries)
-		changedList := make([]string, 0, len(changedFiles))
-		for f := range changedFiles {
-			changedList = append(changedList, f)
-		}
-		sort.Strings(changedList)
-		for _, f := range changedList {
-			report := computeImpact(f, dependents)
-			fmt.Print(formatImpactReport(report))
+		if len(factFiles) > 2000 || len(changedFiles) > 500 {
+			fmt.Printf("  skipped: %d files changed (too large for impact graph)\n", len(changedFiles))
+			fmt.Printf("  hint: rerun on a smaller subset or enable only --trace on scoped paths\n")
+		} else {
+			dependents, err := buildDependentsGraphFromStore(store, factFiles, idx.Symbols, idx.FileLibraries)
+			if err != nil {
+				recordPipelineErr(fmt.Errorf("cache impact skipped: %w", err))
+			} else {
+				changedList := make([]string, 0, len(changedFiles))
+				for f := range changedFiles {
+					changedList = append(changedList, f)
+				}
+				sort.Strings(changedList)
+				for _, f := range changedList {
+					report := computeImpact(f, dependents)
+					fmt.Print(formatImpactReport(report))
+				}
+			}
 		}
 	}
 
@@ -499,17 +633,28 @@ func (idx *Indexer) Run(rootPath string) error {
 	stepStart = time.Now()
 	// Build a global constant map from all extracted constants
 	globalConstants := make(map[string]int)
-	for _, facts := range idx.Facts {
+	for _, file := range factFiles {
+		facts, err := store.Get(file)
+		if err != nil {
+			return fmt.Errorf("load facts for constants: %w", err)
+		}
 		constMap := extractor.BuildConstantMap(facts.ConstantDecls)
 		for k, v := range constMap {
 			globalConstants[k] = v
 		}
 	}
 
-	// Elaborate generates in all files
+	// Elaborate generates in all files and persist to store
 	elaboratedCount := 0
-	for i := range idx.Facts {
-		elaboratedCount += extractor.ElaborateGenerates(idx.Facts[i].Generates, globalConstants)
+	for _, file := range factFiles {
+		facts, err := store.Get(file)
+		if err != nil {
+			return fmt.Errorf("load facts for elaboration: %w", err)
+		}
+		elaboratedCount += extractor.ElaborateGenerates(facts.Generates, globalConstants)
+		if err := store.Put(file, facts); err != nil {
+			return fmt.Errorf("store elaborated facts: %w", err)
+		}
 	}
 	if elaboratedCount > 0 && idx.Verbose {
 		fmt.Printf("\n=== Verbose: Generate Elaboration ===\n")
@@ -519,10 +664,17 @@ func (idx *Indexer) Run(rootPath string) error {
 	timing.RecordStage("elaborate", stepStart, elabDuration, "")
 	var factsValidateDuration time.Duration
 
+	// Build policy engine input and fact tables from store
+	stepStart = time.Now()
+	policyInput, factTables, err := idx.buildPolicyInputAndTables(store, factFiles)
+	if err != nil {
+		return err
+	}
+	buildDuration := time.Since(stepStart)
+	timing.RecordStage("build_input", stepStart, buildDuration, "")
+
 	// Validate relational fact tables for Datalog ingestion
 	stepStart = time.Now()
-	factTables := facts.BuildTables(idx.Facts, idx.FileLibraries, idx.ThirdPartyFiles, idx.buildSymbolRows())
-	factFiles := sortedFactFiles(factTables)
 	factsValidator, err := validator.NewFactsValidator()
 	if err != nil {
 		return fmt.Errorf("CRITICAL: Failed to initialize facts validator: %w", err)
@@ -535,293 +687,26 @@ func (idx *Indexer) Run(rootPath string) error {
 
 	// Verbose output for debugging
 	if idx.Verbose {
-		fmt.Printf("\n=== Verbose: Extracted Ports ===\n")
-		for _, facts := range idx.Facts {
-			for _, p := range facts.Ports {
-				fmt.Printf("  %s.%s: direction=%q type=%q\n", p.InEntity, p.Name, p.Direction, p.Type)
-			}
-		}
-		fmt.Printf("\n=== Verbose: Extracted Processes ===\n")
-		for _, facts := range idx.Facts {
-			for _, p := range facts.Processes {
-				kind := "combinational"
-				if p.IsSequential {
-					kind = "sequential"
-				}
-				fmt.Printf("  %s.%s: %s, sensitivity=%v\n", p.InArch, p.Label, kind, p.SensitivityList)
-				if p.ClockSignal != "" {
-					fmt.Printf("    clock: %s (%s_edge)\n", p.ClockSignal, p.ClockEdge)
-				}
-				if p.HasReset {
-					asyncStr := "sync"
-					if p.ResetAsync {
-						asyncStr = "async"
-					}
-					fmt.Printf("    reset: %s (%s)\n", p.ResetSignal, asyncStr)
-				}
-				if len(p.AssignedSignals) > 0 {
-					fmt.Printf("    writes: %v\n", p.AssignedSignals)
-				}
-				if len(p.ReadSignals) > 0 {
-					fmt.Printf("    reads: %v\n", p.ReadSignals)
-				}
-			}
-		}
-		fmt.Printf("\n=== Verbose: Clock Domains ===\n")
-		for _, facts := range idx.Facts {
-			for _, cd := range facts.ClockDomains {
-				fmt.Printf("  %s (%s): drives %v\n", cd.Clock, cd.Edge, cd.Registers)
-			}
-		}
-		fmt.Printf("\n=== Verbose: Instances ===\n")
-		for _, facts := range idx.Facts {
-			for _, inst := range facts.Instances {
-				fmt.Printf("  %s: %s\n", inst.Name, inst.Target)
-				if len(inst.GenericMap) > 0 {
-					fmt.Printf("    generics: %v\n", inst.GenericMap)
-				}
-				if len(inst.PortMap) > 0 {
-					fmt.Printf("    ports: %v\n", inst.PortMap)
-				}
-			}
-		}
-		fmt.Printf("\n=== Verbose: Case Statements ===\n")
-		for _, facts := range idx.Facts {
-			for _, cs := range facts.CaseStatements {
-				status := "INCOMPLETE (potential latch)"
-				if cs.HasOthers {
-					status = "complete (has others)"
-				}
-				fmt.Printf("  case %s [%s] line %d\n", cs.Expression, status, cs.Line)
-				if cs.InProcess != "" {
-					fmt.Printf("    in process: %s\n", cs.InProcess)
-				}
-				fmt.Printf("    choices: %v\n", cs.Choices)
-			}
-		}
-		fmt.Printf("\n=== Verbose: Concurrent Assignments ===\n")
-		for _, facts := range idx.Facts {
-			for _, ca := range facts.ConcurrentAssignments {
-				fmt.Printf("  %s <= [%s] (kind: %s, line %d)\n", ca.Target, strings.Join(ca.ReadSignals, ", "), ca.Kind, ca.Line)
-			}
-		}
-		fmt.Printf("\n=== Verbose: Comparisons (Security Analysis) ===\n")
-		for _, facts := range idx.Facts {
-			for _, comp := range facts.Comparisons {
-				litInfo := ""
-				if comp.IsLiteral {
-					litInfo = fmt.Sprintf(" [LITERAL: %s, %d bits]", comp.LiteralValue, comp.LiteralBits)
-				}
-				fmt.Printf("  %s %s %s%s (line %d, drives: %s)\n", comp.LeftOperand, comp.Operator, comp.RightOperand, litInfo, comp.Line, comp.ResultDrives)
-			}
-		}
-		fmt.Printf("\n=== Verbose: Arithmetic Ops (Power Analysis) ===\n")
-		for _, facts := range idx.Facts {
-			for _, op := range facts.ArithmeticOps {
-				guardInfo := "unguarded"
-				if op.IsGuarded {
-					guardInfo = fmt.Sprintf("guarded by %s", op.GuardSignal)
-				}
-				fmt.Printf("  %s: %s (%s, line %d)\n", op.Operator, strings.Join(op.Operands, ", "), guardInfo, op.Line)
-			}
-		}
-		fmt.Printf("\n=== Verbose: Signal Dependencies (Loop Detection) ===\n")
-		for _, facts := range idx.Facts {
-			for _, dep := range facts.SignalDeps {
-				seqInfo := "combinational"
-				if dep.IsSequential {
-					seqInfo = "sequential"
-				}
-				fmt.Printf("  %s -> %s (%s, line %d)\n", dep.Source, dep.Target, seqInfo, dep.Line)
-			}
-		}
-		fmt.Printf("\n=== Verbose: Type Declarations ===\n")
-		for _, facts := range idx.Facts {
-			for _, t := range facts.Types {
-				scope := t.InPackage
-				if scope == "" {
-					scope = t.InArch
-				}
-				fmt.Printf("  %s.%s: kind=%s line=%d\n", scope, t.Name, t.Kind, t.Line)
-				if t.Kind == "enum" && len(t.EnumLiterals) > 0 {
-					fmt.Printf("    literals: %v\n", t.EnumLiterals)
-				}
-				if t.Kind == "record" && len(t.Fields) > 0 {
-					fmt.Printf("    fields:\n")
-					for _, f := range t.Fields {
-						fmt.Printf("      %s: %s\n", f.Name, f.Type)
-					}
-				}
-				if t.Kind == "array" {
-					unc := ""
-					if t.Unconstrained {
-						unc = " (unconstrained)"
-					}
-					fmt.Printf("    element: %s%s\n", t.ElementType, unc)
-				}
-			}
-		}
-		fmt.Printf("\n=== Verbose: Subtype Declarations ===\n")
-		for _, facts := range idx.Facts {
-			for _, st := range facts.Subtypes {
-				scope := st.InPackage
-				if scope == "" {
-					scope = st.InArch
-				}
-				constraint := ""
-				if st.Constraint != "" {
-					constraint = " " + st.Constraint
-				}
-				fmt.Printf("  %s.%s: %s%s\n", scope, st.Name, st.BaseType, constraint)
-			}
-		}
-		fmt.Printf("\n=== Verbose: Function Declarations ===\n")
-		for _, facts := range idx.Facts {
-			for _, fn := range facts.Functions {
-				scope := fn.InPackage
-				if scope == "" {
-					scope = fn.InArch
-				}
-				purity := "pure"
-				if !fn.IsPure {
-					purity = "impure"
-				}
-				hasBody := ""
-				if fn.HasBody {
-					hasBody = " [body]"
-				}
-				fmt.Printf("  %s.%s: %s returns %s%s\n", scope, fn.Name, purity, fn.ReturnType, hasBody)
-				if len(fn.Parameters) > 0 {
-					fmt.Printf("    params:\n")
-					for _, p := range fn.Parameters {
-						dir := p.Direction
-						if dir == "" {
-							dir = "in"
-						}
-						fmt.Printf("      %s: %s %s\n", p.Name, dir, p.Type)
-					}
-				}
-			}
-		}
-		fmt.Printf("\n=== Verbose: Procedure Declarations ===\n")
-		for _, facts := range idx.Facts {
-			for _, pr := range facts.Procedures {
-				scope := pr.InPackage
-				if scope == "" {
-					scope = pr.InArch
-				}
-				hasBody := ""
-				if pr.HasBody {
-					hasBody = " [body]"
-				}
-				fmt.Printf("  %s.%s%s\n", scope, pr.Name, hasBody)
-				if len(pr.Parameters) > 0 {
-					fmt.Printf("    params:\n")
-					for _, p := range pr.Parameters {
-						dir := p.Direction
-						if dir == "" {
-							dir = "in"
-						}
-						fmt.Printf("      %s: %s %s\n", p.Name, dir, p.Type)
-					}
-				}
-			}
-		}
-		fmt.Printf("\n=== Verbose: Constant Declarations ===\n")
-		for _, facts := range idx.Facts {
-			for _, c := range facts.ConstantDecls {
-				scope := c.InPackage
-				if scope == "" {
-					scope = c.InArch
-				}
-				value := ""
-				if c.Value != "" {
-					value = fmt.Sprintf(" := %s", c.Value)
-				}
-				fmt.Printf("  %s.%s: %s%s\n", scope, c.Name, c.Type, value)
-			}
-		}
-		fmt.Printf("\n=== Verbose: Generate Statements ===\n")
-		for _, facts := range idx.Facts {
-			for _, gen := range facts.Generates {
-				switch gen.Kind {
-				case "for":
-					elaboration := "cannot elaborate"
-					if gen.CanElaborate {
-						elaboration = fmt.Sprintf("%d iterations", gen.IterationCount)
-					}
-					fmt.Printf("  %s: for %s in %s %s %s (%s)\n",
-						gen.Label, gen.LoopVar, gen.RangeLow, gen.RangeDir, gen.RangeHigh, elaboration)
-				case "if":
-					fmt.Printf("  %s: if %s\n", gen.Label, gen.Condition)
-				case "case":
-					fmt.Printf("  %s: case %s\n", gen.Label, gen.Condition)
-				default:
-					fmt.Printf("  %s: %s\n", gen.Label, gen.Kind)
-				}
-				if len(gen.Signals) > 0 || len(gen.Instances) > 0 || len(gen.Processes) > 0 {
-					fmt.Printf("    contains: %d signals, %d instances, %d processes\n",
-						len(gen.Signals), len(gen.Instances), len(gen.Processes))
-				}
-			}
-		}
-
-		// CDC crossings
-		fmt.Printf("\n=== Verbose: CDC Crossings ===\n")
-		for _, facts := range idx.Facts {
-			for _, cdc := range facts.CDCCrossings {
-				syncStatus := "unsynchronized"
-				if cdc.IsSynchronized {
-					syncStatus = fmt.Sprintf("synchronized (%d stages)", cdc.SyncStages)
-				}
-				bitWidth := "single-bit"
-				if cdc.IsMultiBit {
-					bitWidth = "multi-bit"
-				}
-				fmt.Printf("  %s: %s -> %s (%s, %s) [%s]\n",
-					cdc.Signal, cdc.SourceClock, cdc.DestClock, bitWidth, syncStatus,
-					fmt.Sprintf("%s writes, %s reads", cdc.SourceProc, cdc.DestProc))
-			}
+		if err := idx.emitVerboseFromStore(store, factFiles); err != nil {
+			return err
 		}
 	}
 
+	// Require explicit library mapping for any referenced libraries
+	if idx.Config != nil && idx.Config.RequiresLibraryMapping() {
+		if missing := idx.findMissingLibraries(policyInput.LibraryClauses); len(missing) > 0 {
+			configLabel := "vhdl_lint.json"
+			if idx.Config != nil && idx.Config.ConfigPath() != "" {
+				configLabel = idx.Config.ConfigPath()
+			}
+			return fmt.Errorf("library mapping required: referenced libraries not linked in config: %s. "+
+				"Add them under libraries/files in %s before running the linter.", strings.Join(missing, ", "), configLabel)
+		}
+	}
 	// 3. Pass 2: Resolution (check imports)
 	stepStart = time.Now()
-	// Note: "work" in VHDL is a relative reference to the file's own library.
-	// We translate "work.x" to the file's actual library name for resolution.
-	var missing []string
-	for _, facts := range idx.Facts {
-		// Get the actual library name for this file
-		fileLib := "work"
-		if libInfo, ok := idx.FileLibraries[facts.File]; ok && libInfo.LibraryName != "" {
-			fileLib = strings.ToLower(libInfo.LibraryName)
-		}
-
-		for _, dep := range facts.Dependencies {
-			qualName := strings.ToLower(dep.Target)
-
-			// Translate "work.x" to the file's actual library
-			if strings.HasPrefix(qualName, "work.") {
-				qualName = fileLib + qualName[4:] // Replace "work" with actual library
-			}
-			// Unqualified names resolve in the local library by default
-			if !strings.Contains(qualName, ".") {
-				qualName = fileLib + "." + qualName
-			}
-
-			if !idx.Symbols.Has(qualName) && !isStandardLibrary(qualName) {
-				missing = append(missing, fmt.Sprintf("%s: missing import %q", facts.File, dep.Target))
-			}
-		}
-	}
 	resolveDuration := time.Since(stepStart)
 	timing.RecordStage("resolve", stepStart, resolveDuration, "")
-
-	// 4. Build policy engine input
-	stepStart = time.Now()
-	policyInput := idx.buildPolicyInput()
-	buildDuration := time.Since(stepStart)
-	timing.RecordStage("build_input", stepStart, buildDuration, "")
 
 	// 5. Validate data structure before policy evaluation (CUE contract enforcement)
 	stepStart = time.Now()
@@ -831,6 +716,9 @@ func (idx *Indexer) Run(rootPath string) error {
 	}
 	if err := validateVerificationTags(v, &policyInput); err != nil {
 		return fmt.Errorf("CRITICAL: Failed to validate verification tags: %w", err)
+	}
+	if err := validateVerificationWaivers(v, &policyInput); err != nil {
+		return fmt.Errorf("CRITICAL: Failed to validate verification waivers: %w", err)
 	}
 	if err := v.Validate(policyInput); err != nil {
 		return fmt.Errorf("CRITICAL: Data contract violation (Go -> policy engine mismatch): %w", err)
@@ -929,10 +817,19 @@ func (idx *Indexer) Run(rootPath string) error {
 		}
 	}
 
+	// Populate symbol index for LSP if requested
+	if idx.SymbolsJSON {
+		lintResult.SymbolIndex = buildSymbolIndex(&policyInput)
+	}
+
 	// Output results
 	if idx.JSONOutput {
 		// JSON output mode
-		enc := json.NewEncoder(os.Stdout)
+		out := idx.Output
+		if out == nil {
+			out = os.Stdout
+		}
+		enc := json.NewEncoder(out)
 		enc.SetIndent("", "  ")
 		if err := enc.Encode(lintResult); err != nil {
 			return fmt.Errorf("failed to encode JSON output: %w", err)
@@ -1029,6 +926,79 @@ func formatPipelineErrors(errs []error) string {
 	return b.String()
 }
 
+type policyRuleConfigSummary struct {
+	ConfigPath         string
+	ConfigLabel        string
+	DisabledByConfig   []string
+	OptionalNotEnabled []string
+}
+
+func emitPolicyRuleConfigSummary(cfg *config.Config) {
+	if cfg == nil {
+		return
+	}
+	summary := buildPolicyRuleConfigSummary(cfg)
+	fmt.Printf("\n=== Policy Configuration ===\n")
+	fmt.Printf("  config: %s\n", summary.ConfigLabel)
+	if len(summary.DisabledByConfig) == 0 {
+		fmt.Printf("  rules disabled via config: none\n")
+	} else {
+		fmt.Printf("  rules disabled via config (%d):\n", len(summary.DisabledByConfig))
+		for _, rule := range summary.DisabledByConfig {
+			fmt.Printf("    - %s\n", rule)
+		}
+	}
+	if len(summary.OptionalNotEnabled) == 0 {
+		fmt.Printf("  optional rules not enabled: none\n")
+	} else {
+		fmt.Printf("  optional rules not enabled (%d):\n", len(summary.OptionalNotEnabled))
+		for _, rule := range summary.OptionalNotEnabled {
+			fmt.Printf("    - %s\n", rule)
+		}
+	}
+	if summary.ConfigPath == "" {
+		fmt.Printf("  action: create vhdl_lint.json or .vhdl_lint.json to enable optional rules\n")
+	} else if len(summary.OptionalNotEnabled) > 0 {
+		fmt.Printf("  action: edit %s (lint.rules.<id> = \"warning\"|\"error\")\n", summary.ConfigPath)
+	}
+}
+
+func buildPolicyRuleConfigSummary(cfg *config.Config) policyRuleConfigSummary {
+	summary := policyRuleConfigSummary{}
+	if cfg == nil {
+		summary.ConfigLabel = "default (no config file found)"
+		return summary
+	}
+	summary.ConfigPath = cfg.ConfigPath()
+	if summary.ConfigPath == "" {
+		summary.ConfigLabel = "default (no config file found)"
+	} else {
+		summary.ConfigLabel = summary.ConfigPath
+	}
+
+	rules := cfg.Lint.Rules
+	if rules == nil {
+		rules = map[string]string{}
+	}
+
+	for rule, severity := range rules {
+		if strings.EqualFold(strings.TrimSpace(severity), "off") {
+			summary.DisabledByConfig = append(summary.DisabledByConfig, rule)
+		}
+	}
+
+	optionalRules := policy.OptionalRuleIDs()
+	for _, rule := range optionalRules {
+		if _, ok := rules[rule]; !ok {
+			summary.OptionalNotEnabled = append(summary.OptionalNotEnabled, rule)
+		}
+	}
+
+	sort.Strings(summary.DisabledByConfig)
+	sort.Strings(summary.OptionalNotEnabled)
+	return summary
+}
+
 func applyPolicyResult(lintResult *LintResult, result *policy.Result) {
 	if lintResult == nil || result == nil {
 		return
@@ -1036,6 +1006,7 @@ func applyPolicyResult(lintResult *LintResult, result *policy.Result) {
 	lintResult.Violations = result.Violations
 	lintResult.MissingChecks = result.MissingChecks
 	lintResult.AmbiguousConstructs = result.AmbiguousConstructs
+	lintResult.Waivers = result.Waivers
 	lintResult.Summary = ResultSummary{
 		TotalViolations: result.Summary.TotalViolations,
 		Errors:          result.Summary.Errors,
@@ -1108,716 +1079,34 @@ func sortedFactFiles(tables facts.Tables) []string {
 	return files
 }
 
+func fileListFromFacts(factsList []extractor.FileFacts) []string {
+	seen := make(map[string]bool)
+	files := make([]string, 0, len(factsList))
+	for _, facts := range factsList {
+		if facts.File == "" || seen[facts.File] {
+			continue
+		}
+		seen[facts.File] = true
+		files = append(files, facts.File)
+	}
+	sort.Strings(files)
+	return files
+}
+
 // buildPolicyInput converts extracted facts to the policy engine input format
 func (idx *Indexer) buildPolicyInput() policy.Input {
-	// Initialize all slices to empty (not nil) to ensure JSON serialization
-	// produces [] instead of null - the CUE contract requires arrays
-	input := policy.Input{
-		Standard:              idx.Config.Standard,
-		FileCount:             len(idx.Facts),
-		Entities:              []policy.Entity{},
-		Architectures:         []policy.Architecture{},
-		Packages:              []policy.Package{},
-		Components:            []policy.Component{},
-		UseClauses:            []policy.UseClause{},
-		LibraryClauses:        []policy.LibraryClause{},
-		ContextClauses:        []policy.ContextClause{},
-		Signals:               []policy.Signal{},
-		Ports:                 []policy.Port{},
-		Dependencies:          []policy.Dependency{},
-		Symbols:               []policy.Symbol{},
-		Scopes:                []policy.Scope{},
-		SymbolDefs:            []policy.SymbolDef{},
-		NameUses:              []policy.NameUse{},
-		Files:                 []policy.FileInfo{},
-		VerificationBlocks:    []policy.VerificationBlock{},
-		VerificationTags:      []policy.VerificationTag{},
-		VerificationTagErrors: []policy.VerificationTagError{},
-		Instances:             []policy.Instance{},
-		CaseStatements:        []policy.CaseStatement{},
-		Processes:             []policy.Process{},
-		ConcurrentAssignments: []policy.ConcurrentAssignment{},
-		Generates:             []policy.GenerateStatement{},
-		Configurations:        []policy.Configuration{},
-		// Type system
-		Types:         []policy.TypeDeclaration{},
-		Subtypes:      []policy.SubtypeDeclaration{},
-		Functions:     []policy.FunctionDeclaration{},
-		Procedures:    []policy.ProcedureDeclaration{},
-		ConstantDecls: []policy.ConstantDeclaration{},
-		// Type system info for filtering (LEGACY)
-		EnumLiterals:    []string{},
-		Constants:       []string{},
-		SharedVariables: []string{},
-		// Advanced analysis
-		Comparisons:   []policy.Comparison{},
-		ArithmeticOps: []policy.ArithmeticOp{},
-		SignalDeps:    []policy.SignalDep{},
-		CDCCrossings:  []policy.CDCCrossing{},
-		SignalUsages:  []policy.SignalUsage{},
-		// Configuration
-		LintConfig: policy.LintRuleConfig{
-			Rules: idx.Config.Lint.Rules,
-		},
-		ThirdPartyFiles: []string{},
+	files := fileListFromFacts(idx.Facts)
+	input := idx.newPolicyInput(files)
+	mode := "full"
+	if idx.Config != nil {
+		if m := strings.TrimSpace(idx.Config.Analysis.PolicyInputMode); m != "" {
+			mode = m
+		}
 	}
-
-	// Add third-party files list
-	for f := range idx.ThirdPartyFiles {
-		input.ThirdPartyFiles = append(input.ThirdPartyFiles, f)
-	}
-
-	// Add file/library mappings
-	fileList := make([]string, 0, len(idx.Facts))
 	for _, facts := range idx.Facts {
-		fileList = append(fileList, facts.File)
+		idx.appendFactsToPolicyInput(&input, facts, strings.ToLower(mode))
 	}
-	sort.Strings(fileList)
-	for _, file := range fileList {
-		lib := "work"
-		if info, ok := idx.FileLibraries[file]; ok && info.LibraryName != "" {
-			lib = strings.ToLower(info.LibraryName)
-		}
-		input.Files = append(input.Files, policy.FileInfo{
-			Path:         file,
-			Library:      lib,
-			IsThirdParty: idx.ThirdPartyFiles[file],
-		})
-	}
-
-	// Aggregate facts from all files
-	for _, facts := range idx.Facts {
-		for _, e := range facts.Entities {
-			// Find ports for this entity (initialize to empty, not nil)
-			ports := []policy.Port{}
-			generics := []policy.GenericDecl{}
-			for _, p := range facts.Ports {
-				if p.InEntity == e.Name {
-					ports = append(ports, policy.Port{
-						Name:      p.Name,
-						Direction: p.Direction,
-						Type:      p.Type,
-						Default:   p.Default,
-						Line:      p.Line,
-						InEntity:  p.InEntity,
-						Width:     extractor.CalculateWidth(p.Type),
-					})
-				}
-			}
-			for _, g := range e.Generics {
-				generics = append(generics, policy.GenericDecl{
-					Name:        g.Name,
-					Kind:        g.Kind,
-					Type:        g.Type,
-					Class:       g.Class,
-					Default:     g.Default,
-					Line:        g.Line,
-					InEntity:    g.InEntity,
-					InComponent: g.InComponent,
-				})
-			}
-			input.Entities = append(input.Entities, policy.Entity{
-				Name:     e.Name,
-				File:     facts.File,
-				Line:     e.Line,
-				Ports:    ports,
-				Generics: generics,
-			})
-		}
-
-		for _, a := range facts.Architectures {
-			input.Architectures = append(input.Architectures, policy.Architecture{
-				Name:       a.Name,
-				EntityName: a.EntityName,
-				File:       facts.File,
-				Line:       a.Line,
-			})
-		}
-
-		for _, p := range facts.Packages {
-			input.Packages = append(input.Packages, policy.Package{
-				Name: p.Name,
-				File: facts.File,
-				Line: p.Line,
-			})
-		}
-
-		for _, u := range facts.UseClauses {
-			input.UseClauses = append(input.UseClauses, policy.UseClause{
-				Items: u.Items,
-				File:  facts.File,
-				Line:  u.Line,
-			})
-		}
-		for _, l := range facts.LibraryClauses {
-			input.LibraryClauses = append(input.LibraryClauses, policy.LibraryClause{
-				Libraries: l.Libraries,
-				File:      facts.File,
-				Line:      l.Line,
-			})
-		}
-		for _, c := range facts.ContextClauses {
-			input.ContextClauses = append(input.ContextClauses, policy.ContextClause{
-				Name: c.Name,
-				File: facts.File,
-				Line: c.Line,
-			})
-		}
-
-		for _, sharedName := range facts.SharedVariables {
-			input.SharedVariables = append(input.SharedVariables, sharedName)
-		}
-
-		for _, c := range facts.Components {
-			componentPorts := []policy.Port{}
-			componentGenerics := []policy.GenericDecl{}
-			for _, p := range c.Ports {
-				componentPorts = append(componentPorts, policy.Port{
-					Name:      p.Name,
-					Direction: p.Direction,
-					Type:      p.Type,
-					Line:      p.Line,
-					InEntity:  p.InEntity,
-					Width:     extractor.CalculateWidth(p.Type),
-				})
-			}
-			for _, g := range c.Generics {
-				componentGenerics = append(componentGenerics, policy.GenericDecl{
-					Name:        g.Name,
-					Kind:        g.Kind,
-					Type:        g.Type,
-					Class:       g.Class,
-					Default:     g.Default,
-					Line:        g.Line,
-					InEntity:    g.InEntity,
-					InComponent: g.InComponent,
-				})
-			}
-			input.Components = append(input.Components, policy.Component{
-				Name:       c.Name,
-				EntityRef:  c.EntityRef,
-				File:       facts.File,
-				Line:       c.Line,
-				IsInstance: c.IsInstance,
-				Ports:      componentPorts,
-				Generics:   componentGenerics,
-			})
-		}
-
-		for _, s := range facts.Signals {
-			// Skip signals with empty types (e.g., malformed declarations like "signal x: (range)")
-			if s.Type == "" {
-				continue
-			}
-			input.Signals = append(input.Signals, policy.Signal{
-				Name:     s.Name,
-				Type:     s.Type,
-				File:     facts.File,
-				Line:     s.Line,
-				InEntity: s.InEntity,
-				Width:    extractor.CalculateWidth(s.Type),
-			})
-		}
-
-		for _, p := range facts.Ports {
-			input.Ports = append(input.Ports, policy.Port{
-				Name:      p.Name,
-				Direction: p.Direction,
-				Type:      p.Type,
-				Line:      p.Line,
-				InEntity:  p.InEntity,
-				Width:     extractor.CalculateWidth(p.Type),
-			})
-		}
-
-		for _, d := range facts.Dependencies {
-			// Get the actual library name for this file
-			fileLib := "work"
-			if libInfo, ok := idx.FileLibraries[facts.File]; ok && libInfo.LibraryName != "" {
-				fileLib = strings.ToLower(libInfo.LibraryName)
-			}
-
-			// Translate "work.x" to the file's actual library for resolution
-			qualName := strings.ToLower(d.Target)
-			if strings.HasPrefix(qualName, "work.") {
-				qualName = fileLib + qualName[4:]
-			}
-			if !strings.Contains(qualName, ".") {
-				qualName = fileLib + "." + qualName
-			}
-
-			resolved := idx.Symbols.Has(qualName) || isStandardLibrary(d.Target)
-			if !resolved && d.Kind == "instantiation" {
-				baseName := qualName
-				if idxDot := strings.LastIndex(baseName, "."); idxDot != -1 {
-					baseName = baseName[idxDot+1:]
-				}
-				if baseName != "" && idx.Symbols.HasSuffix(baseName) {
-					resolved = true
-				}
-			}
-			input.Dependencies = append(input.Dependencies, policy.Dependency{
-				Source:   d.Source,
-				Target:   d.Target,
-				Kind:     d.Kind,
-				Line:     d.Line,
-				Resolved: resolved,
-			})
-		}
-
-		for _, inst := range facts.Instances {
-			// Ensure maps are not nil (CUE requires objects, not null)
-			portMap := inst.PortMap
-			if portMap == nil {
-				portMap = make(map[string]string)
-			}
-			genericMap := inst.GenericMap
-			if genericMap == nil {
-				genericMap = make(map[string]string)
-			}
-			associations := []policy.Association{}
-			for _, assoc := range inst.Associations {
-				associations = append(associations, policy.Association{
-					Kind:          assoc.Kind,
-					Formal:        assoc.Formal,
-					Actual:        assoc.Actual,
-					IsPositional:  assoc.IsPositional,
-					ActualKind:    assoc.ActualKind,
-					ActualBase:    assoc.ActualBase,
-					ActualFull:    assoc.ActualFull,
-					Line:          assoc.Line,
-					PositionIndex: assoc.PositionIndex,
-				})
-			}
-			input.Instances = append(input.Instances, policy.Instance{
-				Name:         inst.Name,
-				Target:       inst.Target,
-				PortMap:      portMap,
-				GenericMap:   genericMap,
-				Associations: associations,
-				File:         facts.File,
-				Line:         inst.Line,
-				InArch:       inst.InArch,
-			})
-		}
-
-		for _, cs := range facts.CaseStatements {
-			// Ensure choices is not nil
-			choices := cs.Choices
-			if choices == nil {
-				choices = []string{}
-			}
-			input.CaseStatements = append(input.CaseStatements, policy.CaseStatement{
-				Expression: cs.Expression,
-				Choices:    choices,
-				HasOthers:  cs.HasOthers,
-				File:       facts.File,
-				Line:       cs.Line,
-				InProcess:  cs.InProcess,
-				InArch:     cs.InArch,
-				IsComplete: cs.IsComplete,
-			})
-		}
-
-		for _, proc := range facts.Processes {
-			// Ensure slices are not nil
-			sensList := proc.SensitivityList
-			if sensList == nil {
-				sensList = []string{}
-			}
-			assigned := proc.AssignedSignals
-			if assigned == nil {
-				assigned = []string{}
-			}
-			read := proc.ReadSignals
-			if read == nil {
-				read = []string{}
-			}
-			vars := []policy.VariableDecl{}
-			for _, v := range proc.Variables {
-				vars = append(vars, policy.VariableDecl{
-					Name: v.Name,
-					Type: v.Type,
-					Line: v.Line,
-				})
-			}
-			procCalls := []policy.ProcedureCall{}
-			for _, c := range proc.ProcedureCalls {
-				args := c.Args
-				if args == nil {
-					args = []string{}
-				}
-				procCalls = append(procCalls, policy.ProcedureCall{
-					Name:      c.Name,
-					FullName:  c.FullName,
-					Args:      args,
-					Line:      c.Line,
-					InProcess: c.InProcess,
-					InArch:    c.InArch,
-				})
-			}
-			funcCalls := []policy.FunctionCall{}
-			for _, c := range proc.FunctionCalls {
-				args := c.Args
-				if args == nil {
-					args = []string{}
-				}
-				funcCalls = append(funcCalls, policy.FunctionCall{
-					Name:      c.Name,
-					Args:      args,
-					Line:      c.Line,
-					InProcess: c.InProcess,
-					InArch:    c.InArch,
-				})
-			}
-			waitStmts := []policy.WaitStatement{}
-			for _, w := range proc.WaitStatements {
-				onSignals := w.OnSignals
-				if onSignals == nil {
-					onSignals = []string{}
-				}
-				waitStmts = append(waitStmts, policy.WaitStatement{
-					OnSignals: onSignals,
-					UntilExpr: w.UntilExpr,
-					ForExpr:   w.ForExpr,
-					Line:      w.Line,
-				})
-			}
-			input.Processes = append(input.Processes, policy.Process{
-				Label:           proc.Label,
-				SensitivityList: sensList,
-				IsSequential:    proc.IsSequential,
-				IsCombinational: proc.IsCombinational,
-				ClockSignal:     proc.ClockSignal,
-				ClockEdge:       proc.ClockEdge,
-				HasReset:        proc.HasReset,
-				ResetSignal:     proc.ResetSignal,
-				ResetAsync:      proc.ResetAsync,
-				AssignedSignals: assigned,
-				ReadSignals:     read,
-				Variables:       vars,
-				ProcedureCalls:  procCalls,
-				FunctionCalls:   funcCalls,
-				WaitStatements:  waitStmts,
-				File:            facts.File,
-				Line:            proc.Line,
-				InArch:          proc.InArch,
-			})
-		}
-
-		for _, ca := range facts.ConcurrentAssignments {
-			// Skip assignments with empty targets (edge cases from parsing errors)
-			if ca.Target == "" {
-				continue
-			}
-			// Ensure ReadSignals is not nil
-			readSigs := ca.ReadSignals
-			if readSigs == nil {
-				readSigs = []string{}
-			}
-			input.ConcurrentAssignments = append(input.ConcurrentAssignments, policy.ConcurrentAssignment{
-				Target:      ca.Target,
-				ReadSignals: readSigs,
-				File:        facts.File,
-				Line:        ca.Line,
-				InArch:      ca.InArch,
-				Kind:        ca.Kind,
-			})
-		}
-
-		// Advanced analysis: Comparisons for trojan/trigger detection
-		for _, comp := range facts.Comparisons {
-			input.Comparisons = append(input.Comparisons, policy.Comparison{
-				LeftOperand:  comp.LeftOperand,
-				Operator:     comp.Operator,
-				RightOperand: comp.RightOperand,
-				IsLiteral:    comp.IsLiteral,
-				LiteralValue: comp.LiteralValue,
-				LiteralBits:  comp.LiteralBits,
-				ResultDrives: comp.ResultDrives,
-				File:         facts.File,
-				Line:         comp.Line,
-				InProcess:    comp.InProcess,
-				InArch:       comp.InArch,
-			})
-		}
-
-		// Advanced analysis: Arithmetic operations for power analysis
-		for _, arith := range facts.ArithmeticOps {
-			// Ensure operands is not nil
-			operands := arith.Operands
-			if operands == nil {
-				operands = []string{}
-			}
-			input.ArithmeticOps = append(input.ArithmeticOps, policy.ArithmeticOp{
-				Operator:    arith.Operator,
-				Operands:    operands,
-				Result:      arith.Result,
-				IsGuarded:   arith.IsGuarded,
-				GuardSignal: arith.GuardSignal,
-				File:        facts.File,
-				Line:        arith.Line,
-				InProcess:   arith.InProcess,
-				InArch:      arith.InArch,
-			})
-		}
-
-		// Advanced analysis: Signal dependencies for loop detection
-		for _, dep := range facts.SignalDeps {
-			input.SignalDeps = append(input.SignalDeps, policy.SignalDep{
-				Source:       dep.Source,
-				Target:       dep.Target,
-				InProcess:    dep.InProcess,
-				IsSequential: dep.IsSequential,
-				File:         facts.File,
-				Line:         dep.Line,
-				InArch:       dep.InArch,
-			})
-		}
-
-		// CDC crossings: signals crossing clock domains
-		for _, cdc := range facts.CDCCrossings {
-			input.CDCCrossings = append(input.CDCCrossings, policy.CDCCrossing{
-				Signal:         cdc.Signal,
-				SourceClock:    cdc.SourceClock,
-				SourceProc:     cdc.SourceProc,
-				DestClock:      cdc.DestClock,
-				DestProc:       cdc.DestProc,
-				IsSynchronized: cdc.IsSynchronized,
-				SyncStages:     cdc.SyncStages,
-				IsMultiBit:     cdc.IsMultiBit,
-				File:           cdc.File,
-				Line:           cdc.Line,
-				InArch:         cdc.InArch,
-			})
-		}
-
-		// Signal usages: tracking reads, writes, and port map connections
-		for _, usage := range facts.SignalUsages {
-			input.SignalUsages = append(input.SignalUsages, policy.SignalUsage{
-				Signal:       usage.Signal,
-				IsRead:       usage.IsRead,
-				IsWritten:    usage.IsWritten,
-				InProcess:    usage.InProcess,
-				InPortMap:    usage.InPortMap,
-				InstanceName: usage.InstanceName,
-				InPSL:        usage.InPSL,
-				Line:         usage.Line,
-			})
-		}
-
-		// Generate statements (for-generate, if-generate, case-generate)
-		for _, gen := range facts.Generates {
-			input.Generates = append(input.Generates, policy.GenerateStatement{
-				Label:          gen.Label,
-				Kind:           gen.Kind,
-				File:           facts.File,
-				Line:           gen.Line,
-				InArch:         gen.InArch,
-				LoopVar:        gen.LoopVar,
-				RangeLow:       gen.RangeLow,
-				RangeHigh:      gen.RangeHigh,
-				RangeDir:       gen.RangeDir,
-				IterationCount: gen.IterationCount,
-				CanElaborate:   gen.CanElaborate,
-				Condition:      gen.Condition,
-				SignalCount:    len(gen.Signals),
-				InstanceCount:  len(gen.Instances),
-				ProcessCount:   len(gen.Processes),
-			})
-		}
-
-		// Configuration declarations
-		for _, cfg := range facts.Configurations {
-			input.Configurations = append(input.Configurations, policy.Configuration{
-				Name:       cfg.Name,
-				EntityName: cfg.EntityName,
-				File:       facts.File,
-				Line:       cfg.Line,
-			})
-		}
-
-		for _, block := range facts.VerificationBlocks {
-			input.VerificationBlocks = append(input.VerificationBlocks, policy.VerificationBlock{
-				Label:     block.Label,
-				LineStart: block.LineStart,
-				LineEnd:   block.LineEnd,
-				File:      facts.File,
-				InArch:    block.InArch,
-			})
-		}
-
-		for _, tag := range facts.VerificationTags {
-			bindings := tag.Bindings
-			if bindings == nil {
-				bindings = map[string]string{}
-			}
-			input.VerificationTags = append(input.VerificationTags, policy.VerificationTag{
-				ID:       tag.ID,
-				Scope:    tag.Scope,
-				Bindings: bindings,
-				File:     facts.File,
-				Line:     tag.Line,
-				Raw:      tag.Raw,
-				InArch:   tag.InArch,
-			})
-		}
-
-		for _, terr := range facts.VerificationTagErrors {
-			input.VerificationTagErrors = append(input.VerificationTagErrors, policy.VerificationTagError{
-				File:    facts.File,
-				Line:    terr.Line,
-				Raw:     terr.Raw,
-				Message: terr.Message,
-				InArch:  terr.InArch,
-			})
-		}
-
-		// Type system: Types
-		for _, t := range facts.Types {
-			// Convert enum literals (ensure not nil)
-			enumLits := t.EnumLiterals
-			if enumLits == nil {
-				enumLits = []string{}
-			}
-			// Convert record fields (ensure not nil)
-			var fields []policy.RecordField
-			for _, f := range t.Fields {
-				fields = append(fields, policy.RecordField{
-					Name: f.Name,
-					Type: f.Type,
-					Line: f.Line,
-				})
-			}
-			if fields == nil {
-				fields = []policy.RecordField{}
-			}
-			// Convert index types (ensure not nil)
-			indexTypes := t.IndexTypes
-			if indexTypes == nil {
-				indexTypes = []string{}
-			}
-			input.Types = append(input.Types, policy.TypeDeclaration{
-				Name:          t.Name,
-				Kind:          t.Kind,
-				File:          facts.File,
-				Line:          t.Line,
-				InPackage:     t.InPackage,
-				InArch:        t.InArch,
-				EnumLiterals:  enumLits,
-				Fields:        fields,
-				ElementType:   t.ElementType,
-				IndexTypes:    indexTypes,
-				Unconstrained: t.Unconstrained,
-				BaseUnit:      t.BaseUnit,
-				RangeLow:      t.RangeLow,
-				RangeHigh:     t.RangeHigh,
-				RangeDir:      t.RangeDir,
-			})
-		}
-
-		// Type system: Subtypes
-		for _, st := range facts.Subtypes {
-			input.Subtypes = append(input.Subtypes, policy.SubtypeDeclaration{
-				Name:       st.Name,
-				BaseType:   st.BaseType,
-				Constraint: st.Constraint,
-				Resolution: st.Resolution,
-				File:       facts.File,
-				Line:       st.Line,
-				InPackage:  st.InPackage,
-				InArch:     st.InArch,
-			})
-		}
-
-		// Type system: Functions
-		for _, fn := range facts.Functions {
-			// Convert parameters (ensure not nil)
-			var params []policy.SubprogramParameter
-			for _, p := range fn.Parameters {
-				params = append(params, policy.SubprogramParameter{
-					Name:      p.Name,
-					Direction: p.Direction,
-					Type:      p.Type,
-					Class:     p.Class,
-					Default:   p.Default,
-					Line:      p.Line,
-				})
-			}
-			if params == nil {
-				params = []policy.SubprogramParameter{}
-			}
-			input.Functions = append(input.Functions, policy.FunctionDeclaration{
-				Name:       fn.Name,
-				ReturnType: fn.ReturnType,
-				Parameters: params,
-				IsPure:     fn.IsPure,
-				HasBody:    fn.HasBody,
-				File:       facts.File,
-				Line:       fn.Line,
-				InPackage:  fn.InPackage,
-				InArch:     fn.InArch,
-			})
-		}
-
-		// Type system: Procedures
-		for _, pr := range facts.Procedures {
-			// Convert parameters (ensure not nil)
-			var params []policy.SubprogramParameter
-			for _, p := range pr.Parameters {
-				params = append(params, policy.SubprogramParameter{
-					Name:      p.Name,
-					Direction: p.Direction,
-					Type:      p.Type,
-					Class:     p.Class,
-					Default:   p.Default,
-					Line:      p.Line,
-				})
-			}
-			if params == nil {
-				params = []policy.SubprogramParameter{}
-			}
-			input.Procedures = append(input.Procedures, policy.ProcedureDeclaration{
-				Name:       pr.Name,
-				Parameters: params,
-				HasBody:    pr.HasBody,
-				File:       facts.File,
-				Line:       pr.Line,
-				InPackage:  pr.InPackage,
-				InArch:     pr.InArch,
-			})
-		}
-
-		// Type system: Constants
-		for _, c := range facts.ConstantDecls {
-			input.ConstantDecls = append(input.ConstantDecls, policy.ConstantDeclaration{
-				Name:      c.Name,
-				Type:      c.Type,
-				Value:     c.Value,
-				File:      facts.File,
-				Line:      c.Line,
-				InPackage: c.InPackage,
-				InArch:    c.InArch,
-			})
-		}
-
-		// Type system info (LEGACY): collect enum literals and constants for filtering
-		input.EnumLiterals = append(input.EnumLiterals, facts.EnumLiterals...)
-		input.Constants = append(input.Constants, facts.Constants...)
-	}
-
-	// Add symbols
-	for name, sym := range idx.Symbols.All() {
-		input.Symbols = append(input.Symbols, policy.Symbol{
-			Name: name,
-			Kind: sym.Kind,
-			File: sym.File,
-			Line: sym.Line,
-		})
-	}
-
-	idx.populateScopesDefsUses(&input)
-
+	idx.finalizePolicyInput(&input, strings.ToLower(mode))
 	return input
 }
 
@@ -1843,6 +1132,28 @@ func validateVerificationTags(v *validator.Validator, input *policy.Input) error
 		valid = append(valid, tag)
 	}
 	input.VerificationTags = valid
+	return nil
+}
+
+func validateVerificationWaivers(v *validator.Validator, input *policy.Input) error {
+	if len(input.VerificationWaivers) == 0 {
+		return nil
+	}
+	valid := input.VerificationWaivers[:0]
+	for _, waiver := range input.VerificationWaivers {
+		if err := v.ValidateVerificationWaiver(waiver); err != nil {
+			input.VerificationWaiverErrors = append(input.VerificationWaiverErrors, policy.VerificationWaiverError{
+				File:    waiver.File,
+				Line:    waiver.Line,
+				Raw:     waiver.Raw,
+				Message: err.Error(),
+				InArch:  waiver.InArch,
+			})
+			continue
+		}
+		valid = append(valid, waiver)
+	}
+	input.VerificationWaivers = valid
 	return nil
 }
 
@@ -2394,6 +1705,124 @@ func isStandardLibrary(name string) bool {
 	return false
 }
 
+func isStandardLibraryName(name string) bool {
+	lower := strings.ToLower(name)
+	if lower == "ieee" || lower == "std" {
+		return true
+	}
+	return isStandardLibrary(lower)
+}
+
+func normalizeUseTarget(target, fileLib string) string {
+	trimmed := strings.TrimSpace(strings.ToLower(target))
+	if trimmed == "" {
+		return ""
+	}
+	parts := strings.Split(trimmed, ".")
+	if len(parts) == 1 {
+		return fileLib + "." + parts[0]
+	}
+	if len(parts) == 2 && parts[1] == "all" {
+		return fileLib + "." + parts[0]
+	}
+	lib := parts[0]
+	pkg := parts[1]
+	if lib == "work" {
+		lib = fileLib
+	}
+	if lib == "" || pkg == "" {
+		return ""
+	}
+	return lib + "." + pkg
+}
+
+func normalizeContextTarget(target, fileLib string) string {
+	trimmed := strings.TrimSpace(strings.ToLower(target))
+	if trimmed == "" {
+		return ""
+	}
+	parts := strings.Split(trimmed, ".")
+	if len(parts) == 1 {
+		return fileLib + "." + parts[0]
+	}
+	lib := parts[0]
+	name := parts[1]
+	if lib == "work" {
+		lib = fileLib
+	}
+	if lib == "" || name == "" {
+		return ""
+	}
+	return lib + "." + name
+}
+
+func (idx *Indexer) hasLibrary(name string) bool {
+	if name == "" || idx.Config == nil {
+		return false
+	}
+	for lib := range idx.Config.Libraries {
+		if strings.EqualFold(lib, name) {
+			return true
+		}
+	}
+	for _, entry := range idx.Config.Files {
+		if entry.Library != "" && strings.EqualFold(entry.Library, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func (idx *Indexer) findMissingLibraries(clauses []policy.LibraryClause) []string {
+	if idx.Config == nil {
+		return nil
+	}
+	known := make(map[string]bool)
+	known["work"] = true
+	for lib := range idx.Config.Libraries {
+		if lib == "" {
+			continue
+		}
+		known[strings.ToLower(lib)] = true
+	}
+	for _, entry := range idx.Config.Files {
+		if entry.Library == "" {
+			continue
+		}
+		known[strings.ToLower(entry.Library)] = true
+	}
+	for _, info := range idx.FileLibraries {
+		if info.LibraryName == "" {
+			continue
+		}
+		known[strings.ToLower(info.LibraryName)] = true
+	}
+
+	missing := make(map[string]bool)
+	for _, clause := range clauses {
+		for _, lib := range clause.Libraries {
+			name := strings.ToLower(strings.TrimSpace(lib))
+			if name == "" {
+				continue
+			}
+			if isStandardLibraryName(name) || known[name] {
+				continue
+			}
+			missing[name] = true
+		}
+	}
+
+	if len(missing) == 0 {
+		return nil
+	}
+	list := make([]string, 0, len(missing))
+	for lib := range missing {
+		list = append(list, lib)
+	}
+	sort.Strings(list)
+	return list
+}
+
 func isValidIdentifierName(name string) bool {
 	if name == "" {
 		return false
@@ -2462,7 +1891,18 @@ func emitProgress(mu *sync.Mutex, progress *int, total int, facts extractor.File
 	mu.Lock()
 	defer mu.Unlock()
 	*progress = *progress + 1
-	fmt.Printf("  [%d/%d] %s (%s, %s)\n", *progress, total, facts.File, status, formatDuration(duration))
+	extras := []string{}
+	if facts.ErrorNodeCount > 0 {
+		extras = append(extras, fmt.Sprintf("%d parse errors", facts.ErrorNodeCount))
+	}
+	if n := fallbackTotal(facts.FallbackStats); n > 0 {
+		extras = append(extras, fmt.Sprintf("%d fallbacks", n))
+	}
+	errSuffix := ""
+	if len(extras) > 0 {
+		errSuffix = ", " + strings.Join(extras, ", ")
+	}
+	fmt.Printf("  [%d/%d] %s (%s, %s%s)\n", *progress, total, facts.File, status, formatDuration(duration), errSuffix)
 	if deps != "" {
 		fmt.Printf("    deps: %s\n", deps)
 	}
@@ -2474,10 +1914,20 @@ func emitProgress(mu *sync.Mutex, progress *int, total int, facts extractor.File
 }
 
 func formatFactsSummary(facts extractor.FileFacts) []string {
+	errStr := ""
+	if facts.ErrorNodeCount > 0 {
+		errStr = fmt.Sprintf(" ERRORS=%d", facts.ErrorNodeCount)
+	}
+	if n := fallbackTotal(facts.FallbackStats); n > 0 {
+		errStr += fmt.Sprintf(" FALLBACKS=%d", n)
+	}
 	lines := []string{
-		fmt.Sprintf("facts: entities=%d packages=%d arch=%d signals=%d ports=%d processes=%d instances=%d generates=%d deps=%d",
+		fmt.Sprintf("facts: entities=%d packages=%d arch=%d signals=%d ports=%d processes=%d instances=%d generates=%d deps=%d%s",
 			len(facts.Entities), len(facts.Packages), len(facts.Architectures), len(facts.Signals), len(facts.Ports),
-			len(facts.Processes), len(facts.Instances), len(facts.Generates), len(facts.Dependencies)),
+			len(facts.Processes), len(facts.Instances), len(facts.Generates), len(facts.Dependencies), errStr),
+	}
+	if summary := fallbackSummary(facts.FallbackStats, 5); summary != "" {
+		lines = append(lines, "fallbacks: "+summary)
 	}
 
 	if names := summarizeEntities(facts, 6); names != "" {
@@ -2550,6 +2000,52 @@ func summarizeList(items []string, max int) string {
 		return fmt.Sprintf("%s, ... (+%d more)", strings.Join(items[:max], ", "), len(items)-max)
 	}
 	return strings.Join(items, ", ")
+}
+
+func fallbackTotal(stats map[string]int) int {
+	total := 0
+	for _, n := range stats {
+		if n > 0 {
+			total += n
+		}
+	}
+	return total
+}
+
+func fallbackSummary(stats map[string]int, max int) string {
+	if len(stats) == 0 {
+		return ""
+	}
+	type kv struct {
+		key string
+		n   int
+	}
+	items := make([]kv, 0, len(stats))
+	for key, n := range stats {
+		if n > 0 {
+			items = append(items, kv{key: key, n: n})
+		}
+	}
+	if len(items) == 0 {
+		return ""
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].n == items[j].n {
+			return items[i].key < items[j].key
+		}
+		return items[i].n > items[j].n
+	})
+	if max <= 0 || max > len(items) {
+		max = len(items)
+	}
+	parts := make([]string, 0, max)
+	for i := 0; i < max; i++ {
+		parts = append(parts, fmt.Sprintf("%s=%d", items[i].key, items[i].n))
+	}
+	if len(items) > max {
+		return fmt.Sprintf("%s, ... (+%d more)", strings.Join(parts, ", "), len(items)-max)
+	}
+	return strings.Join(parts, ", ")
 }
 
 func isAlpha(b byte) bool {

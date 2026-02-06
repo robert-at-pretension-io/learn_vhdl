@@ -20,6 +20,7 @@ pub fn optional_violations(input: &Input) -> Vec<Violation> {
     out.extend(combinational_reset(input));
     out.extend(potential_memory_inference(input));
     out.extend(unregistered_output(input));
+    out.extend(potential_overflow(input));
     out
 }
 
@@ -321,6 +322,50 @@ fn output_is_driven(input: &Input, port_name: &str) -> bool {
         .any(|ca| ca.target.eq_ignore_ascii_case(port_name))
 }
 
+fn potential_overflow(input: &Input) -> Vec<Violation> {
+    let signal_widths: std::collections::HashMap<String, usize> = input
+        .signals
+        .iter()
+        .filter(|s| s.width > 0)
+        .map(|s| (s.name.to_ascii_lowercase(), s.width))
+        .collect();
+    let mut out = Vec::new();
+    for op in &input.arithmetic_ops {
+        if !matches!(op.operator.as_str(), "+" | "-" | "add" | "sub") {
+            continue;
+        }
+        if helpers::file_in_testbench(input, &op.file) {
+            continue;
+        }
+        let result_width = signal_widths.get(&op.result.to_ascii_lowercase());
+        if result_width.is_none() {
+            continue;
+        }
+        let result_w = *result_width.unwrap();
+        let max_operand_width = op
+            .operands
+            .iter()
+            .filter_map(|name| signal_widths.get(&name.to_ascii_lowercase()))
+            .copied()
+            .max();
+        if let Some(max_w) = max_operand_width {
+            if result_w > 0 && max_w > 0 && result_w <= max_w {
+                out.push(Violation {
+                    rule: "potential_overflow".to_string(),
+                    severity: "warning".to_string(),
+                    file: op.file.clone(),
+                    line: op.line,
+                    message: format!(
+                        "Result '{}' ({}-bit) of {} may overflow — operand is also {}-bit with no extra bit for carry",
+                        op.result, result_w, op.operator, max_w
+                    ),
+                });
+            }
+        }
+    }
+    out
+}
+
 fn get_entity_file(input: &Input, entity_name: &str) -> String {
     input
         .entities
@@ -333,7 +378,66 @@ fn get_entity_file(input: &Input, entity_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::input::{Input, Signal};
+    use crate::policy::input::{ArithmeticOp, Input, Signal};
+
+    #[test]
+    fn potential_overflow_flags() {
+        let mut input = Input::default();
+        input.signals.push(Signal {
+            name: "a".to_string(),
+            width: 8,
+            file: "a.vhd".to_string(),
+            line: 1,
+            ..Default::default()
+        });
+        input.signals.push(Signal {
+            name: "result".to_string(),
+            width: 8,
+            file: "a.vhd".to_string(),
+            line: 2,
+            ..Default::default()
+        });
+        input.arithmetic_ops.push(ArithmeticOp {
+            operator: "+".to_string(),
+            operands: vec!["a".to_string()],
+            result: "result".to_string(),
+            file: "a.vhd".to_string(),
+            line: 5,
+            ..Default::default()
+        });
+        let v = potential_overflow(&input);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].rule, "potential_overflow");
+    }
+
+    #[test]
+    fn potential_overflow_skip_wider_result() {
+        let mut input = Input::default();
+        input.signals.push(Signal {
+            name: "a".to_string(),
+            width: 8,
+            file: "a.vhd".to_string(),
+            line: 1,
+            ..Default::default()
+        });
+        input.signals.push(Signal {
+            name: "result".to_string(),
+            width: 9,
+            file: "a.vhd".to_string(),
+            line: 2,
+            ..Default::default()
+        });
+        input.arithmetic_ops.push(ArithmeticOp {
+            operator: "+".to_string(),
+            operands: vec!["a".to_string()],
+            result: "result".to_string(),
+            file: "a.vhd".to_string(),
+            line: 5,
+            ..Default::default()
+        });
+        let v = potential_overflow(&input);
+        assert!(v.is_empty());
+    }
 
     #[test]
     fn very_wide_bus_flags() {

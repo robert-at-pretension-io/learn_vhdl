@@ -15,6 +15,8 @@ pub struct Input {
     #[serde(default)]
     pub packages: Vec<Package>,
     #[serde(default)]
+    pub package_bodies: Vec<PackageBody>,
+    #[serde(default)]
     pub components: Vec<Component>,
     #[serde(default)]
     pub use_clauses: Vec<UseClause>,
@@ -22,6 +24,8 @@ pub struct Input {
     pub library_clauses: Vec<LibraryClause>,
     #[serde(default)]
     pub context_clauses: Vec<ContextClause>,
+    #[serde(default)]
+    pub context_declarations: Vec<ContextDeclaration>,
     #[serde(default)]
     pub signals: Vec<Signal>,
     #[serde(default)]
@@ -45,6 +49,10 @@ pub struct Input {
     #[serde(default)]
     pub verification_tag_errors: Vec<VerificationTagError>,
     #[serde(default)]
+    pub verification_waivers: Vec<VerificationWaiver>,
+    #[serde(default)]
+    pub verification_waiver_errors: Vec<VerificationWaiverError>,
+    #[serde(default)]
     pub instances: Vec<Instance>,
     #[serde(default)]
     pub case_statements: Vec<CaseStatement>,
@@ -56,6 +64,8 @@ pub struct Input {
     pub generates: Vec<GenerateStatement>,
     #[serde(default)]
     pub configurations: Vec<Configuration>,
+    #[serde(default)]
+    pub configuration_bindings: Vec<ConfigurationBinding>,
     #[serde(default)]
     pub types: Vec<TypeDeclaration>,
     #[serde(default)]
@@ -128,6 +138,18 @@ pub struct Package {
     pub file: String,
     #[serde(default)]
     pub line: usize,
+    #[serde(default)]
+    pub in_arch: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PackageBody {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub file: String,
+    #[serde(default)]
+    pub line: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -174,6 +196,8 @@ pub struct Port {
     pub r#type: String,
     #[serde(default)]
     pub default: String,
+    #[serde(default)]
+    pub file: String,
     #[serde(default)]
     pub line: usize,
     #[serde(default)]
@@ -230,6 +254,22 @@ pub struct ContextClause {
     pub file: String,
     #[serde(default)]
     pub line: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ContextDeclaration {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub file: String,
+    #[serde(default)]
+    pub line: usize,
+    #[serde(default)]
+    pub libraries: Vec<String>,
+    #[serde(default)]
+    pub use_items: Vec<String>,
+    #[serde(default)]
+    pub context_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -361,11 +401,49 @@ pub struct VerificationTagError {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+pub struct VerificationWaiver {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub scope: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub owner: String,
+    #[serde(default)]
+    pub expires: String,
+    #[serde(default)]
+    pub file: String,
+    #[serde(default)]
+    pub line: usize,
+    #[serde(default)]
+    pub raw: String,
+    #[serde(default)]
+    pub in_arch: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct VerificationWaiverError {
+    #[serde(default)]
+    pub file: String,
+    #[serde(default)]
+    pub line: usize,
+    #[serde(default)]
+    pub raw: String,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub in_arch: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct Instance {
     #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub target: String,
+    #[serde(default)]
+    pub target_arch: String,
     #[serde(default)]
     pub port_map: HashMap<String, String>,
     #[serde(default)]
@@ -579,6 +657,10 @@ pub struct Process {
     #[serde(default)]
     pub read_signals: Vec<String>,
     #[serde(default)]
+    pub assigned_variables: Vec<String>,
+    #[serde(default)]
+    pub read_variables: Vec<String>,
+    #[serde(default)]
     pub variables: Vec<VariableDecl>,
     #[serde(default)]
     pub procedure_calls: Vec<ProcedureCall>,
@@ -609,9 +691,15 @@ pub struct ProcedureCall {
     #[serde(default)]
     pub name: String,
     #[serde(default)]
+    pub full_name: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
     pub line: usize,
     #[serde(default)]
     pub in_process: String,
+    #[serde(default)]
+    pub in_arch: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -619,9 +707,13 @@ pub struct FunctionCall {
     #[serde(default)]
     pub name: String,
     #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
     pub line: usize,
     #[serde(default)]
     pub in_process: String,
+    #[serde(default)]
+    pub in_arch: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -674,6 +766,26 @@ pub struct Configuration {
     pub name: String,
     #[serde(default)]
     pub entity_name: String,
+    #[serde(default)]
+    pub arch_name: String,
+    #[serde(default)]
+    pub file: String,
+    #[serde(default)]
+    pub line: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ConfigurationBinding {
+    #[serde(default)]
+    pub scope_path: Vec<String>,
+    #[serde(default)]
+    pub instance_label: String,
+    #[serde(default)]
+    pub component_name: String,
+    #[serde(default)]
+    pub target_entity: String,
+    #[serde(default)]
+    pub target_arch: String,
     #[serde(default)]
     pub file: String,
     #[serde(default)]

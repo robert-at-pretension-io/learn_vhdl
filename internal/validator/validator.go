@@ -153,6 +153,29 @@ func (v *Validator) ValidateVerificationTag(tag interface{}) error {
 	return nil
 }
 
+// ValidateVerificationWaiver validates a single verification waiver against the CUE schema.
+func (v *Validator) ValidateVerificationWaiver(waiver interface{}) error {
+	jsonBytes, err := json.Marshal(waiver)
+	if err != nil {
+		return fmt.Errorf("marshaling waiver to JSON: %w", err)
+	}
+	dataValue := v.ctx.CompileBytes(jsonBytes)
+	if dataValue.Err() != nil {
+		return fmt.Errorf("compiling waiver as CUE: %w", dataValue.Err())
+	}
+
+	waiverDef := v.schema.LookupPath(cue.ParsePath("#VerificationWaiver"))
+	if waiverDef.Err() != nil {
+		return fmt.Errorf("looking up #VerificationWaiver definition: %w", waiverDef.Err())
+	}
+
+	unified := waiverDef.Unify(dataValue)
+	if err := unified.Validate(); err != nil {
+		return fmt.Errorf("waiver schema validation failed: %w", err)
+	}
+	return nil
+}
+
 // ValidationErrors returns detailed information about all validation errors
 func (v *Validator) ValidationErrors(data interface{}) []string {
 	jsonBytes, err := json.Marshal(data)

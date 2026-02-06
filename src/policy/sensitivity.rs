@@ -8,7 +8,10 @@ pub fn violations(input: &Input) -> Vec<Violation> {
 }
 
 pub fn optional_violations(input: &Input) -> Vec<Violation> {
-    sensitivity_list_superfluous(input)
+    let mut out = Vec::new();
+    out.extend(sensitivity_list_superfluous(input));
+    out.extend(variable_in_sensitivity_list(input));
+    out
 }
 
 fn skip_sensitivity(input: &Input, proc_index: usize) -> bool {
@@ -62,6 +65,34 @@ fn sensitivity_list_incomplete(input: &Input) -> Vec<Violation> {
     out
 }
 
+fn variable_in_sensitivity_list(input: &Input) -> Vec<Violation> {
+    let mut out = Vec::new();
+    for proc in &input.processes {
+        if helpers::has_all_sensitivity(&proc.sensitivity_list) {
+            continue;
+        }
+        for item in &proc.sensitivity_list {
+            if proc
+                .variables
+                .iter()
+                .any(|var| var.name.eq_ignore_ascii_case(item))
+            {
+                out.push(Violation {
+                    rule: "variable_in_sensitivity_list".to_string(),
+                    severity: "error".to_string(),
+                    file: proc.file.clone(),
+                    line: proc.line,
+                    message: format!(
+                        "Variable '{}' appears in sensitivity list of process '{}' - variables cannot trigger processes",
+                        item, proc.label
+                    ),
+                });
+            }
+        }
+    }
+    out
+}
+
 fn sensitivity_list_superfluous(input: &Input) -> Vec<Violation> {
     let mut out = Vec::new();
     for (idx, proc) in input.processes.iter().enumerate() {
@@ -96,7 +127,7 @@ fn sensitivity_list_superfluous(input: &Input) -> Vec<Violation> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::input::{Input, Process};
+    use crate::policy::input::{Input, Process, VariableDecl};
 
     #[test]
     fn sensitivity_list_incomplete_flags() {
@@ -135,5 +166,45 @@ mod tests {
         let v = sensitivity_list_superfluous(&input);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].rule, "sensitivity_list_superfluous");
+    }
+
+    #[test]
+    fn variable_in_sensitivity_list_flags() {
+        let mut input = Input::default();
+        input.processes.push(Process {
+            label: "p1".to_string(),
+            sensitivity_list: vec!["my_var".to_string()],
+            variables: vec![VariableDecl {
+                name: "my_var".to_string(),
+                r#type: "integer".to_string(),
+                line: 5,
+            }],
+            file: "a.vhd".to_string(),
+            line: 4,
+            ..Default::default()
+        });
+        let v = variable_in_sensitivity_list(&input);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].rule, "variable_in_sensitivity_list");
+        assert_eq!(v[0].severity, "error");
+    }
+
+    #[test]
+    fn variable_in_sensitivity_list_skips_all() {
+        let mut input = Input::default();
+        input.processes.push(Process {
+            label: "p1".to_string(),
+            sensitivity_list: vec!["all".to_string()],
+            variables: vec![VariableDecl {
+                name: "my_var".to_string(),
+                r#type: "integer".to_string(),
+                line: 5,
+            }],
+            file: "a.vhd".to_string(),
+            line: 4,
+            ..Default::default()
+        });
+        let v = variable_in_sensitivity_list(&input);
+        assert!(v.is_empty());
     }
 }

@@ -15,6 +15,7 @@ pub fn optional_violations(input: &Input) -> Vec<Violation> {
     out.extend(very_wide_register(input));
     out.extend(mixed_edge_clocking(input));
     out.extend(async_reset_naming(input));
+    out.extend(sequential_signal_no_reset(input));
     out
 }
 
@@ -183,6 +184,33 @@ fn async_reset_naming(input: &Input) -> Vec<Violation> {
         .collect()
 }
 
+fn sequential_signal_no_reset(input: &Input) -> Vec<Violation> {
+    input
+        .processes
+        .iter()
+        .filter(|proc| proc.is_sequential)
+        .filter(|proc| !proc.has_reset)
+        .filter(|proc| !proc.assigned_signals.is_empty())
+        .filter(|proc| !helpers::process_in_testbench(input, proc))
+        .filter(|proc| {
+            proc.assigned_signals
+                .iter()
+                .any(|s| !helpers::is_clock_name(s) && !helpers::is_reset_name(s))
+        })
+        .map(|proc| Violation {
+            rule: "sequential_signal_no_reset".to_string(),
+            severity: "warning".to_string(),
+            file: proc.file.clone(),
+            line: proc.line,
+            message: format!(
+                "Sequential process '{}' assigns {} signals but has no reset - registers may power up in unknown state",
+                proc.label,
+                proc.assigned_signals.len()
+            ),
+        })
+        .collect()
+}
+
 fn is_active_low_reset_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower.ends_with("_n") || (lower.ends_with('n') && helpers::is_reset_name(name))
@@ -232,6 +260,40 @@ mod tests {
         let v = signal_in_seq_and_comb(&input);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].rule, "signal_in_seq_and_comb");
+    }
+
+    #[test]
+    fn sequential_signal_no_reset_flags() {
+        let mut input = Input::default();
+        input.processes.push(Process {
+            label: "seq".to_string(),
+            is_sequential: true,
+            has_reset: false,
+            assigned_signals: vec!["data_out".to_string()],
+            file: "a.vhd".to_string(),
+            line: 5,
+            ..Default::default()
+        });
+        let v = sequential_signal_no_reset(&input);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].rule, "sequential_signal_no_reset");
+    }
+
+    #[test]
+    fn sequential_signal_no_reset_skips_with_reset() {
+        let mut input = Input::default();
+        input.processes.push(Process {
+            label: "seq".to_string(),
+            is_sequential: true,
+            has_reset: true,
+            reset_signal: "rst".to_string(),
+            assigned_signals: vec!["data_out".to_string()],
+            file: "a.vhd".to_string(),
+            line: 5,
+            ..Default::default()
+        });
+        let v = sequential_signal_no_reset(&input);
+        assert!(v.is_empty());
     }
 
     #[test]

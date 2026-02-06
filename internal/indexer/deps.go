@@ -32,6 +32,32 @@ func buildDependentsGraph(
 	return graph
 }
 
+func buildDependentsGraphFromStore(
+	store *factsStore,
+	files []string,
+	symbols *SymbolTable,
+	fileLibs map[string]config.FileLibraryInfo,
+) (dependentsGraph, error) {
+	graph := make(dependentsGraph)
+	for _, file := range files {
+		facts, err := store.Get(file)
+		if err != nil {
+			return nil, err
+		}
+		deps := resolveDependencies(facts, file, symbols, fileLibs)
+		for _, depFile := range deps {
+			if depFile == "" || depFile == file {
+				continue
+			}
+			if graph[depFile] == nil {
+				graph[depFile] = make(map[string]bool)
+			}
+			graph[depFile][file] = true
+		}
+	}
+	return graph, nil
+}
+
 func resolveDependencies(facts extractor.FileFacts, filePath string, symbols *SymbolTable, fileLibs map[string]config.FileLibraryInfo) []string {
 	var deps []string
 	fileLib := "work"

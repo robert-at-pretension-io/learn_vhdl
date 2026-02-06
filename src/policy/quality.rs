@@ -1,5 +1,7 @@
 use regex::Regex;
+use std::collections::{HashMap, HashSet};
 
+use crate::policy::helpers;
 use crate::policy::input::{Input, Port};
 use crate::policy::result::Violation;
 
@@ -29,6 +31,11 @@ pub fn optional_violations(input: &Input) -> Vec<Violation> {
     out.extend(file_entity_mismatch(input));
     out.extend(duplicate_port_in_entity(input));
     out.extend(duplicate_entity_in_file(input));
+    out.extend(duplicate_use_clause(input));
+    out.extend(use_all_abuse(input));
+    out.extend(signal_fanout(input));
+    out.extend(unused_library_clause(input));
+    out.extend(unused_use_clause(input));
     out
 }
 
@@ -527,6 +534,456 @@ fn hardcoded_generic(input: &Input) -> Vec<Violation> {
     out
 }
 
+fn duplicate_use_clause(input: &Input) -> Vec<Violation> {
+    let mut out = Vec::new();
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for uc in &input.use_clauses {
+        for item in &uc.items {
+            let key = format!("{}|{}", uc.file, item.to_ascii_lowercase());
+            if let Some(first_line) = seen.get(&key) {
+                out.push(Violation {
+                    rule: "duplicate_use_clause".to_string(),
+                    severity: "info".to_string(),
+                    file: uc.file.clone(),
+                    line: uc.line,
+                    message: format!(
+                        "Use clause '{}' duplicated (first at line {})",
+                        item, first_line
+                    ),
+                });
+            } else {
+                seen.insert(key, uc.line);
+            }
+        }
+    }
+    out
+}
+
+fn use_all_abuse(input: &Input) -> Vec<Violation> {
+    let mut out = Vec::new();
+    let standard_pkgs: HashSet<&str> = [
+        "ieee.std_logic_1164",
+        "ieee.numeric_std",
+        "ieee.std_logic_arith",
+        "ieee.std_logic_unsigned",
+        "ieee.std_logic_signed",
+        "ieee.math_real",
+        "ieee.math_complex",
+        "std.textio",
+        "std.standard",
+        "std.env",
+    ]
+    .iter()
+    .copied()
+    .collect();
+    for uc in &input.use_clauses {
+        for item in &uc.items {
+            if !item.to_ascii_lowercase().ends_with(".all") {
+                continue;
+            }
+            let pkg = item
+                .to_ascii_lowercase()
+                .trim_end_matches(".all")
+                .to_string();
+            if standard_pkgs.contains(pkg.as_str()) {
+                continue;
+            }
+            if helpers::file_in_testbench(input, &uc.file) {
+                continue;
+            }
+            out.push(Violation {
+                rule: "use_all_abuse".to_string(),
+                severity: "info".to_string(),
+                file: uc.file.clone(),
+                line: uc.line,
+                message: format!(
+                    "Use clause '{}' imports everything — consider importing specific items",
+                    item
+                ),
+            });
+        }
+    }
+    out
+}
+
+fn signal_fanout(input: &Input) -> Vec<Violation> {
+    let mut reader_count: HashMap<String, usize> = HashMap::new();
+    for proc in &input.processes {
+        let mut seen_in_proc: HashSet<String> = HashSet::new();
+        for sig in &proc.read_signals {
+            let key = sig.to_ascii_lowercase();
+            if seen_in_proc.insert(key.clone()) {
+                *reader_count.entry(key).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for sig in &input.signals {
+        let key = sig.name.to_ascii_lowercase();
+        if let Some(&count) = reader_count.get(&key) {
+            if count > 10 {
+                if helpers::file_in_testbench(input, &sig.file) {
+                    continue;
+                }
+                out.push(Violation {
+                    rule: "signal_fanout".to_string(),
+                    severity: "info".to_string(),
+                    file: sig.file.clone(),
+                    line: sig.line,
+                    message: format!(
+                        "Signal '{}' is read by {} processes — high fanout may cause timing issues",
+                        sig.name, count
+                    ),
+                });
+            }
+        }
+    }
+    out
+}
+
+fn unused_library_clause(input: &Input) -> Vec<Violation> {
+    let skip_libs: HashSet<&str> = ["ieee", "std", "work"].iter().copied().collect();
+    let mut out = Vec::new();
+    for lc in &input.library_clauses {
+        if helpers::file_in_testbench(input, &lc.file) {
+            continue;
+        }
+        for lib in &lc.libraries {
+            let lib_lower = lib.to_ascii_lowercase();
+            if skip_libs.contains(lib_lower.as_str()) {
+                continue;
+            }
+            let prefix = format!("{}.", lib_lower);
+            let used_in_use = input
+                .use_clauses
+                .iter()
+                .any(|uc| {
+                    uc.file == lc.file
+                        && uc.items.iter().any(|item| {
+                            item.to_ascii_lowercase().starts_with(&prefix)
+                        })
+                });
+            if used_in_use {
+                continue;
+            }
+            let used_in_instance = input
+                .instances
+                .iter()
+                .any(|inst| {
+                    inst.file == lc.file
+                        && inst.target.to_ascii_lowercase().starts_with(&prefix)
+                });
+            if used_in_instance {
+                continue;
+            }
+            let used_in_context = input
+                .context_clauses
+                .iter()
+                .any(|cc| {
+                    cc.file == lc.file
+                        && cc.name.to_ascii_lowercase().starts_with(&prefix)
+                });
+            if used_in_context {
+                continue;
+            }
+            out.push(Violation {
+                rule: "unused_library_clause".to_string(),
+                severity: "info".to_string(),
+                file: lc.file.clone(),
+                line: lc.line,
+                message: format!(
+                    "Library '{}' is declared but never referenced by a use clause or entity instantiation",
+                    lib
+                ),
+            });
+        }
+    }
+    out
+}
+
+fn std_package_exports(pkg: &str) -> Option<Vec<&'static str>> {
+    match pkg {
+        "ieee.std_logic_1164" => Some(vec![
+            "std_logic", "std_logic_vector", "std_ulogic", "std_ulogic_vector",
+            "to_bit", "to_bitvector", "to_stdulogic", "to_stdulogicvector",
+            "to_stdlogicvector", "rising_edge", "falling_edge", "is_x", "to_01",
+            "to_x01", "to_x01z", "to_ux01", "resolved",
+        ]),
+        "ieee.numeric_std" => Some(vec![
+            "signed", "unsigned", "to_integer", "to_unsigned", "to_signed",
+            "resize", "shift_left", "shift_right", "rotate_left", "rotate_right",
+        ]),
+        "ieee.std_logic_arith" => Some(vec![
+            "signed", "unsigned", "conv_integer", "conv_unsigned", "conv_signed",
+            "conv_std_logic_vector",
+        ]),
+        "ieee.math_real" => Some(vec![
+            "math_pi", "math_e", "ceil", "floor", "round", "log2", "sqrt",
+            "realmax", "realmin", "math_2_pi", "math_1_over_pi",
+        ]),
+        "ieee.math_complex" => Some(vec!["complex", "complex_polar"]),
+        "std.textio" => Some(vec![
+            "line", "text", "readline", "writeline", "read", "write",
+            "file_open", "file_close", "hread", "hwrite", "oread", "owrite",
+        ]),
+        "std.env" => Some(vec!["stop", "finish", "resolution_limit"]),
+        // std_logic_unsigned/signed provide operator overloads — skip
+        _ => None,
+    }
+}
+
+fn collect_used_names(input: &Input, file: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    // Signal types
+    for sig in &input.signals {
+        if sig.file == file {
+            let base = helpers::base_type_name(&sig.r#type);
+            if !base.is_empty() {
+                names.insert(base);
+            }
+        }
+    }
+    // Port types
+    for port in &input.ports {
+        let port_file = input
+            .entities
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case(&port.in_entity))
+            .map(|e| e.file.as_str())
+            .unwrap_or("");
+        if port_file == file {
+            let base = helpers::base_type_name(&port.r#type);
+            if !base.is_empty() {
+                names.insert(base);
+            }
+        }
+    }
+    // Process variable types, function/procedure calls, read/assigned signals
+    for proc in &input.processes {
+        if proc.file == file {
+            for var in &proc.variables {
+                let base = helpers::base_type_name(&var.r#type);
+                if !base.is_empty() {
+                    names.insert(base);
+                }
+            }
+            for fc in &proc.function_calls {
+                names.insert(fc.name.to_ascii_lowercase());
+            }
+            for pc in &proc.procedure_calls {
+                names.insert(pc.name.to_ascii_lowercase());
+            }
+            for sig in &proc.read_signals {
+                names.insert(sig.to_ascii_lowercase());
+            }
+            for sig in &proc.assigned_signals {
+                names.insert(sig.to_ascii_lowercase());
+            }
+        }
+    }
+    // Constant types
+    for cd in &input.constant_decls {
+        if cd.file == file {
+            let base = helpers::base_type_name(&cd.r#type);
+            if !base.is_empty() {
+                names.insert(base);
+            }
+        }
+    }
+    // Subtype base types
+    for st in &input.subtypes {
+        if st.file == file {
+            let base = helpers::base_type_name(&st.base_type);
+            if !base.is_empty() {
+                names.insert(base);
+            }
+        }
+    }
+    // Type declarations (for record/enum usage)
+    for td in &input.types {
+        if td.file == file {
+            names.insert(td.name.to_ascii_lowercase());
+        }
+    }
+    // Concurrent assignment read signals
+    for ca in &input.concurrent_assignments {
+        if ca.file == file {
+            for sig in &ca.read_signals {
+                names.insert(sig.to_ascii_lowercase());
+            }
+        }
+    }
+    // Generic types
+    for entity in &input.entities {
+        if entity.file == file {
+            for gen in &entity.generics {
+                let base = helpers::base_type_name(&gen.r#type);
+                if !base.is_empty() {
+                    names.insert(base);
+                }
+            }
+        }
+    }
+    // Function/procedure declarations (return types, parameter types)
+    for f in &input.functions {
+        if f.file == file {
+            let base = helpers::base_type_name(&f.return_type);
+            if !base.is_empty() {
+                names.insert(base);
+            }
+            for p in &f.parameters {
+                let base = helpers::base_type_name(&p.r#type);
+                if !base.is_empty() {
+                    names.insert(base);
+                }
+            }
+        }
+    }
+    for p in &input.procedures {
+        if p.file == file {
+            for param in &p.parameters {
+                let base = helpers::base_type_name(&param.r#type);
+                if !base.is_empty() {
+                    names.insert(base);
+                }
+            }
+        }
+    }
+    names
+}
+
+fn unused_use_clause(input: &Input) -> Vec<Violation> {
+    let mut out = Vec::new();
+    // Cache used names per file
+    let mut file_names_cache: HashMap<String, HashSet<String>> = HashMap::new();
+    // Build user package exports: package_key -> set of exported names
+    let mut user_pkg_exports: HashMap<String, HashSet<String>> = HashMap::new();
+    for td in &input.types {
+        if !td.in_package.is_empty() {
+            // Find which library this package lives in
+            let lib = package_library(input, &td.in_package, &td.file);
+            let key = format!("{}.{}", lib, td.in_package.to_ascii_lowercase());
+            user_pkg_exports
+                .entry(key)
+                .or_default()
+                .insert(td.name.to_ascii_lowercase());
+        }
+    }
+    for st in &input.subtypes {
+        if !st.in_package.is_empty() {
+            let lib = package_library(input, &st.in_package, &st.file);
+            let key = format!("{}.{}", lib, st.in_package.to_ascii_lowercase());
+            user_pkg_exports
+                .entry(key)
+                .or_default()
+                .insert(st.name.to_ascii_lowercase());
+        }
+    }
+    for f in &input.functions {
+        if !f.in_package.is_empty() {
+            let lib = package_library(input, &f.in_package, &f.file);
+            let key = format!("{}.{}", lib, f.in_package.to_ascii_lowercase());
+            user_pkg_exports
+                .entry(key)
+                .or_default()
+                .insert(f.name.to_ascii_lowercase());
+        }
+    }
+    for p in &input.procedures {
+        if !p.in_package.is_empty() {
+            let lib = package_library(input, &p.in_package, &p.file);
+            let key = format!("{}.{}", lib, p.in_package.to_ascii_lowercase());
+            user_pkg_exports
+                .entry(key)
+                .or_default()
+                .insert(p.name.to_ascii_lowercase());
+        }
+    }
+    for cd in &input.constant_decls {
+        if !cd.in_package.is_empty() {
+            let lib = package_library(input, &cd.in_package, &cd.file);
+            let key = format!("{}.{}", lib, cd.in_package.to_ascii_lowercase());
+            user_pkg_exports
+                .entry(key)
+                .or_default()
+                .insert(cd.name.to_ascii_lowercase());
+        }
+    }
+
+    for uc in &input.use_clauses {
+        if helpers::file_in_testbench(input, &uc.file) {
+            continue;
+        }
+        for item in &uc.items {
+            let lower = item.to_ascii_lowercase();
+            if lower == "std.standard.all" {
+                continue;
+            }
+            // Parse: <library>.<package>[.<selector>]
+            let parts: Vec<&str> = lower.split('.').collect();
+            if parts.len() < 2 {
+                continue;
+            }
+            let pkg_key = format!("{}.{}", parts[0], parts[1]);
+            let selector = if parts.len() >= 3 { parts[2] } else { "" };
+
+            // Get exports for this package
+            let exports: Vec<String> = if let Some(std_exports) = std_package_exports(&pkg_key) {
+                std_exports.iter().map(|s| s.to_string()).collect()
+            } else if let Some(user_exports) = user_pkg_exports.get(&pkg_key) {
+                user_exports.iter().cloned().collect()
+            } else {
+                // Unknown package — skip to avoid false positives
+                continue;
+            };
+
+            if exports.is_empty() {
+                continue;
+            }
+
+            let used_names = file_names_cache
+                .entry(uc.file.clone())
+                .or_insert_with(|| collect_used_names(input, &uc.file));
+
+            let is_used = if selector == "all" {
+                exports.iter().any(|exp| used_names.contains(exp))
+            } else if !selector.is_empty() {
+                used_names.contains(selector)
+            } else {
+                // No selector — can't determine usage
+                continue;
+            };
+
+            if !is_used {
+                out.push(Violation {
+                    rule: "unused_use_clause".to_string(),
+                    severity: "info".to_string(),
+                    file: uc.file.clone(),
+                    line: uc.line,
+                    message: format!(
+                        "Use clause '{}' imports package whose exports are never referenced",
+                        item
+                    ),
+                });
+            }
+        }
+    }
+    out
+}
+
+fn package_library(input: &Input, pkg_name: &str, pkg_file: &str) -> String {
+    // Check file_info for the library
+    for fi in &input.files {
+        if fi.path == pkg_file && !fi.library.is_empty() {
+            return fi.library.to_ascii_lowercase();
+        }
+    }
+    // Default: if it's in the same project, it's "work"
+    let _ = input;
+    let _ = pkg_name;
+    "work".to_string()
+}
+
 fn extract_filename(path: &str) -> String {
     let file = path.split('/').last().unwrap_or(path);
     file.trim_end_matches(".vhdl")
@@ -576,7 +1033,7 @@ fn entity_file(input: &Input, port: &Port) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::input::{Entity, GenerateStatement, Input, Port, Signal};
+    use crate::policy::input::{Entity, GenerateStatement, Input, LibraryClause, Port, Process, Signal, UseClause};
 
     #[test]
     fn very_long_file_flags() {
@@ -689,5 +1146,252 @@ mod tests {
         let violations = unlabeled_generate(&input);
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].rule, "unlabeled_generate");
+    }
+
+    #[test]
+    fn duplicate_use_clause_flags() {
+        let mut input = Input::default();
+        input.use_clauses.push(UseClause {
+            items: vec!["ieee.std_logic_1164.all".to_string()],
+            file: "a.vhd".to_string(),
+            line: 1,
+        });
+        input.use_clauses.push(UseClause {
+            items: vec!["ieee.std_logic_1164.all".to_string()],
+            file: "a.vhd".to_string(),
+            line: 5,
+        });
+        let v = duplicate_use_clause(&input);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].rule, "duplicate_use_clause");
+    }
+
+    #[test]
+    fn duplicate_use_clause_different_files() {
+        let mut input = Input::default();
+        input.use_clauses.push(UseClause {
+            items: vec!["ieee.std_logic_1164.all".to_string()],
+            file: "a.vhd".to_string(),
+            line: 1,
+        });
+        input.use_clauses.push(UseClause {
+            items: vec!["ieee.std_logic_1164.all".to_string()],
+            file: "b.vhd".to_string(),
+            line: 1,
+        });
+        let v = duplicate_use_clause(&input);
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn use_all_abuse_flags_non_standard() {
+        let mut input = Input::default();
+        input.entities.push(Entity {
+            name: "core".to_string(),
+            file: "a.vhd".to_string(),
+            line: 1,
+            ..Default::default()
+        });
+        input.use_clauses.push(UseClause {
+            items: vec!["work.my_pkg.all".to_string()],
+            file: "a.vhd".to_string(),
+            line: 2,
+        });
+        let v = use_all_abuse(&input);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].rule, "use_all_abuse");
+    }
+
+    #[test]
+    fn use_all_abuse_skip_standard() {
+        let mut input = Input::default();
+        input.use_clauses.push(UseClause {
+            items: vec!["ieee.std_logic_1164.all".to_string()],
+            file: "a.vhd".to_string(),
+            line: 1,
+        });
+        let v = use_all_abuse(&input);
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn signal_fanout_flags() {
+        let mut input = Input::default();
+        input.entities.push(Entity {
+            name: "ent".to_string(),
+            file: "a.vhd".to_string(),
+            line: 1,
+            ..Default::default()
+        });
+        input.signals.push(Signal {
+            name: "hot_sig".to_string(),
+            file: "a.vhd".to_string(),
+            line: 2,
+            ..Default::default()
+        });
+        for i in 0..12 {
+            input.processes.push(Process {
+                label: format!("p{}", i),
+                read_signals: vec!["hot_sig".to_string()],
+                file: "a.vhd".to_string(),
+                line: 10 + i,
+                ..Default::default()
+            });
+        }
+        let v = signal_fanout(&input);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].rule, "signal_fanout");
+    }
+
+    #[test]
+    fn signal_fanout_skip_low() {
+        let mut input = Input::default();
+        input.signals.push(Signal {
+            name: "normal".to_string(),
+            file: "a.vhd".to_string(),
+            line: 2,
+            ..Default::default()
+        });
+        for i in 0..3 {
+            input.processes.push(Process {
+                label: format!("p{}", i),
+                read_signals: vec!["normal".to_string()],
+                file: "a.vhd".to_string(),
+                line: 10 + i,
+                ..Default::default()
+            });
+        }
+        let v = signal_fanout(&input);
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn unused_library_clause_flags() {
+        let mut input = Input::default();
+        input.entities.push(Entity {
+            name: "core".to_string(),
+            file: "a.vhd".to_string(),
+            line: 1,
+            ..Default::default()
+        });
+        input.library_clauses.push(LibraryClause {
+            libraries: vec!["unisim".to_string()],
+            file: "a.vhd".to_string(),
+            line: 1,
+        });
+        let v = unused_library_clause(&input);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].rule, "unused_library_clause");
+    }
+
+    #[test]
+    fn unused_library_clause_skip_std() {
+        let mut input = Input::default();
+        input.entities.push(Entity {
+            name: "core".to_string(),
+            file: "a.vhd".to_string(),
+            line: 1,
+            ..Default::default()
+        });
+        input.library_clauses.push(LibraryClause {
+            libraries: vec!["ieee".to_string()],
+            file: "a.vhd".to_string(),
+            line: 1,
+        });
+        let v = unused_library_clause(&input);
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn unused_library_clause_skip_when_used() {
+        let mut input = Input::default();
+        input.entities.push(Entity {
+            name: "core".to_string(),
+            file: "a.vhd".to_string(),
+            line: 1,
+            ..Default::default()
+        });
+        input.library_clauses.push(LibraryClause {
+            libraries: vec!["unisim".to_string()],
+            file: "a.vhd".to_string(),
+            line: 1,
+        });
+        input.use_clauses.push(UseClause {
+            items: vec!["unisim.vcomponents.all".to_string()],
+            file: "a.vhd".to_string(),
+            line: 2,
+        });
+        let v = unused_library_clause(&input);
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn unused_use_clause_flags() {
+        let mut input = Input::default();
+        input.entities.push(Entity {
+            name: "core".to_string(),
+            file: "a.vhd".to_string(),
+            line: 1,
+            ..Default::default()
+        });
+        input.use_clauses.push(UseClause {
+            items: vec!["ieee.math_real.all".to_string()],
+            file: "a.vhd".to_string(),
+            line: 2,
+        });
+        // No math_real symbols used
+        input.signals.push(Signal {
+            name: "data".to_string(),
+            r#type: "std_logic".to_string(),
+            file: "a.vhd".to_string(),
+            line: 3,
+            ..Default::default()
+        });
+        let v = unused_use_clause(&input);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].rule, "unused_use_clause");
+    }
+
+    #[test]
+    fn unused_use_clause_skip_used() {
+        let mut input = Input::default();
+        input.entities.push(Entity {
+            name: "core".to_string(),
+            file: "a.vhd".to_string(),
+            line: 1,
+            ..Default::default()
+        });
+        input.use_clauses.push(UseClause {
+            items: vec!["ieee.std_logic_1164.all".to_string()],
+            file: "a.vhd".to_string(),
+            line: 2,
+        });
+        input.signals.push(Signal {
+            name: "data".to_string(),
+            r#type: "std_logic".to_string(),
+            file: "a.vhd".to_string(),
+            line: 3,
+            ..Default::default()
+        });
+        let v = unused_use_clause(&input);
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn unused_use_clause_skip_unknown_pkg() {
+        let mut input = Input::default();
+        input.entities.push(Entity {
+            name: "core".to_string(),
+            file: "a.vhd".to_string(),
+            line: 1,
+            ..Default::default()
+        });
+        input.use_clauses.push(UseClause {
+            items: vec!["work.my_pkg.all".to_string()],
+            file: "a.vhd".to_string(),
+            line: 2,
+        });
+        let v = unused_use_clause(&input);
+        assert!(v.is_empty());
     }
 }

@@ -18,11 +18,27 @@ type Config struct {
 	// Libraries maps library names to their configuration
 	Libraries map[string]LibraryConfig `json:"libraries,omitempty"`
 
+	// Projects maps project paths to per-project library/file mappings
+	Projects map[string]ProjectConfig `json:"projects,omitempty"`
+
 	// Lint contains linting rule configuration
 	Lint LintConfig `json:"lint,omitempty"`
 
 	// Analysis contains analysis options
 	Analysis AnalysisConfig `json:"analysis,omitempty"`
+
+	configPath    string                   `json:"-"`
+	baseLibraries map[string]LibraryConfig `json:"-"`
+	baseFiles     []FileEntry              `json:"-"`
+}
+
+// ProjectConfig defines per-project overrides for library mapping
+type ProjectConfig struct {
+	// Files is an explicit list of files with optional library/language overrides
+	Files []FileEntry `json:"files,omitempty"`
+
+	// Libraries maps library names to their configuration
+	Libraries map[string]LibraryConfig `json:"libraries,omitempty"`
 }
 
 // LibraryConfig defines a VHDL library's files and options
@@ -78,6 +94,16 @@ type AnalysisConfig struct {
 	// ResolveDefaultBinding computes component to entity default binding
 	ResolveDefaultBinding bool `json:"resolveDefaultBinding,omitempty"`
 
+	// RequireLibraryMapping enforces explicit library mappings for referenced libraries
+	RequireLibraryMapping *bool `json:"requireLibraryMapping,omitempty"`
+
+	// UseProLibraries enables library overrides from .pro build scripts
+	UseProLibraries bool `json:"useProLibraries,omitempty"`
+
+	// PolicyInputMode controls how much data is sent to the Rust policy engine.
+	// Supported values: "full" (default), "cross_file" (omit heavy per-process facts).
+	PolicyInputMode string `json:"policyInputMode,omitempty"`
+
 	// Cache controls incremental indexing cache behavior
 	Cache CacheConfig `json:"cache,omitempty"`
 }
@@ -102,6 +128,7 @@ func DefaultConfig() *Config {
 			MaxParallelFiles:      0, // auto
 			FollowLibraryUse:      true,
 			ResolveDefaultBinding: true,
+			RequireLibraryMapping: boolPtr(true),
 			Cache: CacheConfig{
 				Enabled: boolPtr(true),
 				Dir:     ".vhdl_lint_cache",
@@ -172,8 +199,15 @@ func LoadFile(path string) (*Config, error) {
 
 	// Apply defaults for missing fields
 	cfg.applyDefaults()
+	cfg.configPath = path
 
 	return &cfg, nil
+}
+
+// ConfigPath returns the path of the config file used to load this config.
+// Empty string means defaults were used (no config file found).
+func (c *Config) ConfigPath() string {
+	return c.configPath
 }
 
 // applyDefaults fills in missing configuration with defaults
@@ -204,6 +238,23 @@ func (c *Config) applyDefaults() {
 	if c.Analysis.Cache.Enabled == nil {
 		c.Analysis.Cache.Enabled = boolPtr(true)
 	}
+	if c.Analysis.RequireLibraryMapping == nil {
+		c.Analysis.RequireLibraryMapping = boolPtr(true)
+	}
+	if c.Analysis.PolicyInputMode == "" {
+		c.Analysis.PolicyInputMode = "full"
+	}
+}
+
+// RequiresLibraryMapping returns true if missing libraries should fail the run.
+func (c *Config) RequiresLibraryMapping() bool {
+	if c == nil {
+		return true
+	}
+	if c.Analysis.RequireLibraryMapping == nil {
+		return true
+	}
+	return *c.Analysis.RequireLibraryMapping
 }
 
 // Save writes the configuration to a file

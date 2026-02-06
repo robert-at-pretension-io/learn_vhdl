@@ -51,6 +51,7 @@ package facts_schema
     name: #Identifier
     file: string & =~".+\\.(vhd|vhdl)$"
     line: int & >=1
+    in_arch?: string
 }
 
 #PortRow: {

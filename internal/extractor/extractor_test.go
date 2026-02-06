@@ -3,6 +3,7 @@ package extractor
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -615,6 +616,112 @@ end;
 	}
 	if !hasConcurrentAssignment(facts.ConcurrentAssignments, "z", "selected") {
 		t.Fatalf("expected selected assignment to z")
+	}
+}
+
+func TestExtractorDependencyItemsAreSplit(t *testing.T) {
+	vhdl := `library ieee, worklib;
+use ieee.std_logic_1164.all, ieee.numeric_std.all;
+
+entity dep_top is
+end entity;
+
+architecture rtl of dep_top is
+begin
+end architecture;`
+
+	facts := parseVHDL(t, vhdl)
+
+	var libs []string
+	var uses []string
+	for _, d := range facts.Dependencies {
+		switch strings.ToLower(d.Kind) {
+		case "library":
+			libs = append(libs, strings.ToLower(d.Target))
+		case "use":
+			uses = append(uses, strings.ToLower(d.Target))
+		}
+	}
+
+	if !reflect.DeepEqual(libs, []string{"ieee", "worklib"}) {
+		t.Fatalf("expected split library dependencies, got %#v", libs)
+	}
+	if !reflect.DeepEqual(uses, []string{"ieee.std_logic_1164.all", "ieee.numeric_std.all"}) {
+		t.Fatalf("expected split use dependencies, got %#v", uses)
+	}
+}
+
+func TestExtractorDeterministicSetOrdering(t *testing.T) {
+	vhdl := `library ieee;
+use ieee.std_logic_1164.all;
+
+entity ord_top is
+end entity;
+
+architecture rtl of ord_top is
+  signal a, b, c, y : std_logic;
+begin
+  y <= c and a and b;
+  p_ord : process(a, b, c)
+  begin
+    c <= a;
+    a <= b;
+    b <= c;
+  end process;
+end architecture;`
+
+	facts := parseVHDL(t, vhdl)
+
+	if len(facts.ConcurrentAssignments) == 0 {
+		t.Fatalf("expected concurrent assignment")
+	}
+	ca := facts.ConcurrentAssignments[0]
+	if !reflect.DeepEqual(ca.ReadSignals, []string{"a", "b", "c"}) {
+		t.Fatalf("expected sorted read signals [a b c], got %#v", ca.ReadSignals)
+	}
+
+	proc := mustFindProcess(t, facts.Processes, "p_ord")
+	if !reflect.DeepEqual(proc.AssignedSignals, []string{"a", "b", "c"}) {
+		t.Fatalf("expected sorted assigned signals [a b c], got %#v", proc.AssignedSignals)
+	}
+	if !reflect.DeepEqual(proc.ReadSignals, []string{"a", "b", "c"}) {
+		t.Fatalf("expected sorted read signals [a b c], got %#v", proc.ReadSignals)
+	}
+}
+
+func TestParseIntLiteralStrict(t *testing.T) {
+	valid := map[string]int{
+		"42":      42,
+		"1_024":   1024,
+		"2#1010#": 10,
+		"16#FF#":  255,
+		"16#F#E2": 3840,
+		"16#f#e1": 240,
+		"8#7_7#":  63,
+	}
+	for in, want := range valid {
+		got, err := parseIntLiteral(in)
+		if err != nil {
+			t.Fatalf("parseIntLiteral(%q) unexpected error: %v", in, err)
+		}
+		if got != want {
+			t.Fatalf("parseIntLiteral(%q)=%d want %d", in, got, want)
+		}
+	}
+
+	invalid := []string{
+		"",
+		"10ns",
+		"2#2#",
+		"16#G#",
+		"16#FF",
+		"16#F.F#",
+		"16#F#E-1",
+	}
+	for _, in := range invalid {
+		if got, err := parseIntLiteral(in); err == nil {
+			t.Fatalf("parseIntLiteral(%q) expected error, got value %d", in, got)
+		}
 	}
 }
 

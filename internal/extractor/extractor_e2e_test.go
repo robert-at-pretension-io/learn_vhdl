@@ -111,6 +111,44 @@ func TestExtractorE2ETypesAndPackages(t *testing.T) {
 	findProcedureWithPackage(t, facts.Procedures, "poke", "util")
 }
 
+func TestExtractorE2EPackageBody(t *testing.T) {
+	fixture := fixturePath(t, "package_body.vhd")
+
+	ext := New()
+	facts, err := ext.Extract(fixture)
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+
+	if !hasPackageName(facts.Packages, "util_pkg") {
+		t.Fatalf("expected package util_pkg, got %#v", facts.Packages)
+	}
+	if !hasPackageBodyName(facts.PackageBodies, "util_pkg") {
+		t.Fatalf("expected package body util_pkg, got %#v", facts.PackageBodies)
+	}
+}
+
+func TestExtractorE2EAliasSubprogram(t *testing.T) {
+	fixture := fixturePath(t, "alias_subprogram.vhd")
+
+	ext := New()
+	facts, err := ext.Extract(fixture)
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+
+	fn := findFunctionWithPackage(t, facts.Functions, "to_slv", "alias_pkg")
+	if fn.ReturnType != "std_logic_vector" {
+		t.Fatalf("alias return type: expected std_logic_vector, got %q", fn.ReturnType)
+	}
+	if len(fn.Parameters) != 1 {
+		t.Fatalf("alias parameters: expected 1, got %d: %#v", len(fn.Parameters), fn.Parameters)
+	}
+	if fn.Parameters[0].Type != "int_vec" {
+		t.Fatalf("alias parameter type: expected int_vec, got %q", fn.Parameters[0].Type)
+	}
+}
+
 func TestExtractorE2EAssignmentsInstancesGenerates(t *testing.T) {
 	fixture := fixturePath(t, "assignments_instances_generates.vhd")
 
@@ -260,6 +298,9 @@ func TestExtractorE2EProtectedPkgInstantiationAndConfigSpec(t *testing.T) {
 	if !hasDependencyKind(facts.Dependencies, "package_instantiation", "work.base_pkg") {
 		t.Fatalf("expected package instantiation dependency on work.base_pkg, got %#v", facts.Dependencies)
 	}
+	if !hasPackageName(facts.Packages, "inst_pkg") {
+		t.Fatalf("expected package instantiation to register inst_pkg, got %#v", facts.Packages)
+	}
 	if !hasDependencyKind(facts.Dependencies, "configuration_specification", "work.child") {
 		t.Fatalf("expected configuration specification dependency on work.child, got %#v", facts.Dependencies)
 	}
@@ -308,6 +349,21 @@ func TestExtractorE2EGenericsComponentsAssociations(t *testing.T) {
 	}
 }
 
+func TestExtractorE2EAssociationsIndexedFormal(t *testing.T) {
+	fixture := fixturePath(t, "associations_indexed_formal.vhd")
+
+	ext := New()
+	facts, err := ext.Extract(fixture)
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+
+	inst := findInstanceE2E(t, facts.Instances, "u0")
+	if !hasAssociationFormal(inst.Associations, "Input(0)") {
+		t.Fatalf("expected indexed formal Input(0), got %#v", inst.Associations)
+	}
+}
+
 func TestExtractorE2EProcessVarsCallsWaits(t *testing.T) {
 	fixture := fixturePath(t, "process_vars_calls_waits.vhd")
 
@@ -321,14 +377,47 @@ func TestExtractorE2EProcessVarsCallsWaits(t *testing.T) {
 	if !hasVariable(proc.Variables, "v", "integer") {
 		t.Fatalf("expected variable v: integer, got %#v", proc.Variables)
 	}
-	if len(proc.ProcedureCalls) == 0 || proc.ProcedureCalls[0].Name != "poke" {
+	if !hasProcedureCall(proc.ProcedureCalls, "poke") {
 		t.Fatalf("expected procedure call poke, got %#v", proc.ProcedureCalls)
+	}
+	if !hasProcedureCallArg(proc.ProcedureCalls, "poke", "a") {
+		t.Fatalf("expected procedure call poke args to include a, got %#v", proc.ProcedureCalls)
+	}
+	if !hasProcedureCall(proc.ProcedureCalls, "affirm") {
+		t.Fatalf("expected procedure call affirm, got %#v", proc.ProcedureCalls)
+	}
+	if hasProcedureCall(proc.ProcedureCalls, "affirm.p.match") {
+		t.Fatalf("did not expect nested call to leak into procedure name, got %#v", proc.ProcedureCalls)
+	}
+	if !hasProcedureCallFullName(proc.ProcedureCalls, "std.env.stop") {
+		t.Fatalf("expected procedure call std.env.stop, got %#v", proc.ProcedureCalls)
 	}
 	if len(proc.FunctionCalls) == 0 || proc.FunctionCalls[0].Name != "f" {
 		t.Fatalf("expected function call f, got %#v", proc.FunctionCalls)
 	}
 	if len(proc.WaitStatements) == 0 || proc.WaitStatements[0].UntilExpr == "" {
 		t.Fatalf("expected wait until with condition, got %#v", proc.WaitStatements)
+	}
+}
+
+func TestExtractorE2ELoopVariableNotFunctionCall(t *testing.T) {
+	fixture := fixturePath(t, "process_calls_loop_index.vhd")
+
+	ext := New()
+	facts, err := ext.Extract(fixture)
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+
+	proc := findProcess(t, facts.Processes, "p1")
+	if !hasVariable(proc.Variables, "i", "") {
+		t.Fatalf("expected loop variable i, got %#v", proc.Variables)
+	}
+	if !hasFunctionCall(proc.FunctionCalls, "or_reduce_f") {
+		t.Fatalf("expected function call or_reduce_f, got %#v", proc.FunctionCalls)
+	}
+	if hasFunctionCall(proc.FunctionCalls, "i") {
+		t.Fatalf("did not expect loop index i treated as call, got %#v", proc.FunctionCalls)
 	}
 }
 
@@ -386,6 +475,56 @@ func TestExtractorE2EWaitOnForNamedArgs(t *testing.T) {
 	}
 }
 
+func TestExtractorE2EFunctionCallNamedArgsAssignment(t *testing.T) {
+	fixture := fixturePath(t, "function_call_named_args_assignment.vhd")
+
+	ext := New()
+	facts, err := ext.Extract(fixture)
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+
+	proc := findProcess(t, facts.Processes, "p_main")
+	if !hasFunctionCall(proc.FunctionCalls, "update_options") {
+		t.Fatalf("expected function call update_options, got %#v", proc.FunctionCalls)
+	}
+	if !hasFunctionCallArg(proc.FunctionCalls, "update_options", "Param => a") ||
+		!hasFunctionCallArg(proc.FunctionCalls, "update_options", "Count => b") ||
+		!hasFunctionCallArg(proc.FunctionCalls, "update_options", "Mode  => c") {
+		t.Fatalf("expected named args in update_options call, got %#v", proc.FunctionCalls)
+	}
+}
+
+func TestExtractorE2EAttributeValNotFunctionCall(t *testing.T) {
+	fixture := fixturePath(t, "attribute_val_not_call.vhd")
+
+	ext := New()
+	facts, err := ext.Extract(fixture)
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+
+	proc := findProcess(t, facts.Processes, "p_attr")
+	if hasFunctionCall(proc.FunctionCalls, "val") {
+		t.Fatalf("did not expect attribute val to be treated as function call, got %#v", proc.FunctionCalls)
+	}
+}
+
+func TestExtractorE2ERecordArrayAccessNotFunctionCall(t *testing.T) {
+	fixture := fixturePath(t, "record_array_access_not_call.vhd")
+
+	ext := New()
+	facts, err := ext.Extract(fixture)
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+
+	proc := findProcess(t, facts.Processes, "p_rec")
+	if hasFunctionCall(proc.FunctionCalls, "recs") || hasFunctionCall(proc.FunctionCalls, "field") {
+		t.Fatalf("did not expect record array access to be treated as function call, got %#v", proc.FunctionCalls)
+	}
+}
+
 func TestExtractorE2EFunctionCallsNestedArgs(t *testing.T) {
 	fixture := fixturePath(t, "process_calls_nested_args.vhd")
 
@@ -407,6 +546,206 @@ func TestExtractorE2EFunctionCallsNestedArgs(t *testing.T) {
 	}
 	if !hasFunctionCallArg(proc.FunctionCalls, "math_pkg.f", "c => h(1)") {
 		t.Fatalf("expected math_pkg.f args to include c => h(1), got %#v", proc.FunctionCalls)
+	}
+}
+
+func TestExtractorE2EFunctionCallExpressionArgs(t *testing.T) {
+	fixture := fixturePath(t, "process_calls_expression_args.vhd")
+
+	ext := New()
+	facts, err := ext.Extract(fixture)
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+
+	proc := findProcess(t, facts.Processes, "p_expr")
+	if !hasFunctionCall(proc.FunctionCalls, "math_pkg.int2vec") {
+		t.Fatalf("expected function call math_pkg.int2vec, got %#v", proc.FunctionCalls)
+	}
+	if !hasFunctionCallArg(proc.FunctionCalls, "math_pkg.int2vec", "(a * b)") {
+		t.Fatalf("expected math_pkg.int2vec args to include ( a * b ), got %#v", proc.FunctionCalls)
+	}
+	if !hasFunctionCallArg(proc.FunctionCalls, "math_pkg.int2vec", "8") {
+		t.Fatalf("expected math_pkg.int2vec args to include 8, got %#v", proc.FunctionCalls)
+	}
+}
+
+func TestExtractorE2EProcedureCallExpressionArgs(t *testing.T) {
+	fixture := fixturePath(t, "process_calls_procedure_expr_args.vhd")
+
+	ext := New()
+	facts, err := ext.Extract(fixture)
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+
+	proc := findProcess(t, facts.Processes, "p_proc")
+	if !hasProcedureCall(proc.ProcedureCalls, "simAssertion") {
+		t.Fatalf("expected procedure call simAssertion, got %#v", proc.ProcedureCalls)
+	}
+	if !hasProcedureCallArg(proc.ProcedureCalls, "simAssertion", "a = std_logic_vector(to_unsigned(5, b))") {
+		t.Fatalf("expected simAssertion args to include expression, got %#v", proc.ProcedureCalls)
+	}
+	if !hasProcedureCallArg(proc.ProcedureCalls, "simAssertion", "\"msg\"") {
+		t.Fatalf("expected simAssertion args to include string literal, got %#v", proc.ProcedureCalls)
+	}
+}
+
+func TestExtractorE2EProcedureCallStringCommas(t *testing.T) {
+	fixture := fixturePath(t, "process_calls_string_commas.vhd")
+
+	ext := New()
+	facts, err := ext.Extract(fixture)
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+
+	proc := findProcess(t, facts.Processes, "p0")
+	if !hasProcedureCall(proc.ProcedureCalls, "log") {
+		t.Fatalf("expected procedure call log, got %#v", proc.ProcedureCalls)
+	}
+	if !hasProcedureCallArg(proc.ProcedureCalls, "log", "\"A, B, C\"") {
+		t.Fatalf("expected log args to include string with commas, got %#v", proc.ProcedureCalls)
+	}
+}
+
+func TestExtractorE2EProcedureCallCharCommas(t *testing.T) {
+	fixture := fixturePath(t, "process_calls_char_commas.vhd")
+
+	ext := New()
+	facts, err := ext.Extract(fixture)
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+
+	proc := findProcess(t, facts.Processes, "p0")
+	if !hasProcedureCall(proc.ProcedureCalls, "log_char") {
+		t.Fatalf("expected procedure call log_char, got %#v", proc.ProcedureCalls)
+	}
+	if !hasProcedureCallArg(proc.ProcedureCalls, "log_char", "','") {
+		t.Fatalf("expected log_char args to include ',' literal, got %#v", proc.ProcedureCalls)
+	}
+	if !hasProcedureCallArg(proc.ProcedureCalls, "log_char", "\"msg\"") {
+		t.Fatalf("expected log_char args to include string literal, got %#v", proc.ProcedureCalls)
+	}
+}
+
+func TestExtractorE2EAliasRecordNotFunctionCall(t *testing.T) {
+	fixture := fixturePath(t, "process_calls_alias_record.vhd")
+
+	ext := New()
+	facts, err := ext.Extract(fixture)
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+
+	proc := findProcess(t, facts.Processes, "p_alias")
+	if hasFunctionCall(proc.FunctionCalls, "WR.User") || hasFunctionCall(proc.FunctionCalls, "WR.Valid") {
+		t.Fatalf("did not expect alias record fields to be treated as function calls, got %#v", proc.FunctionCalls)
+	}
+}
+
+func TestExtractorE2EAliasObjectDeclaration(t *testing.T) {
+	fixture := fixturePath(t, "alias_object_decl.vhd")
+
+	ext := New()
+	facts, err := ext.Extract(fixture)
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+
+	found := false
+	for _, sig := range facts.Signals {
+		if strings.EqualFold(sig.Name, "A") {
+			found = true
+			if strings.ToLower(sig.Type) != "std_logic" {
+				t.Fatalf("expected alias A type std_logic, got %#v", sig)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected alias A to be captured as signal, got %#v", facts.Signals)
+	}
+}
+
+func TestExtractorE2EFunctionCallRecordFieldArgs(t *testing.T) {
+	fixture := fixturePath(t, "process_calls_record_field_args.vhd")
+
+	ext := New()
+	facts, err := ext.Extract(fixture)
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+
+	proc := findProcess(t, facts.Processes, "p")
+	if !hasFunctionCall(proc.FunctionCalls, "Foo") {
+		t.Fatalf("expected function call Foo, got %#v", proc.FunctionCalls)
+	}
+	if !hasFunctionCallArg(proc.FunctionCalls, "Foo", "R.Field") {
+		t.Fatalf("expected Foo args to include R.Field, got %#v", proc.FunctionCalls)
+	}
+	if !hasFunctionCallArg(proc.FunctionCalls, "Foo", "R.Field'length") {
+		t.Fatalf("expected Foo args to include R.Field'length, got %#v", proc.FunctionCalls)
+	}
+	if hasFunctionCall(proc.FunctionCalls, "Foo.Field") {
+		t.Fatalf("did not expect record field to be treated as function name, got %#v", proc.FunctionCalls)
+	}
+}
+
+func TestExtractorE2EProcedureCallNamedMultiline(t *testing.T) {
+	fixture := fixturePath(t, "process_calls_procedure_named_multiline.vhd")
+
+	ext := New()
+	facts, err := ext.Extract(fixture)
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+
+	proc := findProcess(t, facts.Processes, "p_multi")
+	if !hasProcedureCall(proc.ProcedureCalls, "DoAxiValidHandshake") {
+		t.Fatalf("expected procedure call DoAxiValidHandshake, got %#v", proc.ProcedureCalls)
+	}
+	if !hasProcedureCallArg(proc.ProcedureCalls, "DoAxiValidHandshake", "Clk            => clk") {
+		t.Fatalf("expected named arg Clk => clk, got %#v", proc.ProcedureCalls)
+	}
+	if !hasProcedureCallArg(proc.ProcedureCalls, "DoAxiValidHandshake", "Valid          => valid_s") {
+		t.Fatalf("expected named arg Valid => valid_s, got %#v", proc.ProcedureCalls)
+	}
+	if !hasProcedureCallArg(proc.ProcedureCalls, "DoAxiValidHandshake", "Ready          => ready_s") {
+		t.Fatalf("expected named arg Ready => ready_s, got %#v", proc.ProcedureCalls)
+	}
+	if !hasProcedureCallArg(proc.ProcedureCalls, "DoAxiValidHandshake", "tpd_Clk_Valid  => tpd_Clk") {
+		t.Fatalf("expected named arg tpd_Clk_Valid => tpd_Clk, got %#v", proc.ProcedureCalls)
+	}
+	if !hasProcedureCallArg(proc.ProcedureCalls, "DoAxiValidHandshake", "AlertLogID     => alert_id") {
+		t.Fatalf("expected named arg AlertLogID => alert_id, got %#v", proc.ProcedureCalls)
+	}
+	if !hasProcedureCallArg(proc.ProcedureCalls, "DoAxiValidHandshake", "TimeOutMessage => \"msg\" & to_string(1)") {
+		t.Fatalf("expected named arg TimeOutMessage, got %#v", proc.ProcedureCalls)
+	}
+	if !hasProcedureCallArg(proc.ProcedureCalls, "DoAxiValidHandshake", "TimeOutPeriod  => 2 * tpd_Clk") {
+		t.Fatalf("expected named arg TimeOutPeriod, got %#v", proc.ProcedureCalls)
+	}
+}
+
+func TestExtractorE2EFunctionCallInConditionSelectedName(t *testing.T) {
+	fixture := fixturePath(t, "process_calls_condition_selected.vhd")
+
+	ext := New()
+	facts, err := ext.Extract(fixture)
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+
+	proc := findProcess(t, facts.Processes, "p_cond")
+	if !hasFunctionCall(proc.FunctionCalls, "or_reduce_f") {
+		t.Fatalf("expected function call or_reduce_f, got %#v", proc.FunctionCalls)
+	}
+	if !hasFunctionCallArg(proc.FunctionCalls, "or_reduce_f", "ctrl.cnt") {
+		t.Fatalf("expected or_reduce_f args to include ctrl.cnt, got %#v", proc.FunctionCalls)
+	}
+	if hasFunctionCall(proc.FunctionCalls, "bus_req_i.addr") {
+		t.Fatalf("did not expect record field access to be treated as function call, got %#v", proc.FunctionCalls)
 	}
 }
 
@@ -894,6 +1233,47 @@ func hasFunctionCallArg(calls []FunctionCall, name, arg string) bool {
 	return false
 }
 
+func hasProcedureCallArg(calls []ProcedureCall, name, arg string) bool {
+	for _, c := range calls {
+		if !strings.EqualFold(c.Name, name) {
+			continue
+		}
+		for _, a := range c.Args {
+			if a == arg {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasProcedureCall(calls []ProcedureCall, name string) bool {
+	for _, c := range calls {
+		if strings.EqualFold(c.Name, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasProcedureCallFullName(calls []ProcedureCall, fullName string) bool {
+	for _, c := range calls {
+		if strings.EqualFold(c.FullName, fullName) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAssociationFormal(assocs []Association, formal string) bool {
+	for _, a := range assocs {
+		if strings.EqualFold(a.Formal, formal) {
+			return true
+		}
+	}
+	return false
+}
+
 func findWaitWithOn(waits []WaitStatement) (WaitStatement, bool) {
 	for _, w := range waits {
 		if len(w.OnSignals) > 0 {
@@ -1131,6 +1511,24 @@ func mustFindDisconnection(t *testing.T, specs []DisconnectionSpecification, tar
 func hasProtectedType(types []TypeDeclaration, name string) bool {
 	for _, td := range types {
 		if td.Name == name && td.Kind == "protected" {
+			return true
+		}
+	}
+	return false
+}
+
+func hasPackageName(pkgs []Package, name string) bool {
+	for _, pkg := range pkgs {
+		if strings.EqualFold(pkg.Name, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasPackageBodyName(bodies []PackageBody, name string) bool {
+	for _, body := range bodies {
+		if strings.EqualFold(body.Name, name) {
 			return true
 		}
 	}

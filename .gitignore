@@ -7,6 +7,8 @@
 
 # Go
 /vhdl-lint
+/vhdl-lsp
+/vhdl-facts
 *.exe
 
 # Tree-sitter generated files

@@ -13,6 +13,7 @@ architecture rtl of clean_fsm_rules is
   signal state : state_t;
   signal next_state : state_t;
 begin
+  -- 3-state FSM: single-process, all states handled, with reset and when others
   fsm_p : process(clk_i, rst_n)
   begin
     if rst_n = '0' then
@@ -21,7 +22,7 @@ begin
     elsif rising_edge(clk_i) then
       case state is
         when S_IDLE => state <= S_RUN;
-        when S_RUN => state <= S_DONE;
+        when S_RUN  => state <= S_DONE;
         when S_DONE => state <= S_IDLE;
         when others => state <= S_IDLE;
       end case;

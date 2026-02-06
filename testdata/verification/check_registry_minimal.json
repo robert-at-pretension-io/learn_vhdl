@@ -3,6 +3,12 @@
     "id": "fsm.legal_state",
     "scope_type": "arch",
     "required_bindings": ["state"],
+    "binding_kinds": {
+      "state": ["signal"]
+    },
+    "binding_types": {
+      "state": "enum"
+    },
     "needs_cover": true,
     "severity": "violation"
   }

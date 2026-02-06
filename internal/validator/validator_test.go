@@ -1,6 +1,8 @@
 package validator
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -59,6 +61,7 @@ func TestCUEContractEnforcement(t *testing.T) {
 						"name":      "bad_port",
 						"direction": "invalid_direction", // Not in enum!
 						"type":      "std_logic",
+						"file":      "test.vhd",
 						"line":      1,
 						"in_entity": "test",
 					},
@@ -99,5 +102,14 @@ func TestCUEContractEnforcement(t *testing.T) {
 				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestNoSecondaryIRSchema(t *testing.T) {
+	path := filepath.Join("..", "..", "schema", "ir.cue")
+	if _, err := os.Stat(path); err == nil {
+		t.Fatalf("unexpected %s: remove it to avoid schema drift", path)
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat %s: %v", path, err)
 	}
 }

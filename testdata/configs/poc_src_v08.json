@@ -1,0 +1,35 @@
+{
+  "standard": "2008",
+  "analysis": {
+    "cache": {
+      "enabled": false
+    },
+    "requireLibraryMapping": false,
+    "maxParallelFiles": 4
+  },
+  "lint": {
+    "rules": {
+      "rule_skipped": "info",
+      "unresolved_type_mark": "off",
+      "unresolved_unqualified_call": "off",
+      "unresolved_subprogram": "off",
+      "ambiguous_subprogram": "off",
+      "ambiguous_unqualified_call": "off",
+      "unresolved_dependency": "off",
+      "unresolved_import": "off",
+      "unresolved_library": "off",
+      "unresolved_package": "off"
+    }
+  },
+  "libraries": {
+    "poc": {
+      "files": [
+        "src/**/*.vhd",
+        "src/**/*.vhdl"
+      ],
+      "exclude": [
+        "**/*.v93.vhdl"
+      ]
+    }
+  }
+}

@@ -12,6 +12,68 @@ pub fn violations(input: &Input) -> Vec<Violation> {
     out
 }
 
+pub fn optional_violations(input: &Input) -> Vec<Violation> {
+    let mut out = Vec::new();
+    out.extend(function_body_missing(input));
+    out.extend(procedure_body_missing(input));
+    out
+}
+
+fn function_body_missing(input: &Input) -> Vec<Violation> {
+    let mut out = Vec::new();
+    for func in &input.functions {
+        if func.has_body {
+            continue;
+        }
+        if !func.in_package.is_empty() {
+            continue; // Package specs normally have declarations without bodies
+        }
+        // Check if another declaration of same function has a body in the same file
+        let has_body_elsewhere = input.functions.iter().any(|other| {
+            other.name.eq_ignore_ascii_case(&func.name) && other.has_body && other.file == func.file
+        });
+        if has_body_elsewhere {
+            continue;
+        }
+        out.push(Violation {
+            rule: "function_body_missing".to_string(),
+            severity: "warning".to_string(),
+            file: func.file.clone(),
+            line: func.line,
+            message: format!("Function '{}' declared without body", func.name),
+        });
+    }
+    out
+}
+
+fn procedure_body_missing(input: &Input) -> Vec<Violation> {
+    let mut out = Vec::new();
+    for proc_decl in &input.procedures {
+        if proc_decl.has_body {
+            continue;
+        }
+        if !proc_decl.in_package.is_empty() {
+            continue;
+        }
+        let has_body_elsewhere = input.procedures.iter().any(|other| {
+            other.name.eq_ignore_ascii_case(&proc_decl.name)
+                && other.has_body
+                && other.file == proc_decl.file
+        });
+        if has_body_elsewhere {
+            continue;
+        }
+        out.push(Violation {
+            rule: "procedure_body_missing".to_string(),
+            severity: "warning".to_string(),
+            file: proc_decl.file.clone(),
+            line: proc_decl.line,
+            message: format!("Procedure '{}' declared without body", proc_decl.name),
+        });
+    }
+    out
+}
+
 fn function_param_invalid_mode(input: &Input) -> Vec<Violation> {
     let mut violations = Vec::new();
     for func in &input.functions {
@@ -104,6 +166,7 @@ fn unresolved_qualified_call_entries(
 ) -> Vec<UnresolvedCall> {
     let mut package_scopes: HashMap<String, Vec<String>> = HashMap::new();
     let mut defs: HashSet<(String, String)> = HashSet::new();
+    let mut pkg_by_file_line: HashMap<(String, usize), String> = HashMap::new();
 
     for def in &input.symbol_defs {
         if def.kind.eq_ignore_ascii_case("package") {
@@ -116,6 +179,43 @@ fn unresolved_qualified_call_entries(
                 def.scope.to_ascii_lowercase(),
                 def.name.to_ascii_lowercase(),
             ));
+        }
+    }
+
+    for pkg in &input.packages {
+        if pkg.name.trim().is_empty() {
+            continue;
+        }
+        pkg_by_file_line.insert(
+            (pkg.file.clone(), pkg.line),
+            pkg.name.to_ascii_lowercase(),
+        );
+    }
+
+    if !input.dependencies.is_empty() {
+        for dep in &input.dependencies {
+            if !dep.kind.eq_ignore_ascii_case("package_instantiation") {
+                continue;
+            }
+            let inst_pkg = match pkg_by_file_line.get(&(dep.source.clone(), dep.line)) {
+                Some(name) => name.clone(),
+                None => continue,
+            };
+            let target_pkg = match parse_target_pkg_name(&dep.target) {
+                Some(name) => name,
+                None => continue,
+            };
+            let target_scopes = match package_scopes.get(&target_pkg) {
+                Some(scopes) => scopes.clone(),
+                None => continue,
+            };
+            if target_scopes.is_empty() {
+                continue;
+            }
+            package_scopes
+                .entry(inst_pkg)
+                .or_default()
+                .extend(target_scopes);
         }
     }
 
@@ -135,6 +235,13 @@ fn unresolved_qualified_call_entries(
             Some(parts) => parts,
             None => continue,
         };
+        if input
+            .shared_variables
+            .iter()
+            .any(|shared| shared.eq_ignore_ascii_case(&pkg))
+        {
+            continue;
+        }
         let pkg_scopes = match package_scopes.get(&pkg) {
             Some(scopes) => scopes,
             None => continue, // Avoid false positives for external/standard packages
@@ -161,7 +268,11 @@ fn unresolved_qualified_call_entries(
 }
 
 fn parse_qualified_name(name: &str) -> Option<(String, String)> {
-    let parts: Vec<&str> = name.split('.').map(str::trim).filter(|p| !p.is_empty()).collect();
+    let parts: Vec<&str> = name
+        .split('.')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
     if parts.len() < 2 {
         return None;
     }
@@ -171,6 +282,18 @@ fn parse_qualified_name(name: &str) -> Option<(String, String)> {
         return None;
     }
     Some((pkg.to_ascii_lowercase(), func.to_ascii_lowercase()))
+}
+
+fn parse_target_pkg_name(target: &str) -> Option<String> {
+    let parts: Vec<&str> = target
+        .split('.')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts[parts.len() - 1].to_ascii_lowercase())
 }
 
 struct UnresolvedCall {
@@ -183,7 +306,9 @@ struct UnresolvedCall {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::input::{FunctionDeclaration, Input, NameUse, ProcedureDeclaration, SymbolDef, SubprogramParameter};
+    use crate::policy::input::{
+        FunctionDeclaration, Input, NameUse, ProcedureDeclaration, SubprogramParameter, SymbolDef,
+    };
 
     fn param(name: &str, direction: &str) -> SubprogramParameter {
         SubprogramParameter {
@@ -323,6 +448,110 @@ mod tests {
         let violations = unresolved_qualified_procedure_call(&input);
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].rule, "unresolved_qualified_procedure_call");
+    }
+
+    #[test]
+    fn function_body_missing_flags() {
+        let mut input = Input::default();
+        input.functions.push(FunctionDeclaration {
+            name: "my_func".to_string(),
+            file: "a.vhd".to_string(),
+            has_body: false,
+            in_package: "".to_string(),
+            ..Default::default()
+        });
+        let violations = function_body_missing(&input);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].rule, "function_body_missing");
+    }
+
+    #[test]
+    fn function_body_missing_skips_package_spec() {
+        let mut input = Input::default();
+        input.functions.push(FunctionDeclaration {
+            name: "my_func".to_string(),
+            file: "a.vhd".to_string(),
+            has_body: false,
+            in_package: "my_pkg".to_string(),
+            ..Default::default()
+        });
+        let violations = function_body_missing(&input);
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn function_body_missing_skips_when_body_exists() {
+        let mut input = Input::default();
+        input.functions.push(FunctionDeclaration {
+            name: "my_func".to_string(),
+            file: "a.vhd".to_string(),
+            has_body: false,
+            in_package: "".to_string(),
+            line: 1,
+            ..Default::default()
+        });
+        input.functions.push(FunctionDeclaration {
+            name: "my_func".to_string(),
+            file: "a.vhd".to_string(),
+            has_body: true,
+            in_package: "".to_string(),
+            line: 5,
+            ..Default::default()
+        });
+        let violations = function_body_missing(&input);
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn procedure_body_missing_flags() {
+        let mut input = Input::default();
+        input.procedures.push(ProcedureDeclaration {
+            name: "my_proc".to_string(),
+            file: "a.vhd".to_string(),
+            has_body: false,
+            in_package: "".to_string(),
+            ..Default::default()
+        });
+        let violations = procedure_body_missing(&input);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].rule, "procedure_body_missing");
+    }
+
+    #[test]
+    fn procedure_body_missing_skips_package_spec() {
+        let mut input = Input::default();
+        input.procedures.push(ProcedureDeclaration {
+            name: "my_proc".to_string(),
+            file: "a.vhd".to_string(),
+            has_body: false,
+            in_package: "my_pkg".to_string(),
+            ..Default::default()
+        });
+        let violations = procedure_body_missing(&input);
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn procedure_body_missing_skips_when_body_exists() {
+        let mut input = Input::default();
+        input.procedures.push(ProcedureDeclaration {
+            name: "my_proc".to_string(),
+            file: "a.vhd".to_string(),
+            has_body: false,
+            in_package: "".to_string(),
+            line: 1,
+            ..Default::default()
+        });
+        input.procedures.push(ProcedureDeclaration {
+            name: "my_proc".to_string(),
+            file: "a.vhd".to_string(),
+            has_body: true,
+            in_package: "".to_string(),
+            line: 5,
+            ..Default::default()
+        });
+        let violations = procedure_body_missing(&input);
+        assert!(violations.is_empty());
     }
 
     #[test]

@@ -84,7 +84,7 @@ func diffArchitectureRows(from, to []ArchitectureRow) []ArchitectureRow {
 
 func diffPackageRows(from, to []PackageRow) []PackageRow {
 	return diffRows(from, to, func(r PackageRow) string {
-		return r.Name + "|" + r.File + "|" + intKey(r.Line)
+		return r.Name + "|" + r.File + "|" + intKey(r.Line) + "|" + r.InArch
 	})
 }
 

@@ -489,11 +489,34 @@ pub fn rule_is_disabled(input: &Input, rule: &str) -> bool {
     if matches!(input.lint_config.rules.get(rule), Some(val) if val == "off") {
         return true;
     }
+    if let Some(alias) = rule_alias(rule) {
+        if matches!(input.lint_config.rules.get(alias), Some(val) if val == "off") {
+            return true;
+        }
+        if input.lint_config.rules.contains_key(alias) {
+            return false;
+        }
+    }
     is_optional_rule(rule) && !input.lint_config.rules.contains_key(rule)
 }
 
 pub fn get_rule_severity(input: &Input, rule: &str) -> Option<String> {
-    input.lint_config.rules.get(rule).cloned()
+    if let Some(val) = input.lint_config.rules.get(rule) {
+        return Some(val.clone());
+    }
+    if let Some(alias) = rule_alias(rule) {
+        return input.lint_config.rules.get(alias).cloned();
+    }
+    None
+}
+
+fn rule_alias(rule: &str) -> Option<&'static str> {
+    match rule {
+        "unresolved_library" | "unresolved_package" => Some("unresolved_import"),
+        "unresolved_subprogram" => Some("unresolved_subprogram_call"),
+        "ambiguous_subprogram" => Some("ambiguous_subprogram_call"),
+        _ => None,
+    }
 }
 
 pub fn is_third_party_file(input: &Input, file: &str) -> bool {
@@ -501,6 +524,11 @@ pub fn is_third_party_file(input: &Input, file: &str) -> bool {
         .third_party_files
         .iter()
         .any(|f| file == f || file.ends_with(f))
+}
+
+pub fn is_stub_file(file: &str) -> bool {
+    let lower = file.to_ascii_lowercase();
+    lower.contains("/external_tests/vendor/") || lower.contains("\\external_tests\\vendor\\")
 }
 
 pub fn is_optional_rule(rule: &str) -> bool {
@@ -573,12 +601,19 @@ pub fn is_optional_rule(rule: &str) -> bool {
             | "inout_as_input"
             | "inout_as_output"
             | "unresolved_dependency"
+            | "unresolved_import"
+            | "unresolved_library"
+            | "unresolved_package"
+            | "unresolved_subprogram"
+            | "ambiguous_subprogram"
+            | "rule_skipped"
             | "undeclared_signal_usage"
             | "multi_driven_signal"
             | "unused_input_port"
             | "duplicate_signal_in_entity"
             | "duplicate_port_in_entity"
             | "duplicate_entity_in_file"
+            | "duplicate_architecture_in_library"
             | "file_entity_mismatch"
             | "many_signals"
             | "buffer_port"
@@ -639,5 +674,42 @@ pub fn is_optional_rule(rule: &str) -> bool {
             | "procedure_param_invalid_mode"
             | "function_param_invalid_mode"
             | "trigger_drives_output"
+            | "missing_verification_block"
+            | "missing_verification_check"
+            | "ambiguous_construct"
+            | "wait_in_clocked_process"
+            | "process_with_no_statements"
+            | "constant_if_condition"
+            | "shared_variable_usage"
+            | "variable_in_sensitivity_list"
+            | "duplicate_architecture_name"
+            | "generic_without_default"
+            | "constant_port_connection"
+            | "entity_port_not_connected"
+            | "port_type_mismatch_style"
+            | "numeric_std_unsigned_mixing"
+            | "redundant_others_only"
+            | "sequential_signal_no_reset"
+            | "function_body_missing"
+            | "write_only_signal"
+            | "unused_constant"
+            | "unused_component"
+            | "unused_type"
+            | "unused_subprogram"
+            | "unused_variable"
+            | "variable_shadows_signal"
+            | "uninitialized_variable_read"
+            | "potential_overflow"
+            | "dead_generate"
+            | "generate_range_mismatch"
+            | "duplicate_use_clause"
+            | "unused_subtype"
+            | "procedure_body_missing"
+            | "unused_generic"
+            | "record_field_unused"
+            | "signal_fanout"
+            | "use_all_abuse"
+            | "unused_library_clause"
+            | "unused_use_clause"
     )
 }

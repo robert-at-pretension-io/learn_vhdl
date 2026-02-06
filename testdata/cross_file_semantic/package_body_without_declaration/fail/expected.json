@@ -1,0 +1,3 @@
+{
+  "rules": ["package_body_without_declaration"]
+}

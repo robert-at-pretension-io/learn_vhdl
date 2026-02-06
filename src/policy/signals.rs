@@ -18,8 +18,11 @@ pub fn violations(input: &Input) -> Vec<Violation> {
 
 pub fn optional_violations(input: &Input) -> Vec<Violation> {
     let mut out = Vec::new();
+    let usage = SignalUsageIndex::from_input(input);
     out.extend(wide_signal(input));
     out.extend(duplicate_signal_name(input));
+    out.extend(shared_variable_usage(input));
+    out.extend(write_only_signal(input, &usage));
     out
 }
 
@@ -529,6 +532,70 @@ fn extract_vector_width(type_str: &str) -> usize {
     0
 }
 
+fn shared_variable_usage(input: &Input) -> Vec<Violation> {
+    let (default_file, default_line) = input
+        .architectures
+        .first()
+        .map(|arch| (arch.file.clone(), arch.line))
+        .unwrap_or_else(|| (String::new(), 1));
+    input
+        .shared_variables
+        .iter()
+        .map(|name| Violation {
+            rule: "shared_variable_usage".to_string(),
+            severity: "warning".to_string(),
+            file: default_file.clone(),
+            line: default_line,
+            message: format!(
+                "Shared variable '{}' is non-synthesizable and race-condition prone",
+                name
+            ),
+        })
+        .collect()
+}
+
+fn write_only_signal(input: &Input, usage: &SignalUsageIndex) -> Vec<Violation> {
+    let mut port_map_signals: HashSet<String> = HashSet::new();
+    for inst in &input.instances {
+        for val in inst.port_map.values() {
+            port_map_signals.insert(val.to_ascii_lowercase());
+        }
+        for assoc in &inst.associations {
+            if !assoc.actual_base.is_empty() {
+                port_map_signals.insert(assoc.actual_base.to_ascii_lowercase());
+            }
+        }
+    }
+    let output_ports: HashSet<String> = input
+        .ports
+        .iter()
+        .filter(|p| {
+            let d = p.direction.to_ascii_lowercase();
+            d == "out" || d == "inout" || d == "buffer"
+        })
+        .map(|p| p.name.to_ascii_lowercase())
+        .collect();
+    input
+        .signals
+        .iter()
+        .filter(|sig| !helpers::file_in_testbench(input, &sig.file))
+        .filter(|sig| usage.has_assigned(&sig.name))
+        .filter(|sig| !usage.has_read(&sig.name))
+        .filter(|sig| !port_map_signals.contains(&sig.name.to_ascii_lowercase()))
+        .filter(|sig| !output_ports.contains(&sig.name.to_ascii_lowercase()))
+        .map(|sig| Violation {
+            rule: "write_only_signal".to_string(),
+            severity: "warning".to_string(),
+            file: sig.file.clone(),
+            line: sig.line,
+            message: format!(
+                "Signal '{}' is assigned but never read (write-only)",
+                sig.name
+            ),
+        })
+        .collect()
+}
+
 fn duplicate_signal_name(input: &Input) -> Vec<Violation> {
     let mut out = Vec::new();
     for (i, sig1) in input.signals.iter().enumerate() {
@@ -758,5 +825,98 @@ mod tests {
         let v = duplicate_signal_name(&input);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].rule, "duplicate_signal_name");
+    }
+
+    #[test]
+    fn shared_variable_usage_flags() {
+        let mut input = Input::default();
+        input.architectures.push(Architecture {
+            name: "rtl".to_string(),
+            entity_name: "ent".to_string(),
+            file: "a.vhd".to_string(),
+            line: 1,
+        });
+        input.shared_variables.push("shared_mem".to_string());
+        let v = shared_variable_usage(&input);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].rule, "shared_variable_usage");
+        assert_eq!(v[0].severity, "warning");
+        assert!(v[0].message.contains("shared_mem"));
+    }
+
+    #[test]
+    fn shared_variable_usage_empty() {
+        let input = Input::default();
+        let v = shared_variable_usage(&input);
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn write_only_signal_flags() {
+        let mut input = Input::default();
+        input.signals.push(Signal {
+            name: "wr_only".to_string(),
+            file: "a.vhd".to_string(),
+            line: 5,
+            in_entity: "ent".to_string(),
+            ..Default::default()
+        });
+        input.processes.push(Process {
+            assigned_signals: vec!["wr_only".to_string()],
+            file: "a.vhd".to_string(),
+            ..Default::default()
+        });
+        let usage = SignalUsageIndex::from_input(&input);
+        let v = write_only_signal(&input, &usage);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].rule, "write_only_signal");
+    }
+
+    #[test]
+    fn write_only_signal_skip_port_map() {
+        use crate::policy::input::Instance;
+        let mut input = Input::default();
+        input.signals.push(Signal {
+            name: "mapped".to_string(),
+            file: "a.vhd".to_string(),
+            line: 5,
+            in_entity: "ent".to_string(),
+            ..Default::default()
+        });
+        input.processes.push(Process {
+            assigned_signals: vec!["mapped".to_string()],
+            file: "a.vhd".to_string(),
+            ..Default::default()
+        });
+        let mut pm = std::collections::HashMap::new();
+        pm.insert("din".to_string(), "mapped".to_string());
+        input.instances.push(Instance {
+            port_map: pm,
+            ..Default::default()
+        });
+        let usage = SignalUsageIndex::from_input(&input);
+        let v = write_only_signal(&input, &usage);
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn write_only_signal_skip_read() {
+        let mut input = Input::default();
+        input.signals.push(Signal {
+            name: "sig".to_string(),
+            file: "a.vhd".to_string(),
+            line: 5,
+            in_entity: "ent".to_string(),
+            ..Default::default()
+        });
+        input.processes.push(Process {
+            assigned_signals: vec!["sig".to_string()],
+            read_signals: vec!["sig".to_string()],
+            file: "a.vhd".to_string(),
+            ..Default::default()
+        });
+        let usage = SignalUsageIndex::from_input(&input);
+        let v = write_only_signal(&input, &usage);
+        assert!(v.is_empty());
     }
 }

@@ -26,6 +26,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/robert-at-pretension-io/vhdl-lint/internal/config"
 	"github.com/robert-at-pretension-io/vhdl-lint/internal/indexer"
@@ -80,6 +81,12 @@ func main() {
 			os.Exit(1)
 		}
 		runLintWithFlags(os.Args[2], false, true, false, false, false)
+	case "--symbols-json":
+		if len(os.Args) < 3 {
+			printUsage()
+			os.Exit(1)
+		}
+		runLintWithSymbols(os.Args[2])
 	case "--timing":
 		if len(os.Args) < 3 {
 			printUsage()
@@ -95,11 +102,13 @@ func main() {
 	case "-h", "--help", "help":
 		printUsage()
 	case "-c", "--config":
-		if len(os.Args) < 4 {
+		configPath, lintPath, flags, err := parseConfigArgs(os.Args[2:])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			printUsage()
 			os.Exit(1)
 		}
-		runLintWithConfig(os.Args[2], os.Args[3], false, false, false, false, false)
+		runLintWithConfig(configPath, lintPath, flags.verbose, flags.json, flags.progress, flags.trace, flags.timing)
 	default:
 		runLintWithFlags(cmd, false, false, false, false, false)
 	}
@@ -119,9 +128,10 @@ Options:
   --policy-trace    Stream Rust policy timing output (per-rule start/done)
   --policy-stream   Stream Rust policy stderr without enabling timing
   -j, --json        Output results as JSON (for programmatic parsing)
+  --symbols-json    JSON output with symbol index (for LSP/IDE integration)
   --timing          Emit timing.jsonl with pipeline timing events
   --clear-policy-cache  Remove cached policy results for the given path
-  -c, --config      Specify config file: vhdl-lint -c config.json <path>
+  -c, --config      Specify config file: vhdl-lint -c config.json [options] <path>
   -h, --help        Show this help message
 
 Configuration:
@@ -131,6 +141,56 @@ Configuration:
     3. ~/.config/vhdl_lint/config.json
 
   Run 'vhdl-lint init' to create a default configuration file.`)
+}
+
+type lintFlags struct {
+	verbose  bool
+	json     bool
+	progress bool
+	trace    bool
+	timing   bool
+}
+
+func parseConfigArgs(args []string) (string, string, lintFlags, error) {
+	if len(args) < 2 {
+		return "", "", lintFlags{}, fmt.Errorf("config mode requires <config> and <path>")
+	}
+	configPath := args[0]
+	var lintPath string
+	flags := lintFlags{}
+
+	for _, arg := range args[1:] {
+		switch arg {
+		case "-v", "--verbose":
+			flags.verbose = true
+		case "-p", "--progress":
+			flags.progress = true
+		case "-t", "--trace":
+			flags.trace = true
+			flags.progress = true
+		case "-j", "--json":
+			flags.json = true
+		case "--timing":
+			flags.timing = true
+		case "--policy-trace":
+			_ = os.Setenv("VHDL_POLICY_TRACE_TIMING", "1")
+		case "--policy-stream":
+			_ = os.Setenv("VHDL_POLICY_STREAM", "1")
+		default:
+			if strings.HasPrefix(arg, "-") {
+				return "", "", lintFlags{}, fmt.Errorf("unknown option %q", arg)
+			}
+			if lintPath != "" {
+				return "", "", lintFlags{}, fmt.Errorf("multiple paths provided (%q, %q)", lintPath, arg)
+			}
+			lintPath = arg
+		}
+	}
+
+	if lintPath == "" {
+		return "", "", lintFlags{}, fmt.Errorf("config mode requires <path>")
+	}
+	return configPath, lintPath, flags, nil
 }
 
 func runInit() {
@@ -194,6 +254,22 @@ func runLintWithConfig(configPath, lintPath string, verbose, jsonOutput, progres
 	idx.JSONOutput = jsonOutput
 	idx.Timing = timing
 	if err := idx.Run(lintPath); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func runLintWithSymbols(path string) {
+	cfg, err := config.Load(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
+		os.Exit(1)
+	}
+
+	idx := indexer.NewWithConfig(cfg)
+	idx.JSONOutput = true
+	idx.SymbolsJSON = true
+	if err := idx.Run(path); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}

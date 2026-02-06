@@ -181,6 +181,10 @@ func ensurePolicyDaemonBinary(policyDir string) (string, error) {
 	}
 
 	base := filepath.Dir(policyDir)
+	sourceRoot, hasSources := findPolicySourceRoot(base)
+	if hasSources {
+		base = sourceRoot
+	}
 	profile := os.Getenv("VHDL_POLICY_PROFILE")
 	if profile == "" {
 		profile = "release"
@@ -199,9 +203,35 @@ func ensurePolicyDaemonBinary(policyDir string) (string, error) {
 	}
 	for _, candidate := range candidates {
 		if existsExecutable(candidate) {
-			return candidate, nil
+			if hasSources {
+				extra := []string{
+					filepath.Join(base, "Cargo.toml"),
+					filepath.Join(base, "Cargo.lock"),
+					filepath.Join(base, "src", "bin", "vhdl_policyd.rs"),
+				}
+				outdated, err := policyBinaryOutdated(candidate, base, extra)
+				if err == nil && !outdated {
+					return candidate, nil
+				}
+			} else {
+				return candidate, nil
+			}
+			break
 		}
 	}
+
+	if hasSources {
+		if err := buildPolicyDaemonBinary(base, profile); err != nil {
+			return "", err
+		}
+		for _, candidate := range candidates {
+			if existsExecutable(candidate) {
+				return candidate, nil
+			}
+		}
+		return "", fmt.Errorf("vhdl_policyd binary not found after build")
+	}
+
 	if path, err := exec.LookPath("vhdl_policyd"); err == nil {
 		return path, nil
 	}

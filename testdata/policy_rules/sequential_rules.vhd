@@ -89,5 +89,13 @@ begin
     end if;
   end process;
 
+  -- Edge: sequential process where clock not in sensitivity but data is
+  p_data_only: process(data)
+  begin
+    if rising_edge(clk) then
+      q <= data;
+    end if;
+  end process;
+
   q <= shared_sig;
 end rtl;

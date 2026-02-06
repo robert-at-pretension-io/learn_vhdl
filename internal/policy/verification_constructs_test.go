@@ -67,6 +67,90 @@ func TestMissingChecksForFIFO(t *testing.T) {
 	})
 }
 
+func TestReadyValidSequentialGateDetectionGap(t *testing.T) {
+	repoRoot := findRepoRoot(t)
+	fixture := filepath.Join(repoRoot, "testdata", "verification", "construct_ready_valid_sequential.vhd")
+
+	result := lintFile(t, repoRoot, fixture, map[string]string{
+		"missing_verification_check": "warning",
+	})
+
+	if hasMissingCheck(result, "rv.stable_while_stalled") || hasMissingCheck(result, "cover.rv.handshake") {
+		t.Fatalf("did not expect ready/valid missing checks for sequential gating fixture")
+	}
+}
+
+func TestReadyValidInternalSignalsDetectionGap(t *testing.T) {
+	repoRoot := findRepoRoot(t)
+	fixture := filepath.Join(repoRoot, "testdata", "verification", "construct_ready_valid_internal.vhd")
+
+	result := lintFile(t, repoRoot, fixture, map[string]string{
+		"missing_verification_check": "warning",
+	})
+
+	if hasMissingCheck(result, "rv.stable_while_stalled") || hasMissingCheck(result, "cover.rv.handshake") {
+		t.Fatalf("did not expect ready/valid missing checks for internal-signal fixture")
+	}
+}
+
+func TestMissingChecksForResetHygiene(t *testing.T) {
+	repoRoot := findRepoRoot(t)
+	fixture := filepath.Join(repoRoot, "testdata", "verification", "construct_reset_hygiene.vhd")
+
+	result := lintFile(t, repoRoot, fixture, map[string]string{
+		"missing_verification_check": "warning",
+	})
+
+	assertMissingChecks(t, result, []string{
+		"reset.no_unknown_after_grace",
+		"reset.asserted_implies_known_defaults",
+	})
+}
+
+func TestCounterFalsePositiveFixture(t *testing.T) {
+	repoRoot := findRepoRoot(t)
+	fixture := filepath.Join(repoRoot, "testdata", "verification", "construct_counter_false_positive.vhd")
+
+	result := lintFile(t, repoRoot, fixture, map[string]string{
+		"missing_verification_check": "warning",
+	})
+
+	assertMissingChecks(t, result, []string{
+		"ctr.range",
+		"ctr.step_rule",
+		"cover.ctr.moved",
+	})
+}
+
+func TestMissingChecksForPulse(t *testing.T) {
+	repoRoot := findRepoRoot(t)
+	fixture := filepath.Join(repoRoot, "testdata", "verification", "construct_pulse.vhd")
+
+	result := lintFile(t, repoRoot, fixture, map[string]string{
+		"missing_verification_check": "warning",
+	})
+
+	assertMissingChecks(t, result, []string{
+		"pulse.width_one_cycle",
+		"cover.pulse.fired",
+	})
+}
+
+func TestMissingChecksForArb(t *testing.T) {
+	repoRoot := findRepoRoot(t)
+	fixture := filepath.Join(repoRoot, "testdata", "verification", "construct_arb.vhd")
+
+	result := lintFile(t, repoRoot, fixture, map[string]string{
+		"missing_verification_check": "warning",
+	})
+
+	assertMissingChecks(t, result, []string{
+		"arb.onehot0",
+		"arb.no_grant_without_req",
+		"cover.arb.grant_seen",
+	})
+}
+
 func TestMissingCoverCompanion(t *testing.T) {
 	repoRoot := findRepoRoot(t)
 	fixture := filepath.Join(repoRoot, "testdata", "verification", "missing_cover_companion.vhd")
@@ -101,11 +185,11 @@ func TestScopeAccurateMatching(t *testing.T) {
 		"missing_verification_check": "warning",
 	})
 
-	if !hasMissingCheckScope(result, "arch:gate") {
-		t.Fatalf("expected missing checks for arch:gate, got violations: %v", collectRules(result))
+	if !hasMissingCheckScopeID(result, "arch:gate", "fsm.legal_state") {
+		t.Fatalf("expected missing fsm checks for arch:gate, got violations: %v", collectRules(result))
 	}
-	if hasMissingCheckScope(result, "arch:rtl") {
-		t.Fatalf("did not expect missing checks for arch:rtl")
+	if hasMissingCheckScopeID(result, "arch:rtl", "fsm.legal_state") {
+		t.Fatalf("did not expect fsm missing checks for arch:rtl")
 	}
 }
 
@@ -130,6 +214,17 @@ func hasMissingCheck(result indexer.LintResult, id string) bool {
 func hasMissingCheckScope(result indexer.LintResult, scope string) bool {
 	for _, v := range result.Violations {
 		if v.Rule == "missing_verification_check" && strings.Contains(v.Message, scope) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasMissingCheckScopeID(result indexer.LintResult, scope, id string) bool {
+	for _, v := range result.Violations {
+		if v.Rule == "missing_verification_check" &&
+			strings.Contains(v.Message, scope) &&
+			strings.Contains(v.Message, id) {
 			return true
 		}
 	}

@@ -1,0 +1,22 @@
+{
+  "standard": "2008",
+  "analysis": {
+    "cache": {
+      "enabled": false
+    },
+    "requireLibraryMapping": false
+  },
+  "lint": {
+    "rules": {
+      "rule_skipped": "info"
+    }
+  },
+  "libraries": {
+    "neorv32": {
+      "files": [
+        "**/*.vhd",
+        "**/*.vhdl"
+      ]
+    }
+  }
+}

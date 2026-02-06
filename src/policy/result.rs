@@ -45,6 +45,18 @@ pub struct AmbiguousConstruct {
     pub candidates: HashMap<String, Vec<String>>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Waiver {
+    pub id: String,
+    pub scope: String,
+    pub reason: String,
+    pub owner: String,
+    pub expires: String,
+    pub file: String,
+    pub line: usize,
+    pub raw: String,
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct Result {
     pub violations: Vec<Violation>,
@@ -53,4 +65,6 @@ pub struct Result {
     pub missing_checks: Vec<MissingCheckTask>,
     #[serde(default)]
     pub ambiguous_constructs: Vec<AmbiguousConstruct>,
+    #[serde(default)]
+    pub waivers: Vec<Waiver>,
 }

@@ -195,28 +195,23 @@ module.exports = grammar({
   //
   // Package vs package body can conflict since both start with $._kw_package
   // ===========================================================================
+  // Conflict count: 55 (was 64; removed 9 _expression_term conflicts)
   conflicts: $ => [
     [$.package_declaration, $._package_declarative_item],
     [$._type_name, $._simple_name],
     [$._type_name, $.function_call, $._simple_name],
-    [$._primary_expression, $._expression_term],
     [$._index_spec, $._primary_expression],
     [$.association_element, $._index_expression_item],
     [$.association_list, $._index_expression_unified],
     [$._index_spec, $._simple_name],
     [$._array_index_constraint, $._simple_name],
     [$._type_name, $._array_index_constraint, $._simple_name],
-    [$._index_spec, $._primary_expression, $._expression_term],
     [$.function_call, $._simple_name],
     [$._index_spec, $._index_expression_item],
     [$._constant_value, $._simple_name],
     [$._entity_aspect, $._simple_name],
     [$.alias_declaration, $._simple_name],
-    [$._type_mark, $._name, $._expression_term],
-    [$._type_mark, $._primary_expression, $._expression_term],
     [$._type_mark, $.report_statement, $._name],
-    [$.physical_literal, $._expression_term],
-    [$.physical_literal, $._primary_expression, $._expression_term],
     [$.physical_literal, $.arithmetic_operator],
     [$._protected_type_private_item, $.private_variable_declaration],
     [$._generic_type_indication, $._type_name, $._simple_name],
@@ -226,13 +221,12 @@ module.exports = grammar({
     [$._generate_body],
     [$._generate_body, $._generate_block],
     [$.psl_next_expression, $._aggregate_element],
-    [$.psl_parenthesized_expression, $._expression_term],
     [$.psl_next_event_expression, $.association_element, $._index_expression_item],
     [$._waveform_element, $._waveform_element_no_when],
     [$.component_instantiation, $._simple_name],
     [$._conditional_signal_assignment, $._simple_signal_assignment],
     [$._waveform_element_no_when, $._expression],
-    [$.subprogram_declaration, $.subprogram_body],
+    // subprogram_body removed (was identical to subprogram_declaration) — conflict eliminated
     [$.concurrent_procedure_call, $.component_instantiation],
     [$._force_release_assignment, $._assignment_target],
     [$.block_configuration, $.component_configuration],
@@ -243,10 +237,9 @@ module.exports = grammar({
     [$.physical_type_definition],
     [$.psl_sequence],
     [$._psl_sequence_item],
-    [$._psl_assert_expression, $._expression_term],
     [$._block_declarative_item, $._concurrent_statement],
     [$._simple_name, $._aggregate_element],
-    [$._primary_expression, $._expression_term, $._aggregate_element],
+    [$._primary_expression, $._aggregate_element],
     [$._aggregate_choice_expression, $._aggregate_element],
     [$.generic_type_declaration],  // VHDL-2019 generic type vs type_expression
     [$._generic_type_indication, $._type_expression],  // For access/file type generics
@@ -617,13 +610,6 @@ module.exports = grammar({
     ),
 
     // Simplified expression - placeholder for proper expression parsing
-    // Match word characters, spaces, and some punctuation, but stop at delimiters
-    // Note: includes '(' but not ')' to avoid eating closing parens of param lists
-    // NOT using token() to allow word boundaries to work properly
-    // _simple_expression - fallback for value/expression contexts
-    // Does NOT include '(' or ')'
-    _simple_expression: _ => prec(-1, /[a-zA-Z0-9_., \t"'+\-*/<>=]+/),
-
     // _type_expression - for type definition contexts
     // Matches: identifier optionally followed by constraint
     // e.g., "integer", "std_logic_vector(7 downto 0)", "file of string"
@@ -779,7 +765,7 @@ module.exports = grammar({
       $.shared_variable_declaration,
       $.alias_declaration,
       $.attribute_specification,
-      $.subprogram_body,
+      $.subprogram_declaration,
       $.use_clause
     ),
 
@@ -1133,7 +1119,7 @@ module.exports = grammar({
     ),
 
     _package_body_declarative_item: $ => choice(
-      $.subprogram_body,
+      $.subprogram_declaration,
       $.type_declaration,  // For protected type bodies
       $.constant_declaration,
       $.shared_variable_declaration,  // Shared variables in package body
@@ -1521,8 +1507,8 @@ module.exports = grammar({
               field('configuration', $._name)
             )
           ),
-          optional(seq($._kw_generic, $._kw_map, '(', /[^)]+/, ')')),  // Generic map
-          optional(seq($._kw_port, $._kw_map, '(', /[^)]+/, ')')),     // Port map
+          optional($.generic_map_aspect),
+          optional($.port_map_aspect),
           ';'  // Semicolon after binding indication
         ),
         seq(
@@ -1532,8 +1518,8 @@ module.exports = grammar({
         ),
         // Incremental binding indication (generic map and/or port map without use)
         seq(
-          optional(seq($._kw_generic, $._kw_map, '(', /[^)]+/, ')')),  // Generic map
-          optional(seq($._kw_port, $._kw_map, '(', /[^)]+/, ')')),     // Port map
+          optional($.generic_map_aspect),
+          optional($.port_map_aspect),
           ';'  // Semicolon after incremental binding
         )
       )),
@@ -1677,8 +1663,8 @@ module.exports = grammar({
         seq($._kw_configuration, $._name),  // use configuration work.cfg
         $._kw_open  // use open
       ),
-      optional(seq($._kw_generic, $._kw_map, '(', /[^)]*/, ')')),
-      optional(seq($._kw_port, $._kw_map, '(', /[^)]*/, ')')),
+      optional($.generic_map_aspect),
+      optional($.port_map_aspect),
       ';'
     ),
 
@@ -1951,10 +1937,10 @@ module.exports = grammar({
 
     // Signal assignment - simple, conditional, or selected (with optional label)
     signal_assignment: $ => choice(
+      prec.dynamic(2, $._force_release_assignment),
       prec.dynamic(1, $._conditional_signal_assignment),
       prec.dynamic(-1, $._simple_signal_assignment),
-      $._selected_signal_assignment,
-      $._force_release_assignment
+      $._selected_signal_assignment
     ),
 
     // Simple signal assignment with waveform: signal <= [transport] value [after time] {, value [after time]};
@@ -2016,12 +2002,12 @@ module.exports = grammar({
     ),
 
     // VHDL-2008 force/release
-    _force_release_assignment: $ => prec.dynamic(1, seq(
+    _force_release_assignment: $ => prec.dynamic(10, seq(
       optional(seq($.identifier, ':')),
       field('target', alias($._name, $.assignment_target)),  // Visible wrapper for ChildByFieldName
       '<=',
       choice($._kw_force, $._kw_release),
-      optional($._expression),
+      optional($._logical_expression),  // Use non-conditional to avoid consuming 'when'
       optional(seq($._kw_when, $._expression)),
       ';'
     )),
@@ -2062,7 +2048,6 @@ module.exports = grammar({
       $.package_instantiation,
       $.subprogram_instantiation,
       $.subprogram_declaration,
-      $.subprogram_body,
       $.use_clause
     ),
 
@@ -2128,15 +2113,6 @@ module.exports = grammar({
     ),
 
 
-    // -------------------------------------------------------------------------
-    // subprogram_body (function/procedure implementations)
-    // -------------------------------------------------------------------------
-    // Subprogram body - now just uses the unified declaration rules
-    subprogram_body: $ => choice(
-      $.function_declaration,
-      $.procedure_declaration
-    ),
-
     // Declarative items inside subprograms (functions/procedures)
     _subprogram_declarative_item: $ => choice(
       $.variable_declaration,
@@ -2150,7 +2126,7 @@ module.exports = grammar({
       $.shared_variable_declaration,
       $.use_clause,
       $.subprogram_instantiation,
-      $.subprogram_body  // Nested functions/procedures
+      $.subprogram_declaration  // Nested functions/procedures
     ),
 
     variable_declaration: $ => seq(
@@ -2500,19 +2476,15 @@ module.exports = grammar({
     // instead of trying to reconstruct expression structure from flat tokens.
     // =========================================================================
 
-    // Expression entry point - try structured expressions first, fall back to flat
+    // Expression entry point
     _expression: $ => choice(
       $.conditional_expression,  // VHDL-2008/2019: expr when cond else expr
-      $._logical_expression,
-      prec(-1, repeat1($._expression_term))  // Fallback for edge cases
+      $._logical_expression
     ),
 
     // Expression variant that disallows top-level conditional expressions.
     // Used in waveform contexts to avoid eating "when" from signal assignments.
-    _expression_no_conditional: $ => choice(
-      $._logical_expression,
-      prec(-1, repeat1($._expression_term))
-    ),
+    _expression_no_conditional: $ => $._logical_expression,
 
     // Conditional expression (right-associative)
     conditional_expression: $ => prec.right(1, seq(
@@ -2605,24 +2577,8 @@ module.exports = grammar({
       $._parenthesized_expression
     ),
 
-    // Keep _expression_term for backward compatibility (some rules use it directly)
-    _expression_term: $ => choice(
-      prec(10, $._literal),  // Must be early and high precedence to catch char literals
-      $.allocator_expression,  // new Type or new Type'(value)
-      $.qualified_expression,  // type'(expr) - must be before _name
-      $._name_with_signature,
-      $._name,
-      $.physical_literal,
-      $.based_literal,
-      $.number,
-      $.relational_operator,  // =, /=, <, >, <=, >= (visible for semantic analysis)
-      $.logical_operator,     // and, or, xor, etc. (visible for semantic analysis)
-      $.arithmetic_operator,  // +, -, *, /, etc. (visible for semantic analysis)
-      $.shift_operator,       // sll, srl, sla, sra, rol, ror
-      $._kw_not,              // Unary not
-      $._kw_abs,              // Unary abs
-      $._parenthesized_expression  // Grouped or aggregate
-    ),
+    // _expression_term removed — all expression parsing now uses the structured
+    // hierarchy (_logical_expression → _relational_expression → ... → _primary).
 
     // Visible operator nodes for semantic analysis
     relational_operator: _ => choice('=', '/=', '<', '>', '<=', '>=', '?=', '?/=', '?<', '?>', '?<=', '?>='),
@@ -2733,10 +2689,18 @@ module.exports = grammar({
       $._string_literal       // Includes quoted, percent-delimited, and bit strings
     )),
 
+    // Procedure call with actuals
+    procedure_call: $ => seq(
+      field('name', $._name),
+      '(',
+      field('arguments', optional($.association_list)),
+      ')'
+    ),
+
     // Procedure call statement - lower precedence than assignments
     procedure_call_statement: $ => prec.dynamic(-1, seq(
       optional(seq($.identifier, ':')),  // Optional label
-      $._name,
+      choice($.procedure_call, $._name),
       ';'
     )),
 

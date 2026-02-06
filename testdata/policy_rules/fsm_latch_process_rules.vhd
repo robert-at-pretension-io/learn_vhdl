@@ -11,8 +11,10 @@ end fsm_latch_rules;
 
 architecture rtl of fsm_latch_rules is
   type state_t is (IDLE, RUN, DONE);
+  type lg_state_t is (LG_IDLE, LG_START, LG_RUN, LG_WAIT, LG_DONE);
   signal state     : state_t;
   signal state_vec : std_logic_vector(1 downto 0);
+  signal lg_state  : lg_state_t;
   signal s0 : std_logic;
   signal s1 : std_logic;
   signal s2 : std_logic;
@@ -73,6 +75,23 @@ begin
   begin
     if rising_edge(clk) then
       state <= IDLE;
+    end if;
+  end process;
+
+  -- Edge: larger FSM with multiple unhandled states (no when others)
+  large_fsm_comb: process(lg_state, a)
+  begin
+    case lg_state is
+      when LG_IDLE   => y <= '0';
+      when LG_START  => y <= a;
+      when LG_RUN    => y <= '1';
+    end case;
+  end process;
+
+  large_fsm_seq: process(clk)
+  begin
+    if rising_edge(clk) then
+      lg_state <= LG_IDLE;
     end if;
   end process;
 end rtl;

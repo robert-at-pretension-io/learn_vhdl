@@ -42,6 +42,7 @@ begin
   p_ghost: process(in_p)
   begin
     ghost_signal <= in_p;
+    phantom_sig <= in_p;
   end process;
 end rtl;
 

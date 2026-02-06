@@ -50,3 +50,10 @@ func TestImpactExpansion(t *testing.T) {
 		t.Fatalf("unexpected dependents: %v", level)
 	}
 }
+
+func TestNormalizeUseTargetPkgAll(t *testing.T) {
+	got := normalizeUseTarget("P_SORTNET_TB.all", "test")
+	if got != "test.p_sortnet_tb" {
+		t.Fatalf("expected test.p_sortnet_tb, got %q", got)
+	}
+}

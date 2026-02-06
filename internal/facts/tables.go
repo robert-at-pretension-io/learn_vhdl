@@ -51,9 +51,10 @@ type ArchitectureRow struct {
 }
 
 type PackageRow struct {
-	Name string `json:"name"`
-	File string `json:"file"`
-	Line int    `json:"line"`
+	Name   string `json:"name"`
+	File   string `json:"file"`
+	Line   int    `json:"line"`
+	InArch string `json:"in_arch"`
 }
 
 type PortRow struct {
@@ -179,224 +180,231 @@ type SymbolRow struct {
 	Line int    `json:"line"`
 }
 
+// Builder incrementally builds fact tables without holding all FileFacts in memory.
+type Builder struct {
+	tables     Tables
+	fileLibs   map[string]config.FileLibraryInfo
+	thirdParty map[string]bool
+	seenFiles  map[string]bool
+}
+
+// NewBuilder creates a new fact table builder.
+func NewBuilder(fileLibs map[string]config.FileLibraryInfo, thirdParty map[string]bool) *Builder {
+	return &Builder{
+		tables:     emptyTables(),
+		fileLibs:   fileLibs,
+		thirdParty: thirdParty,
+		seenFiles:  make(map[string]bool),
+	}
+}
+
+// AppendFacts adds a FileFacts snapshot to the tables.
+func (b *Builder) AppendFacts(f extractor.FileFacts) {
+	if f.File == "" {
+		return
+	}
+	if !b.seenFiles[f.File] {
+		b.seenFiles[f.File] = true
+		libName := ""
+		if info, ok := b.fileLibs[f.File]; ok {
+			libName = info.LibraryName
+		}
+		b.tables.Files = append(b.tables.Files, FileRow{
+			Path:         f.File,
+			Library:      libName,
+			IsThirdParty: b.thirdParty[f.File],
+		})
+	}
+
+	for _, e := range f.Entities {
+		b.tables.Entities = append(b.tables.Entities, EntityRow{
+			Name: e.Name,
+			File: f.File,
+			Line: e.Line,
+		})
+	}
+
+	for _, a := range f.Architectures {
+		b.tables.Architectures = append(b.tables.Architectures, ArchitectureRow{
+			Name:       a.Name,
+			EntityName: a.EntityName,
+			File:       f.File,
+			Line:       a.Line,
+		})
+	}
+
+	for _, p := range f.Packages {
+		b.tables.Packages = append(b.tables.Packages, PackageRow{
+			Name:   p.Name,
+			File:   f.File,
+			Line:   p.Line,
+			InArch: p.InArch,
+		})
+	}
+
+	for _, p := range f.Ports {
+		b.tables.Ports = append(b.tables.Ports, PortRow{
+			Entity:    p.InEntity,
+			Name:      p.Name,
+			Direction: p.Direction,
+			Type:      p.Type,
+			File:      f.File,
+			Line:      p.Line,
+		})
+	}
+
+	for _, s := range f.Signals {
+		b.tables.Signals = append(b.tables.Signals, SignalRow{
+			Name:  s.Name,
+			Type:  s.Type,
+			File:  f.File,
+			Line:  s.Line,
+			Scope: s.InEntity,
+		})
+	}
+
+	for _, inst := range f.Instances {
+		b.tables.Instances = append(b.tables.Instances, InstanceRow{
+			Name:   inst.Name,
+			Target: inst.Target,
+			File:   f.File,
+			Line:   inst.Line,
+			InArch: inst.InArch,
+		})
+	}
+
+	for _, dep := range f.Dependencies {
+		b.tables.Dependencies = append(b.tables.Dependencies, DependencyRow{
+			File:   f.File,
+			Target: dep.Target,
+			Kind:   dep.Kind,
+			Line:   dep.Line,
+		})
+	}
+
+	for _, use := range f.UseClauses {
+		for _, item := range use.Items {
+			b.tables.UseClauses = append(b.tables.UseClauses, UseClauseRow{
+				File: f.File,
+				Item: item,
+				Line: use.Line,
+			})
+		}
+	}
+
+	for _, lib := range f.LibraryClauses {
+		for _, name := range lib.Libraries {
+			b.tables.LibraryClauses = append(b.tables.LibraryClauses, LibraryClauseRow{
+				File:    f.File,
+				Library: name,
+				Line:    lib.Line,
+			})
+		}
+	}
+
+	for _, ctx := range f.ContextClauses {
+		b.tables.ContextClauses = append(b.tables.ContextClauses, ContextClauseRow{
+			File: f.File,
+			Name: ctx.Name,
+			Line: ctx.Line,
+		})
+	}
+
+	for _, proc := range f.Processes {
+		b.tables.Processes = append(b.tables.Processes, ProcessRow{
+			Label:        proc.Label,
+			File:         f.File,
+			Line:         proc.Line,
+			InArch:       proc.InArch,
+			IsSequential: proc.IsSequential,
+			IsComb:       proc.IsCombinational,
+		})
+	}
+
+	for _, gen := range f.Generates {
+		b.tables.Generates = append(b.tables.Generates, GenerateRow{
+			Label:   gen.Label,
+			Kind:    gen.Kind,
+			File:    f.File,
+			Line:    gen.Line,
+			InArch:  gen.InArch,
+			CanElab: gen.CanElaborate,
+		})
+	}
+
+	for _, t := range f.Types {
+		b.tables.Types = append(b.tables.Types, TypeRow{
+			Name:      t.Name,
+			Kind:      t.Kind,
+			File:      f.File,
+			Line:      t.Line,
+			InPackage: t.InPackage,
+			InArch:    t.InArch,
+		})
+	}
+
+	for _, st := range f.Subtypes {
+		b.tables.Subtypes = append(b.tables.Subtypes, SubtypeRow{
+			Name:      st.Name,
+			BaseType:  st.BaseType,
+			File:      f.File,
+			Line:      st.Line,
+			InPackage: st.InPackage,
+			InArch:    st.InArch,
+		})
+	}
+
+	for _, fn := range f.Functions {
+		b.tables.Functions = append(b.tables.Functions, FunctionRow{
+			Name:       fn.Name,
+			ReturnType: fn.ReturnType,
+			File:       f.File,
+			Line:       fn.Line,
+			InPackage:  fn.InPackage,
+			InArch:     fn.InArch,
+			IsPure:     fn.IsPure,
+			HasBody:    fn.HasBody,
+		})
+	}
+
+	for _, pr := range f.Procedures {
+		b.tables.Procedures = append(b.tables.Procedures, ProcedureRow{
+			Name:      pr.Name,
+			File:      f.File,
+			Line:      pr.Line,
+			InPackage: pr.InPackage,
+			InArch:    pr.InArch,
+			HasBody:   pr.HasBody,
+		})
+	}
+
+	for _, c := range f.ConstantDecls {
+		b.tables.Constants = append(b.tables.Constants, ConstantRow{
+			Name:      c.Name,
+			Type:      c.Type,
+			Value:     c.Value,
+			File:      f.File,
+			Line:      c.Line,
+			InPackage: c.InPackage,
+			InArch:    c.InArch,
+		})
+	}
+}
+
+// Finalize returns the constructed tables with optional symbol rows.
+func (b *Builder) Finalize(symbols []SymbolRow) Tables {
+	if len(symbols) > 0 {
+		b.tables.Symbols = append(b.tables.Symbols, symbols...)
+	}
+	sort.Slice(b.tables.Files, func(i, j int) bool { return b.tables.Files[i].Path < b.tables.Files[j].Path })
+	return b.tables
+}
+
 // BuildTables converts extractor FileFacts into a normalized relational model.
 func BuildTables(facts []extractor.FileFacts, fileLibs map[string]config.FileLibraryInfo, thirdParty map[string]bool, symbols []SymbolRow) Tables {
-	tables := Tables{
-		Files:          []FileRow{},
-		Entities:       []EntityRow{},
-		Architectures:  []ArchitectureRow{},
-		Packages:       []PackageRow{},
-		Ports:          []PortRow{},
-		Signals:        []SignalRow{},
-		Instances:      []InstanceRow{},
-		Dependencies:   []DependencyRow{},
-		UseClauses:     []UseClauseRow{},
-		LibraryClauses: []LibraryClauseRow{},
-		ContextClauses: []ContextClauseRow{},
-		Processes:      []ProcessRow{},
-		Generates:      []GenerateRow{},
-		Types:          []TypeRow{},
-		Subtypes:       []SubtypeRow{},
-		Functions:      []FunctionRow{},
-		Procedures:     []ProcedureRow{},
-		Constants:      []ConstantRow{},
-		Symbols:        []SymbolRow{},
-	}
-
-	seenFiles := make(map[string]bool)
+	builder := NewBuilder(fileLibs, thirdParty)
 	for _, f := range facts {
-		if !seenFiles[f.File] {
-			seenFiles[f.File] = true
-			libName := ""
-			if info, ok := fileLibs[f.File]; ok {
-				libName = info.LibraryName
-			}
-			tables.Files = append(tables.Files, FileRow{
-				Path:         f.File,
-				Library:      libName,
-				IsThirdParty: thirdParty[f.File],
-			})
-		}
-
-		for _, e := range f.Entities {
-			tables.Entities = append(tables.Entities, EntityRow{
-				Name: e.Name,
-				File: f.File,
-				Line: e.Line,
-			})
-		}
-
-		for _, a := range f.Architectures {
-			tables.Architectures = append(tables.Architectures, ArchitectureRow{
-				Name:       a.Name,
-				EntityName: a.EntityName,
-				File:       f.File,
-				Line:       a.Line,
-			})
-		}
-
-		for _, p := range f.Packages {
-			tables.Packages = append(tables.Packages, PackageRow{
-				Name: p.Name,
-				File: f.File,
-				Line: p.Line,
-			})
-		}
-
-		for _, p := range f.Ports {
-			tables.Ports = append(tables.Ports, PortRow{
-				Entity:    p.InEntity,
-				Name:      p.Name,
-				Direction: p.Direction,
-				Type:      p.Type,
-				File:      f.File,
-				Line:      p.Line,
-			})
-		}
-
-		for _, s := range f.Signals {
-			tables.Signals = append(tables.Signals, SignalRow{
-				Name:  s.Name,
-				Type:  s.Type,
-				File:  f.File,
-				Line:  s.Line,
-				Scope: s.InEntity,
-			})
-		}
-
-		for _, inst := range f.Instances {
-			tables.Instances = append(tables.Instances, InstanceRow{
-				Name:   inst.Name,
-				Target: inst.Target,
-				File:   f.File,
-				Line:   inst.Line,
-				InArch: inst.InArch,
-			})
-		}
-
-		for _, dep := range f.Dependencies {
-			tables.Dependencies = append(tables.Dependencies, DependencyRow{
-				File:   f.File,
-				Target: dep.Target,
-				Kind:   dep.Kind,
-				Line:   dep.Line,
-			})
-		}
-
-		for _, use := range f.UseClauses {
-			for _, item := range use.Items {
-				tables.UseClauses = append(tables.UseClauses, UseClauseRow{
-					File: f.File,
-					Item: item,
-					Line: use.Line,
-				})
-			}
-		}
-
-		for _, lib := range f.LibraryClauses {
-			for _, name := range lib.Libraries {
-				tables.LibraryClauses = append(tables.LibraryClauses, LibraryClauseRow{
-					File:    f.File,
-					Library: name,
-					Line:    lib.Line,
-				})
-			}
-		}
-
-		for _, ctx := range f.ContextClauses {
-			tables.ContextClauses = append(tables.ContextClauses, ContextClauseRow{
-				File: f.File,
-				Name: ctx.Name,
-				Line: ctx.Line,
-			})
-		}
-
-		for _, proc := range f.Processes {
-			tables.Processes = append(tables.Processes, ProcessRow{
-				Label:        proc.Label,
-				File:         f.File,
-				Line:         proc.Line,
-				InArch:       proc.InArch,
-				IsSequential: proc.IsSequential,
-				IsComb:       proc.IsCombinational,
-			})
-		}
-
-		for _, gen := range f.Generates {
-			tables.Generates = append(tables.Generates, GenerateRow{
-				Label:   gen.Label,
-				Kind:    gen.Kind,
-				File:    f.File,
-				Line:    gen.Line,
-				InArch:  gen.InArch,
-				CanElab: gen.CanElaborate,
-			})
-		}
-
-		for _, t := range f.Types {
-			tables.Types = append(tables.Types, TypeRow{
-				Name:      t.Name,
-				Kind:      t.Kind,
-				File:      f.File,
-				Line:      t.Line,
-				InPackage: t.InPackage,
-				InArch:    t.InArch,
-			})
-		}
-
-		for _, st := range f.Subtypes {
-			tables.Subtypes = append(tables.Subtypes, SubtypeRow{
-				Name:      st.Name,
-				BaseType:  st.BaseType,
-				File:      f.File,
-				Line:      st.Line,
-				InPackage: st.InPackage,
-				InArch:    st.InArch,
-			})
-		}
-
-		for _, fn := range f.Functions {
-			tables.Functions = append(tables.Functions, FunctionRow{
-				Name:       fn.Name,
-				ReturnType: fn.ReturnType,
-				File:       f.File,
-				Line:       fn.Line,
-				InPackage:  fn.InPackage,
-				InArch:     fn.InArch,
-				IsPure:     fn.IsPure,
-				HasBody:    fn.HasBody,
-			})
-		}
-
-		for _, pr := range f.Procedures {
-			tables.Procedures = append(tables.Procedures, ProcedureRow{
-				Name:      pr.Name,
-				File:      f.File,
-				Line:      pr.Line,
-				InPackage: pr.InPackage,
-				InArch:    pr.InArch,
-				HasBody:   pr.HasBody,
-			})
-		}
-
-		for _, c := range f.ConstantDecls {
-			tables.Constants = append(tables.Constants, ConstantRow{
-				Name:      c.Name,
-				Type:      c.Type,
-				Value:     c.Value,
-				File:      f.File,
-				Line:      c.Line,
-				InPackage: c.InPackage,
-				InArch:    c.InArch,
-			})
-		}
+		builder.AppendFacts(f)
 	}
-
-	if len(symbols) > 0 {
-		tables.Symbols = append(tables.Symbols, symbols...)
-	}
-
-	sort.Slice(tables.Files, func(i, j int) bool { return tables.Files[i].Path < tables.Files[j].Path })
-
-	return tables
+	return builder.Finalize(symbols)
 }

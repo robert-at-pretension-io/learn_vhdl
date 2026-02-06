@@ -20,6 +20,7 @@ pub fn optional_violations(input: &Input) -> Vec<Violation> {
     out.extend(many_instances(input));
     out.extend(hardcoded_port_value(input));
     out.extend(open_port_connection(input));
+    out.extend(port_type_mismatch_style(input));
     out
 }
 
@@ -460,6 +461,73 @@ fn indexed_width(actual: &str, base_width: usize) -> Option<usize> {
     Some(1)
 }
 
+fn port_type_mismatch_style(input: &Input) -> Vec<Violation> {
+    let mut out = Vec::new();
+    for inst in &input.instances {
+        let target_lower = inst.target.to_ascii_lowercase();
+        for entity in &input.entities {
+            if !target_matches_entity(&target_lower, &entity.name.to_ascii_lowercase()) {
+                continue;
+            }
+            for port in &entity.ports {
+                if port.r#type.is_empty() {
+                    continue;
+                }
+                let actual = match inst
+                    .port_map
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(&port.name))
+                {
+                    Some((_, v)) => v.clone(),
+                    None => continue,
+                };
+                if actual.is_empty() || actual.eq_ignore_ascii_case("open") {
+                    continue;
+                }
+                if actual.starts_with('\'') || actual.starts_with('"') {
+                    continue;
+                }
+                let signal_type = get_signal_type_for_mismatch(input, &actual);
+                if signal_type.is_empty() {
+                    continue;
+                }
+                let port_base = helpers::base_type_name(&port.r#type);
+                let sig_base = helpers::base_type_name(&signal_type);
+                if port_base.is_empty() || sig_base.is_empty() {
+                    continue;
+                }
+                if !port_base.eq_ignore_ascii_case(&sig_base) {
+                    out.push(Violation {
+                        rule: "port_type_mismatch_style".to_string(),
+                        severity: "warning".to_string(),
+                        file: inst.file.clone(),
+                        line: inst.line,
+                        message: format!(
+                            "Type mismatch style: signal '{}' ({}) connected to port '{}' ({}) in instance '{}'",
+                            actual, signal_type, port.name, port.r#type, inst.name
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+fn get_signal_type_for_mismatch(input: &Input, name: &str) -> String {
+    for sig in &input.signals {
+        if sig.name.eq_ignore_ascii_case(name) {
+            return sig.r#type.clone();
+        }
+    }
+    for port in &input.ports {
+        if port.name.eq_ignore_ascii_case(name) {
+            return port.r#type.clone();
+        }
+    }
+    String::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,6 +659,98 @@ mod tests {
         });
 
         let v = port_width_mismatch(&input);
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn port_type_mismatch_style_flags_different_base_types() {
+        let mut input = Input::default();
+        let mut entity = Entity::default();
+        entity.name = "child".to_string();
+        entity.ports.push(Port {
+            name: "data_i".to_string(),
+            direction: "in".to_string(),
+            r#type: "std_logic".to_string(),
+            ..Default::default()
+        });
+        input.entities.push(entity);
+
+        let mut inst = Instance::default();
+        inst.name = "u1".to_string();
+        inst.target = "work.child".to_string();
+        inst.file = "a.vhd".to_string();
+        inst.line = 10;
+        inst.port_map
+            .insert("data_i".to_string(), "my_sig".to_string());
+        input.instances.push(inst);
+
+        input.signals.push(Signal {
+            name: "my_sig".to_string(),
+            r#type: "std_ulogic".to_string(),
+            ..Default::default()
+        });
+
+        let v = port_type_mismatch_style(&input);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].rule, "port_type_mismatch_style");
+        assert!(v[0].message.contains("my_sig"));
+    }
+
+    #[test]
+    fn port_type_mismatch_style_ignores_matching_types() {
+        let mut input = Input::default();
+        let mut entity = Entity::default();
+        entity.name = "child".to_string();
+        entity.ports.push(Port {
+            name: "data_i".to_string(),
+            direction: "in".to_string(),
+            r#type: "std_logic".to_string(),
+            ..Default::default()
+        });
+        input.entities.push(entity);
+
+        let mut inst = Instance::default();
+        inst.name = "u1".to_string();
+        inst.target = "work.child".to_string();
+        inst.file = "a.vhd".to_string();
+        inst.line = 10;
+        inst.port_map
+            .insert("data_i".to_string(), "my_sig".to_string());
+        input.instances.push(inst);
+
+        input.signals.push(Signal {
+            name: "my_sig".to_string(),
+            r#type: "std_logic".to_string(),
+            ..Default::default()
+        });
+
+        let v = port_type_mismatch_style(&input);
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn port_type_mismatch_style_skips_literals() {
+        let mut input = Input::default();
+        let mut entity = Entity::default();
+        entity.name = "child".to_string();
+        entity.ports.push(Port {
+            name: "data_i".to_string(),
+            direction: "in".to_string(),
+            r#type: "std_logic".to_string(),
+            ..Default::default()
+        });
+        input.entities.push(entity);
+
+        let mut inst = Instance::default();
+        inst.name = "u1".to_string();
+        inst.target = "work.child".to_string();
+        inst.file = "a.vhd".to_string();
+        inst.line = 10;
+        inst.port_map
+            .insert("data_i".to_string(), "'1'".to_string());
+        input.instances.push(inst);
+
+        let v = port_type_mismatch_style(&input);
         assert!(v.is_empty());
     }
 }

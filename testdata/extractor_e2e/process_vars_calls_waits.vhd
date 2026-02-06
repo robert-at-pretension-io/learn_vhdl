@@ -1,5 +1,18 @@
 library ieee;
 use ieee.std_logic_1164.all;
+library std;
+use std.env.all;
+
+package p is
+  function match(x : std_logic) return boolean;
+end;
+
+package body p is
+  function match(x : std_logic) return boolean is
+  begin
+    return x = '1';
+  end function;
+end;
 
 entity call_top is
   port(
@@ -20,6 +33,11 @@ architecture rtl of call_top is
     return x;
   end function;
 
+  procedure affirm(cond : in boolean) is
+  begin
+    null;
+  end procedure;
+
 begin
   p_call : process
     variable v : integer;
@@ -27,6 +45,8 @@ begin
     wait until rising_edge(clk);
     v := 1;
     poke(a);
+    affirm(p.match(a));
+    std.env.stop;
     y <= f(a);
   end process;
 end;

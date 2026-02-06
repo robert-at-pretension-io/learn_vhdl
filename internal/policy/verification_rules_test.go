@@ -32,3 +32,29 @@ func TestInvalidVerificationTagMissingBinding(t *testing.T) {
 		t.Fatalf("expected invalid_verification_tag violation, got rules: %v", collectRules(result))
 	}
 }
+
+func TestStrayVerificationTag(t *testing.T) {
+	repoRoot := findRepoRoot(t)
+	fixture := filepath.Join(repoRoot, "testdata", "verification", "stray_verification_tag.vhd")
+
+	result := lintFile(t, repoRoot, fixture, map[string]string{
+		"stray_verification_tag": "warning",
+	})
+
+	if !hasRule(result, "stray_verification_tag") {
+		t.Fatalf("expected stray_verification_tag violation, got rules: %v", collectRules(result))
+	}
+}
+
+func TestVerificationScopeMismatch(t *testing.T) {
+	repoRoot := findRepoRoot(t)
+	fixture := filepath.Join(repoRoot, "testdata", "verification", "scope_mismatch.vhd")
+
+	result := lintFile(t, repoRoot, fixture, map[string]string{
+		"scope_mismatch": "warning",
+	})
+
+	if !hasRule(result, "scope_mismatch") {
+		t.Fatalf("expected scope_mismatch violation, got rules: %v", collectRules(result))
+	}
+}

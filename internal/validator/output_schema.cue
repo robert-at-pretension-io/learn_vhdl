@@ -14,6 +14,7 @@ package schema
     violations:   [...#Violation]
     missing_checks: [...#MissingCheck] | *[]
     ambiguous_constructs: [...#AmbiguousConstruct] | *[]
+    waivers:      [...#Waiver] | *[]
     summary:      #Summary
     stats:        #Stats
     files:        [...#FileResult]
@@ -89,4 +90,16 @@ package schema
     file:       string & =~".+\\.(vhd|vhdl)$"
     line:       int & >=1
     candidates: {[string]: [...string]}
+}
+
+// Waiver records suppression of a verification rule in a scope.
+#Waiver: {
+    id:      string & !=""
+    scope:   string & =~"^(arch|entity):.+$"
+    reason:  string & !=""
+    owner:   string | *""
+    expires: string | *""
+    file:    string & =~".+\\.(vhd|vhdl)$"
+    line:    int & >=1
+    raw:     string
 }

@@ -3,6 +3,8 @@ use crate::policy::clocks_resets;
 use crate::policy::combinational;
 use crate::policy::configurations;
 use crate::policy::core;
+use crate::policy::cross_file;
+use crate::policy::dead_code;
 use crate::policy::fsm;
 use crate::policy::helpers;
 use crate::policy::hierarchy;
@@ -25,6 +27,7 @@ use crate::policy::subprograms;
 use crate::policy::synthesis;
 use crate::policy::testbench;
 use crate::policy::types;
+use crate::policy::variables;
 use crate::policy::verification;
 use std::time::{Duration, Instant};
 
@@ -43,6 +46,13 @@ pub fn evaluate(input: &Input) -> Result {
         &mut timings,
         core::violations,
     ));
+    raw.extend(collect_timed(
+        "core_optional",
+        input,
+        timing_enabled,
+        &mut timings,
+        core::optional_violations,
+    ));
     let verification_analysis = if timing_enabled {
         let start = Instant::now();
         let analysis = verification::analyze(input);
@@ -59,6 +69,7 @@ pub fn evaluate(input: &Input) -> Result {
     raw.extend(verification_analysis.violations);
     let missing_checks = verification_analysis.missing_checks;
     let ambiguous_constructs = verification_analysis.ambiguous_constructs;
+    let waivers = verification_analysis.waivers;
     raw.extend(collect_timed(
         "cdc",
         input,
@@ -116,11 +127,25 @@ pub fn evaluate(input: &Input) -> Result {
         hierarchy::violations,
     ));
     raw.extend(collect_timed(
+        "cross_file",
+        input,
+        timing_enabled,
+        &mut timings,
+        cross_file::violations,
+    ));
+    raw.extend(collect_timed(
         "instances",
         input,
         timing_enabled,
         &mut timings,
         instances::violations,
+    ));
+    raw.extend(collect_timed(
+        "instances_optional",
+        input,
+        timing_enabled,
+        &mut timings,
+        instances::optional_violations,
     ));
     raw.extend(collect_timed(
         "latch",
@@ -163,6 +188,13 @@ pub fn evaluate(input: &Input) -> Result {
         timing_enabled,
         &mut timings,
         processes::violations,
+    ));
+    raw.extend(collect_timed(
+        "processes_optional",
+        input,
+        timing_enabled,
+        &mut timings,
+        processes::optional_violations,
     ));
     raw.extend(collect_timed(
         "power",
@@ -240,6 +272,13 @@ pub fn evaluate(input: &Input) -> Result {
         timing_enabled,
         &mut timings,
         subprograms::violations,
+    ));
+    raw.extend(collect_timed(
+        "subprograms_optional",
+        input,
+        timing_enabled,
+        &mut timings,
+        subprograms::optional_violations,
     ));
     raw.extend(collect_timed(
         "synthesis",
@@ -347,6 +386,20 @@ pub fn evaluate(input: &Input) -> Result {
         &mut timings,
         synthesis::optional_violations,
     ));
+    raw.extend(collect_timed(
+        "dead_code_optional",
+        input,
+        timing_enabled,
+        &mut timings,
+        dead_code::optional_violations,
+    ));
+    raw.extend(collect_timed(
+        "variables_optional",
+        input,
+        timing_enabled,
+        &mut timings,
+        variables::optional_violations,
+    ));
 
     let filtered = filter_violations(input, raw);
     let filtered_missing_checks = filter_missing_checks(input, missing_checks);
@@ -359,6 +412,7 @@ pub fn evaluate(input: &Input) -> Result {
         violations: filtered,
         missing_checks: filtered_missing_checks,
         ambiguous_constructs: filtered_ambiguous,
+        waivers,
     }
 }
 
@@ -400,10 +454,7 @@ fn is_valid_severity(sev: &str) -> bool {
     matches!(sev, "error" | "warning" | "info")
 }
 
-fn filter_missing_checks(
-    input: &Input,
-    tasks: Vec<MissingCheckTask>,
-) -> Vec<MissingCheckTask> {
+fn filter_missing_checks(input: &Input, tasks: Vec<MissingCheckTask>) -> Vec<MissingCheckTask> {
     if helpers::rule_is_disabled(input, "missing_verification_check") {
         return Vec::new();
     }

@@ -3,6 +3,12 @@
     "id": "fsm.legal_state",
     "scope_type": "arch",
     "required_bindings": ["state"],
+    "binding_kinds": {
+      "state": ["signal"]
+    },
+    "binding_types": {
+      "state": "enum"
+    },
     "needs_cover": true,
     "severity": "violation"
   },
@@ -10,6 +16,12 @@
     "id": "fsm.reset_known",
     "scope_type": "arch",
     "required_bindings": ["state"],
+    "binding_kinds": {
+      "state": ["signal"]
+    },
+    "binding_types": {
+      "state": "enum"
+    },
     "needs_cover": false,
     "severity": "violation"
   },
@@ -17,6 +29,12 @@
     "id": "cover.fsm.transition_taken",
     "scope_type": "arch",
     "required_bindings": ["state"],
+    "binding_kinds": {
+      "state": ["signal"]
+    },
+    "binding_types": {
+      "state": "enum"
+    },
     "needs_cover": false,
     "severity": "violation"
   },
@@ -24,6 +42,14 @@
     "id": "rv.stable_while_stalled",
     "scope_type": "arch",
     "required_bindings": ["valid", "ready"],
+    "binding_kinds": {
+      "valid": ["signal", "port"],
+      "ready": ["signal", "port"]
+    },
+    "binding_types": {
+      "valid": "bit",
+      "ready": "bit"
+    },
     "needs_cover": true,
     "severity": "violation"
   },
@@ -31,6 +57,14 @@
     "id": "rv.eventual_progress_bounded",
     "scope_type": "arch",
     "required_bindings": ["valid", "ready"],
+    "binding_kinds": {
+      "valid": ["signal", "port"],
+      "ready": ["signal", "port"]
+    },
+    "binding_types": {
+      "valid": "bit",
+      "ready": "bit"
+    },
     "needs_cover": false,
     "severity": "violation",
     "requires_bound": true
@@ -39,6 +73,14 @@
     "id": "cover.rv.handshake",
     "scope_type": "arch",
     "required_bindings": ["valid", "ready"],
+    "binding_kinds": {
+      "valid": ["signal", "port"],
+      "ready": ["signal", "port"]
+    },
+    "binding_types": {
+      "valid": "bit",
+      "ready": "bit"
+    },
     "needs_cover": false,
     "severity": "violation"
   },
@@ -46,6 +88,14 @@
     "id": "fifo.no_read_empty",
     "scope_type": "arch",
     "required_bindings": ["rd_en", "empty"],
+    "binding_kinds": {
+      "rd_en": ["signal", "port"],
+      "empty": ["signal", "port"]
+    },
+    "binding_types": {
+      "rd_en": "bit",
+      "empty": "bit"
+    },
     "needs_cover": true,
     "severity": "violation"
   },
@@ -53,6 +103,14 @@
     "id": "fifo.no_write_full",
     "scope_type": "arch",
     "required_bindings": ["wr_en", "full"],
+    "binding_kinds": {
+      "wr_en": ["signal", "port"],
+      "full": ["signal", "port"]
+    },
+    "binding_types": {
+      "wr_en": "bit",
+      "full": "bit"
+    },
     "needs_cover": false,
     "severity": "violation"
   },
@@ -60,6 +118,14 @@
     "id": "cover.fifo.activity",
     "scope_type": "arch",
     "required_bindings": ["rd_en", "wr_en"],
+    "binding_kinds": {
+      "rd_en": ["signal", "port"],
+      "wr_en": ["signal", "port"]
+    },
+    "binding_types": {
+      "rd_en": "bit",
+      "wr_en": "bit"
+    },
     "needs_cover": false,
     "severity": "violation"
   },
@@ -67,6 +133,12 @@
     "id": "ctr.range",
     "scope_type": "arch",
     "required_bindings": ["counter"],
+    "binding_kinds": {
+      "counter": ["signal"]
+    },
+    "binding_types": {
+      "counter": "numeric"
+    },
     "needs_cover": true,
     "severity": "violation"
   },
@@ -74,6 +146,12 @@
     "id": "ctr.step_rule",
     "scope_type": "arch",
     "required_bindings": ["counter"],
+    "binding_kinds": {
+      "counter": ["signal"]
+    },
+    "binding_types": {
+      "counter": "numeric"
+    },
     "needs_cover": false,
     "severity": "violation"
   },
@@ -81,6 +159,89 @@
     "id": "cover.ctr.moved",
     "scope_type": "arch",
     "required_bindings": ["counter"],
+    "binding_kinds": {
+      "counter": ["signal"]
+    },
+    "binding_types": {
+      "counter": "numeric"
+    },
+    "needs_cover": false,
+    "severity": "violation"
+  },
+  {
+    "id": "reset.no_unknown_after_grace",
+    "scope_type": "arch",
+    "required_bindings": ["signals"],
+    "binding_kinds": {
+      "signals": ["signal", "port"]
+    },
+    "needs_cover": false,
+    "severity": "violation"
+  },
+  {
+    "id": "reset.asserted_implies_known_defaults",
+    "scope_type": "arch",
+    "required_bindings": ["signals"],
+    "binding_kinds": {
+      "signals": ["signal", "port"]
+    },
+    "needs_cover": false,
+    "severity": "violation"
+  },
+  {
+    "id": "pulse.width_one_cycle",
+    "scope_type": "arch",
+    "required_bindings": ["pulse"],
+    "binding_kinds": {
+      "pulse": ["signal", "port"]
+    },
+    "binding_types": {
+      "pulse": "bit"
+    },
+    "needs_cover": true,
+    "severity": "violation"
+  },
+  {
+    "id": "cover.pulse.fired",
+    "scope_type": "arch",
+    "required_bindings": ["pulse"],
+    "binding_kinds": {
+      "pulse": ["signal", "port"]
+    },
+    "binding_types": {
+      "pulse": "bit"
+    },
+    "needs_cover": false,
+    "severity": "violation"
+  },
+  {
+    "id": "arb.onehot0",
+    "scope_type": "arch",
+    "required_bindings": ["grants"],
+    "binding_kinds": {
+      "grants": ["signal", "port"]
+    },
+    "needs_cover": true,
+    "severity": "violation"
+  },
+  {
+    "id": "arb.no_grant_without_req",
+    "scope_type": "arch",
+    "required_bindings": ["grants", "reqs"],
+    "binding_kinds": {
+      "grants": ["signal", "port"],
+      "reqs": ["signal", "port"]
+    },
+    "needs_cover": false,
+    "severity": "violation"
+  },
+  {
+    "id": "cover.arb.grant_seen",
+    "scope_type": "arch",
+    "required_bindings": ["grants"],
+    "binding_kinds": {
+      "grants": ["signal", "port"]
+    },
     "needs_cover": false,
     "severity": "violation"
   }

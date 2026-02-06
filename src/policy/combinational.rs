@@ -20,6 +20,7 @@ pub fn optional_violations(input: &Input) -> Vec<Violation> {
     out.extend(vhdl2008_sensitivity_all(input));
     out.extend(long_sensitivity_list(input));
     out.extend(potential_comb_loop(input));
+    out.extend(redundant_others_only(input));
     out
 }
 
@@ -175,7 +176,10 @@ fn two_stage_loop(input: &Input) -> Vec<Violation> {
     let deps = filtered_combinational_deps(input);
     let mut edges: HashMap<(String, String), Vec<&SignalDep>> = HashMap::new();
     for dep in &deps {
-        let key = (dep.source.to_ascii_lowercase(), dep.target.to_ascii_lowercase());
+        let key = (
+            dep.source.to_ascii_lowercase(),
+            dep.target.to_ascii_lowercase(),
+        );
         edges.entry(key).or_default().push(*dep);
     }
 
@@ -295,6 +299,30 @@ fn potential_comb_loop(input: &Input) -> Vec<Violation> {
     out
 }
 
+fn redundant_others_only(input: &Input) -> Vec<Violation> {
+    input
+        .case_statements
+        .iter()
+        .filter(|cs| {
+            cs.has_others
+                && cs
+                    .choices
+                    .iter()
+                    .all(|c| c.eq_ignore_ascii_case("others"))
+        })
+        .map(|cs| Violation {
+            rule: "redundant_others_only".to_string(),
+            severity: "info".to_string(),
+            file: cs.file.clone(),
+            line: cs.line,
+            message: format!(
+                "Case statement on '{}' has only 'when others =>' with no explicit alternatives",
+                cs.expression
+            ),
+        })
+        .collect()
+}
+
 fn is_loop_false_positive(sig: &str) -> bool {
     let lower = sig.to_ascii_lowercase();
     lower.contains("next") || lower.contains("state")
@@ -355,7 +383,9 @@ fn cross_process_loop(input: &Input) -> Vec<Violation> {
         if a >= b {
             continue;
         }
-        let Some(procs_ba) = pair_map.get(&(b.clone(), a.clone())) else { continue };
+        let Some(procs_ba) = pair_map.get(&(b.clone(), a.clone())) else {
+            continue;
+        };
         for proc1 in procs_ab {
             for proc2 in procs_ba {
                 if proc1.label == proc2.label {
@@ -413,7 +443,7 @@ fn filtered_combinational_deps(input: &Input) -> Vec<&SignalDep> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::input::{Entity, Input, Process, Signal, SignalDep};
+    use crate::policy::input::{CaseStatement, Entity, Input, Process, Signal, SignalDep};
 
     #[test]
     fn combinational_feedback_flags() {
@@ -479,6 +509,37 @@ mod tests {
             ..Default::default()
         });
         let v = direct_combinational_loop(&input);
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn redundant_others_only_flags() {
+        let mut input = Input::default();
+        input.case_statements.push(CaseStatement {
+            expression: "state".to_string(),
+            choices: vec![],
+            has_others: true,
+            file: "a.vhd".to_string(),
+            line: 10,
+            ..Default::default()
+        });
+        let v = redundant_others_only(&input);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].rule, "redundant_others_only");
+    }
+
+    #[test]
+    fn redundant_others_only_skips_with_choices() {
+        let mut input = Input::default();
+        input.case_statements.push(CaseStatement {
+            expression: "state".to_string(),
+            choices: vec!["IDLE".to_string()],
+            has_others: true,
+            file: "a.vhd".to_string(),
+            line: 10,
+            ..Default::default()
+        });
+        let v = redundant_others_only(&input);
         assert!(v.is_empty());
     }
 

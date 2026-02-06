@@ -1,0 +1,3 @@
+{
+  "rules": ["ambiguous_unqualified_call", "unresolved_unqualified_call"]
+}

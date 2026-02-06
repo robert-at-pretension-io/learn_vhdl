@@ -44,6 +44,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -62,10 +63,12 @@ type FileFacts struct {
 	Entities       []Entity
 	Architectures  []Architecture
 	Packages       []Package
+	PackageBodies  []PackageBody
 	Components     []Component
 	UseClauses     []UseClause
 	LibraryClauses []LibraryClause
 	ContextClauses []ContextClause
+	ContextDecls   []ContextDeclaration
 	Dependencies   []Dependency
 	Signals        []Signal
 	Ports          []Port
@@ -97,9 +100,26 @@ type FileFacts struct {
 	SignalDeps    []SignalDep    // Signal dependencies for loop detection
 	CDCCrossings  []CDCCrossing  // Clock domain crossing detection
 	// Verification contract
-	VerificationBlocks    []VerificationBlock
-	VerificationTags      []VerificationTag
-	VerificationTagErrors []VerificationTagError
+	VerificationBlocks       []VerificationBlock
+	VerificationTags         []VerificationTag
+	VerificationTagErrors    []VerificationTagError
+	VerificationWaivers      []VerificationWaiver
+	VerificationWaiverErrors []VerificationWaiverError
+	// Parse quality
+	ErrorNodeCount int            // Number of tree-sitter ERROR nodes (parse failures)
+	FallbackStats  map[string]int // Counts of fallback code paths taken during extraction
+}
+
+// incFallback increments a named fallback counter on FileFacts for observability.
+// If facts is nil the call is a no-op.
+func incFallback(facts *FileFacts, key string) {
+	if facts == nil {
+		return
+	}
+	if facts.FallbackStats == nil {
+		facts.FallbackStats = make(map[string]int)
+	}
+	facts.FallbackStats[key]++
 }
 
 // ClockDomain represents a clock and the signals it drives
@@ -140,16 +160,19 @@ type Process struct {
 	Line            int
 	InArch          string // Which architecture this process belongs to
 	// Semantic info
-	IsSequential    bool     // Has clock edge (rising_edge/falling_edge)
-	IsCombinational bool     // No clock edge and no wait statements
-	HasWait         bool     // Contains wait statements (not combinational)
-	ClockSignal     string   // Clock signal if sequential
-	ClockEdge       string   // "rising" or "falling"
-	HasReset        bool     // Has reset logic
-	ResetSignal     string   // Reset signal name
-	ResetAsync      bool     // Is reset asynchronous
-	AssignedSignals []string // Signals assigned in this process
-	ReadSignals     []string // Signals read in this process
+	IsSequential      bool     // Has clock edge (rising_edge/falling_edge)
+	IsCombinational   bool     // No clock edge and no wait statements
+	HasWait           bool     // Contains wait statements (not combinational)
+	ClockSignal       string   // Clock signal if sequential
+	ClockEdge         string   // "rising" or "falling"
+	HasReset          bool     // Has reset logic
+	ResetSignal       string   // Reset signal name
+	ResetAsync        bool     // Is reset asynchronous
+	ResetPolarity     string   // "active_high" or "active_low"
+	AssignedSignals   []string // Signals assigned in this process
+	ReadSignals       []string // Signals read in this process
+	AssignedVariables []string // Variables assigned in this process
+	ReadVariables     []string // Variables read in this process
 	// Additional structured details
 	Variables      []VariableDecl
 	ProcedureCalls []ProcedureCall
@@ -271,6 +294,14 @@ type Architecture struct {
 type Package struct {
 	Name string
 	Line int
+	// InArch indicates a local package declared inside an architecture
+	InArch string
+}
+
+// PackageBody represents a VHDL package body declaration
+type PackageBody struct {
+	Name string
+	Line int
 }
 
 // Component represents a component declaration or instantiation
@@ -288,6 +319,7 @@ type Component struct {
 type Instance struct {
 	Name       string            // Instance label (e.g., "u_cpu")
 	Target     string            // Target entity/component (e.g., "work.cpu")
+	TargetArch string            // Target architecture (if specified)
 	PortMap    map[string]string // Formal port -> actual signal mapping
 	GenericMap map[string]string // Formal generic -> actual value mapping
 	Line       int
@@ -364,6 +396,15 @@ type ContextClause struct {
 	Line int
 }
 
+// ContextDeclaration represents a VHDL context declaration
+type ContextDeclaration struct {
+	Name        string
+	Line        int
+	Libraries   []string
+	UseItems    []string
+	ContextRefs []string
+}
+
 // Association represents a port/generic association element
 type Association struct {
 	Kind          string // "port" or "generic"
@@ -431,6 +472,26 @@ type VerificationTag struct {
 
 // VerificationTagError represents a malformed tag line
 type VerificationTagError struct {
+	Line    int
+	Raw     string
+	Message string
+	InArch  string
+}
+
+// VerificationWaiver represents a parsed --@waive line inside a verification block
+type VerificationWaiver struct {
+	ID      string
+	Scope   string
+	Reason  string
+	Owner   string
+	Expires string
+	Line    int
+	Raw     string
+	InArch  string
+}
+
+// VerificationWaiverError represents a malformed waiver line
+type VerificationWaiverError struct {
 	Line    int
 	Raw     string
 	Message string
@@ -533,6 +594,7 @@ type ConstantDeclaration struct {
 type ConfigurationDeclaration struct {
 	Name       string
 	EntityName string
+	ArchName   string
 	Bindings   []ConfigurationBinding
 	Line       int
 }
@@ -577,9 +639,9 @@ func (e *Extractor) Extract(filePath string) (FileFacts, error) {
 		return facts, fmt.Errorf("reading file: %w", err)
 	}
 
-	// If no language set, use simple regex-based extraction as fallback
+	// Fail loudly if tree-sitter language is not loaded
 	if e.lang == nil {
-		return e.extractSimple(filePath, content)
+		return facts, fmt.Errorf("tree-sitter language not loaded: cannot extract facts from %s", filePath)
 	}
 
 	// Create a new parser for this extraction (thread-safe)
@@ -607,16 +669,33 @@ func (e *Extractor) Extract(filePath string) (FileFacts, error) {
 // context is the current architecture name (for scoping signals, processes, etc.)
 // We also need to track package context separately for type declarations
 func (e *Extractor) walkTree(node *sitter.Node, source []byte, facts *FileFacts, context string, declaredSignals map[string]bool) {
-	e.walkTreeWithPkg(node, source, facts, "", context, declaredSignals)
+	e.walkTreeWithPkg(node, source, facts, "", context, declaredSignals, 0)
 }
 
-// walkTreeWithPkg traverses with both package and architecture context
-func (e *Extractor) walkTreeWithPkg(node *sitter.Node, source []byte, facts *FileFacts, pkgContext, archContext string, declaredSignals map[string]bool) {
+// walkTreeWithPkg traverses with both package and architecture context.
+// depth tracks recursion depth; traversal stops at maxWalkDepth to prevent stack overflow.
+func (e *Extractor) walkTreeWithPkg(node *sitter.Node, source []byte, facts *FileFacts, pkgContext, archContext string, declaredSignals map[string]bool, depth int) {
 	if node == nil {
+		return
+	}
+	const maxWalkDepth = 150
+	if depth > maxWalkDepth {
 		return
 	}
 
 	nodeType := node.Type()
+
+	// Count parse errors — ERROR nodes indicate grammar gaps or malformed input.
+	// Still recurse into children: tree-sitter's error recovery often produces
+	// valid subtrees (e.g. a process_statement inside an ERROR region) that we
+	// can extract useful facts from.
+	if nodeType == "ERROR" {
+		facts.ErrorNodeCount++
+		for i := 0; i < int(node.ChildCount()); i++ {
+			e.walkTreeWithPkg(node.Child(i), source, facts, pkgContext, archContext, declaredSignals, depth+1)
+		}
+		return
+	}
 
 	switch nodeType {
 	case "entity_declaration":
@@ -629,12 +708,26 @@ func (e *Extractor) walkTreeWithPkg(node *sitter.Node, source []byte, facts *Fil
 	case "architecture_body":
 		arch := e.extractArchitecture(node, source)
 		facts.Architectures = append(facts.Architectures, arch)
-		archContext = arch.Name
+		// Scope declaredSignals per architecture: copy the current map (which
+		// includes entity ports) so that signals declared in this architecture
+		// don't leak into subsequent architectures in the same file.
+		archSignals := make(map[string]bool, len(declaredSignals))
+		for k, v := range declaredSignals {
+			archSignals[k] = v
+		}
+		for i := 0; i < int(node.ChildCount()); i++ {
+			e.walkTreeWithPkg(node.Child(i), source, facts, pkgContext, arch.Name, archSignals, depth+1)
+		}
+		return
 
 	case "package_declaration":
 		pkg := e.extractPackage(node, source)
+		pkg.InArch = archContext
 		facts.Packages = append(facts.Packages, pkg)
 		pkgContext = pkg.Name
+	case "package_body":
+		body := e.extractPackageBody(node, source)
+		facts.PackageBodies = append(facts.PackageBodies, body)
 	case "configuration_declaration":
 		cfg := e.extractConfigurationDeclaration(node, source)
 		facts.Configurations = append(facts.Configurations, cfg)
@@ -660,8 +753,11 @@ func (e *Extractor) walkTreeWithPkg(node *sitter.Node, source []byte, facts *Fil
 		}
 
 	case "use_clause":
-		dep := e.extractUseClause(node, source, facts.File)
-		facts.Dependencies = append(facts.Dependencies, dep)
+		for _, dep := range e.extractUseClause(node, source, facts.File) {
+			if dep.Target != "" {
+				facts.Dependencies = append(facts.Dependencies, dep)
+			}
+		}
 		items := e.extractUseClauseItems(node, source)
 		if len(items) > 0 {
 			facts.UseClauses = append(facts.UseClauses, UseClause{
@@ -671,9 +767,10 @@ func (e *Extractor) walkTreeWithPkg(node *sitter.Node, source []byte, facts *Fil
 		}
 
 	case "library_clause":
-		dep := e.extractLibraryClause(node, source, facts.File)
-		if dep.Target != "" {
-			facts.Dependencies = append(facts.Dependencies, dep)
+		for _, dep := range e.extractLibraryClause(node, source, facts.File) {
+			if dep.Target != "" {
+				facts.Dependencies = append(facts.Dependencies, dep)
+			}
 		}
 		libraries := e.extractLibraryClauseItems(node, source)
 		if len(libraries) > 0 {
@@ -693,10 +790,25 @@ func (e *Extractor) walkTreeWithPkg(node *sitter.Node, source []byte, facts *Fil
 				Line: dep.Line,
 			})
 		}
+	case "context_declaration":
+		decl := e.extractContextDeclaration(node, source)
+		if decl.Name != "" {
+			facts.ContextDecls = append(facts.ContextDecls, decl)
+		}
 	case "package_instantiation":
 		dep := e.extractPackageInstantiation(node, source, facts.File)
 		if dep.Target != "" {
 			facts.Dependencies = append(facts.Dependencies, dep)
+		}
+		if nameNode := node.ChildByFieldName("name"); nameNode != nil {
+			name := strings.TrimSpace(nameNode.Content(source))
+			if name != "" {
+				facts.Packages = append(facts.Packages, Package{
+					Name:   name,
+					Line:   int(node.StartPoint().Row) + 1,
+					InArch: archContext,
+				})
+			}
 		}
 	case "configuration_specification":
 		dep := e.extractConfigurationSpecification(node, source, facts.File)
@@ -798,6 +910,25 @@ func (e *Extractor) walkTreeWithPkg(node *sitter.Node, source []byte, facts *Fil
 		pd := e.extractProcedureDeclaration(node, source, pkgContext, archContext)
 		facts.Procedures = append(facts.Procedures, pd)
 
+	case "alias_declaration":
+		// Extract subprogram aliases (function/procedure)
+		if fd, pd := e.extractAliasDeclaration(node, source, pkgContext, archContext); fd != nil || pd != nil {
+			if fd != nil {
+				facts.Functions = append(facts.Functions, *fd)
+			}
+			if pd != nil {
+				facts.Procedures = append(facts.Procedures, *pd)
+			}
+		} else if aliasName, aliasType := e.extractObjectAlias(node, source); aliasName != "" && aliasType != "" {
+			facts.Signals = append(facts.Signals, Signal{
+				Name:     aliasName,
+				Type:     aliasType,
+				Line:     int(node.StartPoint().Row) + 1,
+				InEntity: archContext,
+			})
+			addDeclaredSignalName(declaredSignals, aliasName)
+		}
+
 	case "constant_declaration":
 		// Extract full constant declarations with context
 		constDecls := e.extractConstantDeclarations(node, source, pkgContext, archContext)
@@ -843,7 +974,7 @@ func (e *Extractor) walkTreeWithPkg(node *sitter.Node, source []byte, facts *Fil
 			}
 			e.extractReadsFromNode(child, source, readSet, false, declaredSignals, nil)
 		}
-		for sig := range readSet {
+		for _, sig := range sortedStringSetKeys(readSet) {
 			facts.SignalUsages = append(facts.SignalUsages, SignalUsage{
 				Signal: sig,
 				IsRead: true,
@@ -900,9 +1031,13 @@ func (e *Extractor) walkTreeWithPkg(node *sitter.Node, source []byte, facts *Fil
 		}
 
 		if proc.HasReset {
+			polarity := proc.ResetPolarity
+			if polarity == "" {
+				polarity = "active_high" // fallback for resets not detected via comparison
+			}
 			facts.ResetInfos = append(facts.ResetInfos, ResetInfo{
 				Signal:    proc.ResetSignal,
-				Polarity:  "active_high", // TODO: detect from comparison value
+				Polarity:  polarity,
 				IsAsync:   proc.ResetAsync,
 				Registers: proc.AssignedSignals,
 				Process:   proc.Label,
@@ -940,7 +1075,7 @@ func (e *Extractor) walkTreeWithPkg(node *sitter.Node, source []byte, facts *Fil
 
 	// Recurse into children
 	for i := 0; i < int(node.ChildCount()); i++ {
-		e.walkTreeWithPkg(node.Child(i), source, facts, pkgContext, archContext, declaredSignals)
+		e.walkTreeWithPkg(node.Child(i), source, facts, pkgContext, archContext, declaredSignals, depth+1)
 	}
 }
 
@@ -1066,6 +1201,16 @@ func (e *Extractor) extractPackage(node *sitter.Node, source []byte) Package {
 	return pkg
 }
 
+func (e *Extractor) extractPackageBody(node *sitter.Node, source []byte) PackageBody {
+	body := PackageBody{
+		Line: int(node.StartPoint().Row) + 1,
+	}
+	if nameNode := node.ChildByFieldName("name"); nameNode != nil {
+		body.Name = nameNode.Content(source)
+	}
+	return body
+}
+
 // extractConfigurationDeclaration extracts a configuration declaration (name + entity)
 func (e *Extractor) extractConfigurationDeclaration(node *sitter.Node, source []byte) ConfigurationDeclaration {
 	cfg := ConfigurationDeclaration{
@@ -1080,6 +1225,18 @@ func (e *Extractor) extractConfigurationDeclaration(node *sitter.Node, source []
 		entityText := entityNode.Content(source)
 		parts := strings.Split(entityText, ".")
 		cfg.EntityName = parts[len(parts)-1]
+	}
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		if child == nil {
+			continue
+		}
+		if child.Type() == "block_configuration" {
+			if labelNode := child.ChildByFieldName("label"); labelNode != nil {
+				cfg.ArchName = strings.TrimSpace(labelNode.Content(source))
+			}
+			break
+		}
 	}
 
 	cfg.Bindings = e.extractConfigurationBindings(node, source)
@@ -1232,7 +1389,7 @@ func (e *Extractor) extractPSLSignalReads(node *sitter.Node, source []byte, fact
 		}
 		e.extractReadsFromNode(child, source, readSet, false, declaredSignals, nil)
 	}
-	for sig := range readSet {
+	for _, sig := range sortedStringSetKeys(readSet) {
 		facts.SignalUsages = append(facts.SignalUsages, SignalUsage{
 			Signal: sig,
 			IsRead: true,
@@ -1258,37 +1415,69 @@ func hasPSLChild(node *sitter.Node) bool {
 	return false
 }
 
-func (e *Extractor) extractUseClause(node *sitter.Node, source []byte, file string) Dependency {
-	// Extract the library.package path from use clause
+func (e *Extractor) extractUseClause(node *sitter.Node, source []byte, file string) []Dependency {
+	line := int(node.StartPoint().Row) + 1
+	items := e.extractUseClauseItems(node, source)
+	if len(items) > 0 {
+		deps := make([]Dependency, 0, len(items))
+		for _, item := range items {
+			item = strings.TrimSpace(item)
+			if item == "" {
+				continue
+			}
+			deps = append(deps, Dependency{
+				Source: file,
+				Target: item,
+				Kind:   "use",
+				Line:   line,
+			})
+		}
+		return deps
+	}
+
+	// Fallback when selector tokens are incomplete.
 	target := ""
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
+		if child == nil {
+			continue
+		}
 		if child.Type() == "identifier" || child.Type() == "selector_clause" {
 			target += child.Content(source)
 		}
 	}
-	return Dependency{
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return nil
+	}
+	return []Dependency{{
 		Source: file,
 		Target: target,
 		Kind:   "use",
-		Line:   int(node.StartPoint().Row) + 1,
-	}
+		Line:   line,
+	}}
 }
 
-func (e *Extractor) extractLibraryClause(node *sitter.Node, source []byte, file string) Dependency {
-	// Extract library name
-	for i := 0; i < int(node.ChildCount()); i++ {
-		child := node.Child(i)
-		if child.Type() == "identifier" {
-			return Dependency{
-				Source: file,
-				Target: child.Content(source),
-				Kind:   "library",
-				Line:   int(node.StartPoint().Row) + 1,
-			}
-		}
+func (e *Extractor) extractLibraryClause(node *sitter.Node, source []byte, file string) []Dependency {
+	line := int(node.StartPoint().Row) + 1
+	items := e.extractLibraryClauseItems(node, source)
+	if len(items) == 0 {
+		return nil
 	}
-	return Dependency{}
+	deps := make([]Dependency, 0, len(items))
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		deps = append(deps, Dependency{
+			Source: file,
+			Target: item,
+			Kind:   "library",
+			Line:   line,
+		})
+	}
+	return deps
 }
 
 func (e *Extractor) extractUseClauseItems(node *sitter.Node, source []byte) []string {
@@ -1297,6 +1486,9 @@ func (e *Extractor) extractUseClauseItems(node *sitter.Node, source []byte) []st
 
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
+		if child == nil {
+			continue
+		}
 		switch child.Type() {
 		case "identifier":
 			if current != "" {
@@ -1326,6 +1518,9 @@ func (e *Extractor) extractLibraryClauseItems(node *sitter.Node, source []byte) 
 	var libs []string
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
+		if child == nil {
+			continue
+		}
 		if child.Type() == "identifier" {
 			libs = append(libs, child.Content(source))
 		}
@@ -1349,6 +1544,39 @@ func (e *Extractor) extractContextReference(node *sitter.Node, source []byte, fi
 	}
 }
 
+func (e *Extractor) extractContextDeclaration(node *sitter.Node, source []byte) ContextDeclaration {
+	decl := ContextDeclaration{
+		Line: int(node.StartPoint().Row) + 1,
+	}
+	if nameNode := node.ChildByFieldName("name"); nameNode != nil {
+		decl.Name = nameNode.Content(source)
+	}
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		if child == nil {
+			continue
+		}
+		switch child.Type() {
+		case "library_clause":
+			decl.Libraries = append(decl.Libraries, e.extractLibraryClauseItems(child, source)...)
+		case "use_clause":
+			decl.UseItems = append(decl.UseItems, e.extractUseClauseItems(child, source)...)
+		case "context_reference":
+			content := strings.TrimSpace(child.Content(source))
+			lower := strings.ToLower(content)
+			if strings.HasPrefix(lower, "context ") {
+				content = strings.TrimSpace(content[len("context "):])
+			}
+			content = strings.TrimSuffix(content, ";")
+			content = strings.TrimSpace(content)
+			if content != "" {
+				decl.ContextRefs = append(decl.ContextRefs, content)
+			}
+		}
+	}
+	return decl
+}
+
 func (e *Extractor) extractPackageInstantiation(node *sitter.Node, source []byte, file string) Dependency {
 	var target string
 	if prefix := node.ChildByFieldName("prefix"); prefix != nil {
@@ -1359,6 +1587,9 @@ func (e *Extractor) extractPackageInstantiation(node *sitter.Node, source []byte
 	} else {
 		for i := 0; i < int(node.ChildCount()); i++ {
 			child := node.Child(i)
+			if child == nil {
+				continue
+			}
 			if child.Type() == "identifier" && target == "" {
 				target = child.Content(source)
 			}
@@ -1458,6 +1689,10 @@ func (e *Extractor) extractInstance(node *sitter.Node, source []byte, context st
 		Associations: []Association{},
 	}
 
+	if archNode := node.ChildByFieldName("architecture"); archNode != nil {
+		inst.TargetArch = archNode.Content(source)
+	}
+
 	// Extract using field names and node types (clean declarative approach)
 
 	// Instance label
@@ -1484,6 +1719,9 @@ func (e *Extractor) extractInstance(node *sitter.Node, source []byte, context st
 	// Extract generic_map_aspect and port_map_aspect
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
+		if child == nil {
+			continue
+		}
 		switch child.Type() {
 		case "generic_map_aspect":
 			e.extractMapAspect(child, source, inst.GenericMap)
@@ -1502,6 +1740,9 @@ func (e *Extractor) extractMapAspect(node *sitter.Node, source []byte, result ma
 	// Find the association_list child
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
+		if child == nil {
+			continue
+		}
 		if child.Type() == "association_list" {
 			e.extractAssociationList(child, source, result)
 			return
@@ -1513,8 +1754,11 @@ func (e *Extractor) extractMapAspect(node *sitter.Node, source []byte, result ma
 func (e *Extractor) extractAssociationList(node *sitter.Node, source []byte, result map[string]string) {
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
+		if child == nil {
+			continue
+		}
 		if child.Type() == "association_element" {
-			formal, actual := e.extractAssociationElement(child, source)
+			formal, actual := e.extractAssociationElement(child, source, nil)
 			if formal != "" && actual != "" {
 				result[formal] = actual
 			}
@@ -1524,7 +1768,7 @@ func (e *Extractor) extractAssociationList(node *sitter.Node, source []byte, res
 
 // extractAssociationElement extracts formal => actual from an association_element
 // Uses grammar fields directly: field('formal', ...) and field('actual', ...)
-func (e *Extractor) extractAssociationElement(node *sitter.Node, source []byte) (formal, actual string) {
+func (e *Extractor) extractAssociationElement(node *sitter.Node, source []byte, facts *FileFacts) (formal, actual string) {
 	// Grammar structure:
 	//   Named:      field('formal', $._name) '=>' field('actual', choice($._expression, $._kw_open))
 	//   Positional: field('actual', $._expression)
@@ -1532,6 +1776,11 @@ func (e *Extractor) extractAssociationElement(node *sitter.Node, source []byte) 
 	// Extract formal (only present in named associations)
 	if formalNode := node.ChildByFieldName("formal"); formalNode != nil {
 		formal = formalNode.Content(source)
+	}
+	if derived := extractAssociationFormalFromContent(node.Content(source)); derived != "" {
+		if formal == "" || len(derived) > len(formal) || strings.Contains(derived, "(") {
+			formal = derived
+		}
 	}
 
 	// Extract actual (always present)
@@ -1548,9 +1797,13 @@ func (e *Extractor) extractAssociationElement(node *sitter.Node, source []byte) 
 	// Fallback for edge cases where fields aren't populated
 	// (e.g., grammar conflicts or hidden tokens like _kw_open).
 	if actual == "" {
+		incFallback(facts, "assoc_child_walk")
 		sawArrow := false
 		for i := 0; i < int(node.ChildCount()); i++ {
 			child := node.Child(i)
+			if child == nil {
+				continue
+			}
 			childType := child.Type()
 			childContent := child.Content(source)
 
@@ -1578,6 +1831,7 @@ func (e *Extractor) extractAssociationElement(node *sitter.Node, source []byte) 
 
 		// Handle hidden 'open' keyword (no child node)
 		if sawArrow && actual == "" {
+			incFallback(facts, "assoc_hidden_open")
 			parts := strings.SplitN(node.Content(source), "=>", 2)
 			if len(parts) == 2 {
 				if strings.EqualFold(strings.TrimSpace(parts[1]), "open") {
@@ -1591,7 +1845,16 @@ func (e *Extractor) extractAssociationElement(node *sitter.Node, source []byte) 
 	// to parsing the association text after the "=>" token.
 	if derived := extractAssociationActualFromContent(node.Content(source)); derived != "" {
 		if actual == "" || (len(derived) > len(actual) && !strings.EqualFold(actual, "open")) {
+			incFallback(facts, "assoc_actual_from_content")
 			actual = derived
+		}
+	}
+	if formal == "" {
+		if derived := extractPositionalActualFromContent(node.Content(source)); derived != "" {
+			if actual == "" || (len(derived) > len(actual) && !strings.EqualFold(actual, "open")) {
+				incFallback(facts, "assoc_positional_from_content")
+				actual = derived
+			}
 		}
 	}
 
@@ -1615,9 +1878,40 @@ func extractAssociationActualFromContent(content string) string {
 	return rhs
 }
 
+func extractAssociationFormalFromContent(content string) string {
+	parts := strings.SplitN(content, "=>", 2)
+	if len(parts) != 2 {
+		return ""
+	}
+	lhs := strings.TrimSpace(parts[0])
+	if lhs == "" {
+		return ""
+	}
+	if idx := strings.Index(lhs, "--"); idx != -1 {
+		lhs = strings.TrimSpace(lhs[:idx])
+	}
+	lhs = strings.TrimRight(lhs, ",;")
+	return strings.TrimSpace(lhs)
+}
+
+func extractPositionalActualFromContent(content string) string {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return ""
+	}
+	if idx := strings.Index(trimmed, "--"); idx != -1 {
+		trimmed = strings.TrimSpace(trimmed[:idx])
+	}
+	trimmed = strings.TrimRight(trimmed, ",;")
+	return strings.TrimSpace(trimmed)
+}
+
 func (e *Extractor) extractAssociationsFromMapAspect(node *sitter.Node, source []byte, kind string) []Association {
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
+		if child == nil {
+			continue
+		}
 		if child.Type() == "association_list" {
 			return e.extractAssociationsFromList(child, source, kind)
 		}
@@ -1630,6 +1924,9 @@ func (e *Extractor) extractAssociationsFromList(node *sitter.Node, source []byte
 	pos := 0
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
+		if child == nil {
+			continue
+		}
 		if child.Type() != "association_element" {
 			continue
 		}
@@ -1654,6 +1951,11 @@ func (e *Extractor) extractAssociationElementDetailed(node *sitter.Node, source 
 		assoc.Formal = strings.TrimSpace(formalNode.Content(source))
 	} else {
 		assoc.IsPositional = true
+	}
+	if derived := extractAssociationFormalFromContent(node.Content(source)); derived != "" {
+		if assoc.Formal == "" || len(derived) > len(assoc.Formal) || strings.Contains(derived, "(") {
+			assoc.Formal = derived
+		}
 	}
 
 	if actualNode != nil {
@@ -1720,16 +2022,17 @@ func (e *Extractor) extractConcurrentAssignment(node *sitter.Node, source []byte
 		Kind:   "simple",
 	}
 
-	// Determine kind based on content
-	// VHDL selected assignment: "with expr select target <= value when choice, ..."
-	// VHDL conditional assignment: "target <= value when condition else other"
-	content := strings.ToLower(node.Content(source))
-	// Selected assignments must start with "with" keyword (not just contain "select" in a signal name)
-	isSelected := strings.HasPrefix(strings.TrimSpace(content), "with ") && strings.Contains(content, " select ")
-	if strings.Contains(content, " when ") && strings.Contains(content, " else ") && !isSelected {
-		ca.Kind = "conditional"
-	} else if isSelected {
+	// Classify assignment kind using parse tree structure, not string matching.
+	// Selected: "with expr select target <= ..." — target field is offset from node start.
+	// Conditional: "target <= value when cond else ..." — has >2 named children.
+	// Simple: "target <= value;" — target at start, few named children.
+	targetNode := node.ChildByFieldName("target")
+	if targetNode != nil && targetNode.StartByte() > node.StartByte()+2 {
+		// Target is shifted right — must be selected (with expr select target ...)
 		ca.Kind = "selected"
+	} else if node.NamedChildCount() > 2 {
+		// More than target + value means conditional (has when/else branches)
+		ca.Kind = "conditional"
 	}
 
 	// Extract target using grammar's field('target', assignment_target) wrapper
@@ -1745,7 +2048,7 @@ func (e *Extractor) extractConcurrentAssignment(node *sitter.Node, source []byte
 	delete(readSet, ca.Target)
 
 	// Convert read set to slice
-	for sig := range readSet {
+	for _, sig := range sortedStringSetKeys(readSet) {
 		ca.ReadSignals = append(ca.ReadSignals, sig)
 	}
 
@@ -1773,6 +2076,9 @@ func (e *Extractor) extractAssignmentTarget(node *sitter.Node, source []byte) (s
 	// assignment_target wraps: identifier, selected_name, indexed_name, or aggregate
 	for i := 0; i < int(targetNode.ChildCount()); i++ {
 		child := targetNode.Child(i)
+		if child == nil {
+			continue
+		}
 		childType := child.Type()
 
 		switch childType {
@@ -1875,6 +2181,9 @@ func (e *Extractor) walkNameNode(node *sitter.Node, source []byte, info *NameInf
 		if info.Base == "" {
 			for i := 0; i < int(node.ChildCount()); i++ {
 				child := node.Child(i)
+				if child == nil {
+					continue
+				}
 				childType := child.Type()
 				if childType == "identifier" {
 					if info.Base == "" {
@@ -1904,6 +2213,9 @@ func (e *Extractor) walkNameNode(node *sitter.Node, source []byte, info *NameInf
 		if info.Base == "" {
 			for i := 0; i < int(node.ChildCount()); i++ {
 				child := node.Child(i)
+				if child == nil {
+					continue
+				}
 				childType := child.Type()
 				if childType == "identifier" || childType == "selected_name" || childType == "indexed_name" {
 					e.walkNameNode(child, source, info)
@@ -1964,6 +2276,9 @@ func (e *Extractor) extractEnumLiterals(node *sitter.Node, source []byte) []stri
 			// Extract all identifier children as enum literals
 			for i := 0; i < int(n.ChildCount()); i++ {
 				child := n.Child(i)
+				if child == nil {
+					continue
+				}
 				if child.Type() == "identifier" {
 					literals = append(literals, child.Content(source))
 				}
@@ -1992,6 +2307,9 @@ func (e *Extractor) extractConstantNames(node *sitter.Node, source []byte) []str
 	sawColon := false
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
+		if child == nil {
+			continue
+		}
 		childType := child.Type()
 
 		if childType == ":" {
@@ -2019,6 +2337,9 @@ func (e *Extractor) extractSharedVariableNames(node *sitter.Node, source []byte)
 	seen := make(map[string]bool)
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
+		if child == nil {
+			continue
+		}
 		if child.Type() == ":" {
 			break
 		}
@@ -2050,6 +2371,9 @@ func (e *Extractor) extractConstantDeclarations(node *sitter.Node, source []byte
 	sawAssign := false
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
+		if child == nil {
+			continue
+		}
 		childType := child.Type()
 
 		if childType == ":" {
@@ -2116,6 +2440,9 @@ func (e *Extractor) extractTypeName(node *sitter.Node, source []byte) string {
 	// Type mark or subtype indication - recurse to find the actual type name
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
+		if child == nil {
+			continue
+		}
 		childType := child.Type()
 		if childType == "identifier" || childType == "simple_name" || childType == "selected_name" {
 			return child.Content(source)
@@ -2148,12 +2475,8 @@ func (e *Extractor) extractSignals(node *sitter.Node, source []byte, context str
 
 	var names []string
 	var sigType string
-	var typeIdent string
-	foundColon := false
-	foundType := false
-	var typeStart, typeEnd uint32
 
-	// Prefer grammar fields when available
+	// Use grammar fields — signal_declaration always provides 'names' and 'type'
 	if namesNode := node.ChildByFieldName("names"); namesNode != nil {
 		names = append(names, collectIdentifierList(namesNode, source)...)
 	}
@@ -2164,56 +2487,31 @@ func (e *Extractor) extractSignals(node *sitter.Node, source []byte, context str
 		}
 	}
 
-	for i := 0; i < int(node.ChildCount()); i++ {
-		child := node.Child(i)
-		childType := child.Type()
-		content := child.Content(source)
-
-		if content == ":" {
-			foundColon = true
-			continue
-		}
-
-		if childType == "identifier" {
-			if !foundColon {
-				// Before colon = signal names
-				if len(names) == 0 {
-					names = append(names, content)
-				}
-			} else {
-				// After colon = type identifier (fallback if we can't capture full type)
-				typeIdent = content
-			}
-		}
-		if childType == "identifier_list" && len(names) == 0 {
-			names = append(names, collectIdentifierList(child, source)...)
-		}
-
-		if foundColon {
-			if content == ":=" || content == ";" {
-				break
-			}
-			if childType == "comment" {
+	// Minimal fallback: if grammar fields unavailable (e.g., partial parse),
+	// extract names and type from child positions relative to ':'
+	if len(names) == 0 || sigType == "" {
+		foundColon := false
+		for i := 0; i < int(node.ChildCount()); i++ {
+			child := node.Child(i)
+			if child == nil {
 				continue
 			}
-			if !foundType {
-				typeStart = child.StartByte()
-				typeEnd = child.EndByte()
-				foundType = true
-			} else {
-				typeEnd = child.EndByte()
+			content := child.Content(source)
+			if content == ":" {
+				foundColon = true
+				continue
+			}
+			if child.Type() == "identifier" {
+				if !foundColon && len(names) == 0 {
+					names = append(names, content)
+				} else if foundColon && sigType == "" {
+					sigType = content
+				}
+			}
+			if child.Type() == "identifier_list" && len(names) == 0 {
+				names = append(names, collectIdentifierList(child, source)...)
 			}
 		}
-	}
-
-	if sigType == "" && foundType && typeEnd > typeStart {
-		rawType := strings.TrimSpace(string(source[typeStart:typeEnd]))
-		if rawType != "" {
-			sigType = strings.Join(strings.Fields(rawType), " ")
-		}
-	}
-	if sigType == "" {
-		sigType = typeIdent
 	}
 
 	for _, name := range names {
@@ -2235,6 +2533,9 @@ func collectIdentifierList(node *sitter.Node, source []byte) []string {
 	var names []string
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
+		if child == nil {
+			continue
+		}
 		switch child.Type() {
 		case "identifier":
 			names = append(names, child.Content(source))
@@ -2246,50 +2547,20 @@ func collectIdentifierList(node *sitter.Node, source []byte) []string {
 }
 
 func (e *Extractor) extractPortsFromEntity(node *sitter.Node, source []byte, entityName string, facts *FileFacts, declaredSignals map[string]bool) {
-	// Walk through entity looking for parameters (ports)
-	var foundPortClause bool
-	var walkForPorts func(n *sitter.Node)
-	walkForPorts = func(n *sitter.Node) {
-		if n == nil {
-			return
-		}
-		if n.Type() == "port_clause" {
-			foundPortClause = true
-			if portsNode := n.ChildByFieldName("ports"); portsNode != nil {
-				e.extractPortsFromParameterList(portsNode, source, entityName, facts, declaredSignals)
-			}
-			return
-		}
-		for i := 0; i < int(n.ChildCount()); i++ {
-			walkForPorts(n.Child(i))
-		}
+	ports := e.extractPortsFromNode(node, source, entityName)
+	for _, p := range ports {
+		addDeclaredSignalName(declaredSignals, p.Name)
 	}
-	walkForPorts(node)
-
-	// Fallback for older grammar or unexpected trees: collect all parameter nodes
-	if !foundPortClause {
-		var walkAllParams func(n *sitter.Node)
-		walkAllParams = func(n *sitter.Node) {
-			if n == nil {
-				return
-			}
-			if n.Type() == "parameter" {
-				ports := e.extractPorts(n, source)
-				for i := range ports {
-					ports[i].InEntity = entityName
-					addDeclaredSignalName(declaredSignals, ports[i].Name)
-				}
-				facts.Ports = append(facts.Ports, ports...)
-			}
-			for i := 0; i < int(n.ChildCount()); i++ {
-				walkAllParams(n.Child(i))
-			}
-		}
-		walkAllParams(node)
-	}
+	facts.Ports = append(facts.Ports, ports...)
 }
 
 func (e *Extractor) extractPortsFromComponent(node *sitter.Node, source []byte, componentName string) []Port {
+	return e.extractPortsFromNode(node, source, componentName)
+}
+
+// extractPortsFromNode is the shared port extraction logic for entities and components.
+// Walks the node tree looking for port_clause → parameter nodes, extracts ports.
+func (e *Extractor) extractPortsFromNode(node *sitter.Node, source []byte, ownerName string) []Port {
 	var ports []Port
 	var foundPortClause bool
 
@@ -2309,7 +2580,7 @@ func (e *Extractor) extractPortsFromComponent(node *sitter.Node, source []byte, 
 					if p.Type() == "parameter" {
 						extracted := e.extractPorts(p, source)
 						for i := range extracted {
-							extracted[i].InEntity = componentName
+							extracted[i].InEntity = ownerName
 						}
 						ports = append(ports, extracted...)
 						return
@@ -2328,6 +2599,7 @@ func (e *Extractor) extractPortsFromComponent(node *sitter.Node, source []byte, 
 	}
 	walkForPorts(node)
 
+	// Fallback: collect all parameter nodes if no port_clause found
 	if !foundPortClause {
 		var walkAllParams func(n *sitter.Node)
 		walkAllParams = func(n *sitter.Node) {
@@ -2337,7 +2609,7 @@ func (e *Extractor) extractPortsFromComponent(node *sitter.Node, source []byte, 
 			if n.Type() == "parameter" {
 				extracted := e.extractPorts(n, source)
 				for i := range extracted {
-					extracted[i].InEntity = componentName
+					extracted[i].InEntity = ownerName
 				}
 				ports = append(ports, extracted...)
 			}
@@ -2385,6 +2657,9 @@ func (e *Extractor) extractGenericDeclsFromItem(node *sitter.Node, source []byte
 	case "generic_item":
 		for i := 0; i < int(node.ChildCount()); i++ {
 			child := node.Child(i)
+			if child == nil {
+				continue
+			}
 			switch child.Type() {
 			case "parameter":
 				decls = append(decls, e.extractGenericDeclsFromParameter(child, source, inEntity, inComponent)...)
@@ -2398,6 +2673,9 @@ func (e *Extractor) extractGenericDeclsFromItem(node *sitter.Node, source []byte
 		name := ""
 		for i := 0; i < int(node.ChildCount()); i++ {
 			child := node.Child(i)
+			if child == nil {
+				continue
+			}
 			if child.Type() == "identifier" {
 				name = child.Content(source)
 				break
@@ -2437,6 +2715,9 @@ func (e *Extractor) extractGenericDeclsFromItem(node *sitter.Node, source []byte
 		if strings.HasPrefix(strings.TrimSpace(content), "package") {
 			for i := 0; i < int(node.ChildCount()); i++ {
 				child := node.Child(i)
+				if child == nil {
+					continue
+				}
 				if child.Type() == "identifier" {
 					decls = append(decls, GenericDecl{
 						Name:        child.Content(source),
@@ -2491,6 +2772,9 @@ func (e *Extractor) extractGenericDeclsFromParameter(node *sitter.Node, source [
 		typeEnd := -1
 		for i := 0; i < int(node.ChildCount()); i++ {
 			child := node.Child(i)
+			if child == nil {
+				continue
+			}
 			switch child.Type() {
 			case ":":
 				sawColon = true
@@ -2543,6 +2827,9 @@ func (e *Extractor) extractGenericConstantsFromEntity(node *sitter.Node, source 
 		if n.Type() == "generic_item" {
 			for i := 0; i < int(n.ChildCount()); i++ {
 				child := n.Child(i)
+				if child == nil {
+					continue
+				}
 				if child.Type() == "parameter" {
 					namesNode := child.ChildByFieldName("names")
 					for _, name := range collectIdentifierList(namesNode, source) {
@@ -2623,6 +2910,9 @@ func (e *Extractor) extractPorts(node *sitter.Node, source []byte) []Port {
 
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
+		if child == nil {
+			continue
+		}
 		childType := child.Type()
 
 		if childType == ":" {
@@ -2680,6 +2970,9 @@ func (e *Extractor) extractPorts(node *sitter.Node, source []byte) []Port {
 		var identifiers []string
 		for i := 0; i < int(node.ChildCount()); i++ {
 			child := node.Child(i)
+			if child == nil {
+				continue
+			}
 			if child.Type() == "identifier" {
 				identifiers = append(identifiers, child.Content(source))
 			}
@@ -2730,6 +3023,9 @@ func (e *Extractor) extractProcess(node *sitter.Node, source []byte, context str
 	// Walk through children to find label and sensitivity list
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
+		if child == nil {
+			continue
+		}
 		childType := child.Type()
 
 		switch childType {
@@ -2807,6 +3103,9 @@ func (e *Extractor) analyzeProcessSemantics(node *sitter.Node, source []byte, pr
 				argName := ""
 				for i := 0; i < int(n.ChildCount()); i++ {
 					child := n.Child(i)
+					if child == nil {
+						continue
+					}
 					if child.Type() == "identifier" {
 						if funcName == "" {
 							funcName = strings.ToLower(child.Content(source))
@@ -2847,13 +3146,48 @@ func (e *Extractor) analyzeProcessSemantics(node *sitter.Node, source []byte, pr
 			if sig, ok := e.extractAssignmentTarget(n, source); ok {
 				assignedSet[sig] = true
 			}
+			// Capture function calls on RHS expressions to avoid mis-parsing
+			rawAssign := n.Content(source)
+			exprLine := int(n.StartPoint().Row) + 1
+			for _, call := range e.extractFunctionCallsFromString(rawAssign, exprLine, proc.Label, proc.InArch, declaredSignals, variableSet) {
+				if !hasCall(call) {
+					proc.FunctionCalls = append(proc.FunctionCalls, call)
+				}
+			}
 			// Walk RHS for reads
 			targetNode := n.ChildByFieldName("target")
 			e.extractReadsFromNodeSkipping(n, source, readSet, false, declaredSignals, variableSet, targetNode)
 
 		case "assignment_statement":
-			// Variable/generic assignments (tmp := expr) don't assign signals,
-			// but the RHS may read signals that we need to track
+			// Variable assignments (tmp := expr) — track LHS as assigned for
+			// variable analysis, and RHS may read signals/variables.
+			// Grammar: [label:] _assignment_target := _expression ;
+			// _assignment_target has no field name, so find the child just before ":="
+			for ci := 0; ci < int(n.ChildCount()); ci++ {
+				child := n.Child(ci)
+				if child.Type() == ":=" {
+					if ci > 0 {
+						prev := n.Child(ci - 1)
+						switch prev.Type() {
+						case "identifier":
+							assignedSet[prev.Content(source)] = true
+						case "selected_name", "indexed_name":
+							info := e.extractNameInfo(prev, source)
+							if info.Base != "" {
+								assignedSet[info.Base] = true
+							}
+						}
+					}
+					break
+				}
+			}
+			rawAssign := n.Content(source)
+			exprLine := int(n.StartPoint().Row) + 1
+			for _, call := range e.extractFunctionCallsFromString(rawAssign, exprLine, proc.Label, proc.InArch, declaredSignals, variableSet) {
+				if !hasCall(call) {
+					proc.FunctionCalls = append(proc.FunctionCalls, call)
+				}
+			}
 			e.extractReadsFromNode(n, source, readSet, true, declaredSignals, variableSet)
 
 		case "if_statement":
@@ -2867,6 +3201,16 @@ func (e *Extractor) analyzeProcessSemantics(node *sitter.Node, source []byte, pr
 			// Pattern: if reset = '1' then (before clock edge = async)
 			// Pattern: elsif reset = '1' then (after clock edge = sync)
 			e.checkResetPattern(n, source, proc)
+			// Capture function calls that appear in conditions (tree-sitter doesn't always
+			// surface them as indexed_name nodes).
+			if condNode := n.ChildByFieldName("condition"); condNode != nil {
+				condLine := int(condNode.StartPoint().Row) + 1
+				for _, call := range e.extractFunctionCallsFromString(condNode.Content(source), condLine, proc.Label, proc.InArch, declaredSignals, variableSet) {
+					if !hasCall(call) {
+						proc.FunctionCalls = append(proc.FunctionCalls, call)
+					}
+				}
+			}
 			// Extract reads from condition (identifiers before first statement)
 			e.extractIfConditionReads(n, source, readSet, declaredSignals, variableSet)
 			// Continue walking children for nested statements
@@ -2878,6 +3222,15 @@ func (e *Extractor) analyzeProcessSemantics(node *sitter.Node, source []byte, pr
 		case "case_statement":
 			// Extract reads from case expression
 			e.extractCaseExpressionReads(n, source, readSet, declaredSignals, variableSet)
+			// Capture function calls in case expressions for the same reason as conditions.
+			if exprNode := n.ChildByFieldName("expression"); exprNode != nil {
+				exprLine := int(exprNode.StartPoint().Row) + 1
+				for _, call := range e.extractFunctionCallsFromString(exprNode.Content(source), exprLine, proc.Label, proc.InArch, declaredSignals, variableSet) {
+					if !hasCall(call) {
+						proc.FunctionCalls = append(proc.FunctionCalls, call)
+					}
+				}
+			}
 			// Continue walking children for case alternatives
 			for i := 0; i < int(n.ChildCount()); i++ {
 				walk(n.Child(i), false)
@@ -2886,7 +3239,7 @@ func (e *Extractor) analyzeProcessSemantics(node *sitter.Node, source []byte, pr
 
 		case "procedure_call_statement":
 			// Procedure calls may read signals via arguments (e.g., check_equal(sig, ...))
-			if call := e.extractProcedureCall(n, source, proc.Label, proc.InArch); call.Name != "" {
+			if call := e.extractProcedureCall(n, source, proc.Label, proc.InArch, nil); call.Name != "" {
 				proc.ProcedureCalls = append(proc.ProcedureCalls, call)
 			}
 			callReads := make(map[string]bool)
@@ -2915,7 +3268,7 @@ func (e *Extractor) analyzeProcessSemantics(node *sitter.Node, source []byte, pr
 			}
 		}
 
-		if call := e.extractFunctionCallFromPrefixContent(n, source, proc.Label, proc.InArch, declaredSignals, variableSet); call.Name != "" {
+		if call := e.extractFunctionCallFromPrefixContent(n, source, proc.Label, proc.InArch, declaredSignals, variableSet, nil); call.Name != "" {
 			if !hasCall(call) {
 				proc.FunctionCalls = append(proc.FunctionCalls, call)
 			}
@@ -2935,14 +3288,18 @@ func (e *Extractor) analyzeProcessSemantics(node *sitter.Node, source []byte, pr
 
 	walk(node, false)
 
-	// Convert sets to slices, filtering out process-local variables
-	for sig := range assignedSet {
-		if !variableSet[strings.ToLower(sig)] {
+	// Convert sets to slices, separating signals from process-local variables
+	for _, sig := range sortedStringSetKeys(assignedSet) {
+		if variableSet[strings.ToLower(sig)] {
+			proc.AssignedVariables = append(proc.AssignedVariables, sig)
+		} else {
 			proc.AssignedSignals = append(proc.AssignedSignals, sig)
 		}
 	}
-	for sig := range readSet {
-		if !variableSet[strings.ToLower(sig)] {
+	for _, sig := range sortedStringSetKeys(readSet) {
+		if variableSet[strings.ToLower(sig)] {
+			proc.ReadVariables = append(proc.ReadVariables, sig)
+		} else {
 			proc.ReadSignals = append(proc.ReadSignals, sig)
 		}
 	}
@@ -2965,6 +3322,9 @@ func (e *Extractor) collectProcessVariables(node *sitter.Node, source []byte, va
 			varNames := []string{}
 			for i := 0; i < int(n.ChildCount()); i++ {
 				child := n.Child(i)
+				if child == nil {
+					continue
+				}
 				if child.Type() == ":" {
 					sawColon = true
 					break
@@ -2987,11 +3347,59 @@ func (e *Extractor) collectProcessVariables(node *sitter.Node, source []byte, va
 			}
 		}
 
+		if n.Type() == "alias_declaration" {
+			line := int(n.StartPoint().Row) + 1
+			aliasName := ""
+			aliasType := ""
+			if nameNode := n.ChildByFieldName("name"); nameNode != nil {
+				aliasName = nameNode.Content(source)
+			}
+			if aliasType == "" {
+				aliasName, aliasType = e.extractObjectAlias(n, source)
+			}
+			if aliasName != "" {
+				varSet[strings.ToLower(aliasName)] = true
+				if vars != nil {
+					*vars = append(*vars, VariableDecl{
+						Name: aliasName,
+						Type: aliasType,
+						Line: line,
+					})
+				}
+			}
+		}
+
 		if n.Type() == "loop_statement" {
 			line := int(n.StartPoint().Row) + 1
-			loopText := n.Content(source)
-			if match := regexp.MustCompile(`(?i)\\bfor\\s+([a-zA-Z_][a-zA-Z0-9_]*)\\s+in\\b`).FindStringSubmatch(loopText); match != nil {
-				loopVar := match[1]
+			loopVar := ""
+			rangeIdx := -1
+			for i := 0; i < int(n.ChildCount()); i++ {
+				child := n.Child(i)
+				if child == nil {
+					continue
+				}
+				childType := child.Type()
+				if childType == "range_expression" || childType == "discrete_range" {
+					rangeIdx = i
+					break
+				}
+			}
+			if rangeIdx != -1 {
+				for j := rangeIdx - 1; j >= 0; j-- {
+					cj := n.Child(j)
+					if cj != nil && cj.Type() == "identifier" {
+						loopVar = cj.Content(source)
+						break
+					}
+				}
+			}
+			if loopVar == "" {
+				loopText := n.Content(source)
+				if match := regexp.MustCompile(`(?i)\\bfor\\s+([a-zA-Z_][a-zA-Z0-9_]*)\\s+in\\b`).FindStringSubmatch(loopText); match != nil {
+					loopVar = match[1]
+				}
+			}
+			if loopVar != "" {
 				varSet[strings.ToLower(loopVar)] = true
 				if vars != nil {
 					*vars = append(*vars, VariableDecl{
@@ -3048,6 +3456,9 @@ func (e *Extractor) extractVariableType(node *sitter.Node, source []byte) string
 	typeEnd := -1
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
+		if child == nil {
+			continue
+		}
 		switch child.Type() {
 		case ":":
 			sawColon = true
@@ -3135,25 +3546,7 @@ func (e *Extractor) isNotSignalRead(node *sitter.Node, source []byte) bool {
 // isCommonVHDLFunction checks if a name is a common VHDL function or type conversion
 // These should not be treated as signal reads when used as indexed_name prefixes
 func (e *Extractor) isCommonVHDLFunction(name string) bool {
-	switch name {
-	// Type conversions
-	case "unsigned", "signed", "std_logic_vector", "std_ulogic_vector":
-		return true
-	case "integer", "natural", "positive", "real":
-		return true
-	// numeric_std functions
-	case "to_unsigned", "to_signed", "to_integer", "to_real":
-		return true
-	case "resize", "shift_left", "shift_right", "rotate_left", "rotate_right":
-		return true
-	// Common functions
-	case "conv_integer", "conv_unsigned", "conv_signed", "conv_std_logic_vector":
-		return true
-	case "rising_edge", "falling_edge", "now", "time":
-		return true
-	default:
-		return false
-	}
+	return CommonVHDLFunctions[strings.ToLower(name)]
 }
 
 // isFunctionCall checks if an identifier appears to be a function call
@@ -3197,6 +3590,25 @@ func addDeclaredSignalName(declaredSignals map[string]bool, name string) {
 		return
 	}
 	declaredSignals[strings.ToLower(name)] = true
+}
+
+func sortedStringSetKeys(set map[string]bool) []string {
+	if len(set) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(set))
+	for k := range set {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		li := strings.ToLower(keys[i])
+		lj := strings.ToLower(keys[j])
+		if li == lj {
+			return keys[i] < keys[j]
+		}
+		return li < lj
+	})
+	return keys
 }
 
 func isDeclaredSignalName(name string, declaredSignals map[string]bool, variableSet map[string]bool) bool {
@@ -3483,6 +3895,9 @@ func childIndex(parent, child *sitter.Node) int {
 	childType := child.Type()
 	for i := 0; i < int(parent.ChildCount()); i++ {
 		c := parent.Child(i)
+		if c == nil {
+			continue
+		}
 		if c.StartByte() == childStart && c.EndByte() == childEnd && c.Type() == childType {
 			return i
 		}
@@ -3652,27 +4067,34 @@ func (e *Extractor) extractReadsFromNodeSkipping(node *sitter.Node, source []byt
 	walk(node, nil, -1)
 }
 
-// isResetName checks if a signal name looks like a reset signal
+// isResetName checks if a signal name looks like a reset signal by substring match.
+// NOTE: May produce false positives on names that contain "rst" as a substring
+// (e.g., "burst_counter", "first_data"). Callers should combine with context
+// (comparison pattern, polarity) to confirm reset intent.
 func isResetName(name string) bool {
 	lower := strings.ToLower(name)
 	return strings.Contains(lower, "rst") || strings.Contains(lower, "reset")
 }
 
 func isStaticAttribute(attr string) bool {
-	switch strings.ToLower(attr) {
-	case "left", "right", "high", "low", "range", "reverse_range", "length",
-		"ascending", "image", "value", "pos", "val", "succ", "pred",
-		"leftof", "rightof", "driving", "driving_value", "simple_name",
-		"instance_name", "path_name":
-		return true
-	default:
-		return false
-	}
+	return StaticAttributes[strings.ToLower(attr)]
 }
 
-// checkResetPattern looks for reset patterns in if statements
-// Pattern: if reset = '1' then (async if first condition before clock edge)
-// Uses grammar: field('condition', alias($._expression, $.condition)) creates a wrapper node
+// checkResetPattern looks for reset patterns in if statements.
+//
+// Supported patterns:
+//   - if rst = '1' then           -> active_high reset
+//   - if rst = '0' then           -> active_low reset
+//   - if rst then                 -> active_high (boolean reset)
+//   - if not rst_n then           -> active_low (negated boolean)
+//   - if rst = '1' and other then -> compound condition, first reset match wins
+//
+// Unsupported (not detected):
+//   - Record field resets: if ctrl.rst = '1' then
+//   - Metalogic levels: if rst = 'L' or rst = 'H' then
+//
+// Reset is classified as async if its condition appears before the clock edge
+// in the if/elsif chain. Uses grammar: field('condition', alias($._expression, $.condition)).
 func (e *Extractor) checkResetPattern(node *sitter.Node, source []byte, proc *Process) {
 	// Get the condition wrapper node via ChildByFieldName
 	condNode := node.ChildByFieldName("condition")
@@ -3686,13 +4108,19 @@ func (e *Extractor) checkResetPattern(node *sitter.Node, source []byte, proc *Pr
 		return
 	}
 
-	// Walk the condition wrapper's children to find reset pattern
+	// Walk the condition wrapper's children to find reset pattern.
+	// For compound conditions (e.g. "rst = '1' and other_cond"), check each
+	// relational_expression independently and use the first reset-named match.
 	var resetSignal string
 	var hasComparison bool
 	var hasValue bool
+	var compValue string // The character literal being compared (e.g., '0' or '1')
 
 	for i := 0; i < int(condNode.ChildCount()); i++ {
 		child := condNode.Child(i)
+		if child == nil {
+			continue
+		}
 		childType := child.Type()
 		childContent := child.Content(source)
 
@@ -3705,33 +4133,74 @@ func (e *Extractor) checkResetPattern(node *sitter.Node, source []byte, proc *Pr
 			hasComparison = true
 		case "character_literal":
 			hasValue = true
+			compValue = childContent
 		case "relational_expression":
-			// If we have a structured relational_expression, use its fields
+			// Extract signal and value from this relational_expression
+			var relSig, relVal string
 			if leftNode := child.ChildByFieldName("left"); leftNode != nil {
 				info := e.extractNameInfo(leftNode, source)
-				if info.Base != "" {
-					resetSignal = info.Base
-				}
+				relSig = info.Base
 			}
-			hasComparison = true
 			if rightNode := child.ChildByFieldName("right"); rightNode != nil {
 				if rightNode.Type() == "character_literal" {
-					hasValue = true
+					relVal = rightNode.Content(source)
 				}
+			}
+			// Use this expression if it has a reset-named signal, or if we
+			// don't have one yet
+			if relSig != "" && (resetSignal == "" || isResetName(relSig)) {
+				resetSignal = relSig
+				hasComparison = true
+				if relVal != "" {
+					hasValue = true
+					compValue = relVal
+				}
+			} else {
+				hasComparison = true
 			}
 		}
 	}
 
 	// If we found a comparison with a reset-named signal, mark it as reset
 	if resetSignal != "" && hasComparison && hasValue {
+		// Determine polarity: rst = '0' or rst_n = '0' → active_low; rst = '1' → active_high
+		polarity := "active_high"
+		if compValue == "'0'" {
+			polarity = "active_low"
+		}
 		if !proc.HasReset && isResetName(resetSignal) {
 			proc.HasReset = true
 			proc.ResetSignal = resetSignal
+			proc.ResetPolarity = polarity
 			// Async reset only if it's not nested under a clocked if-statement
 			if !isWithinClockedIf(node, source) {
 				proc.ResetAsync = true
 			}
 		} else if proc.HasReset && !proc.ResetAsync && isResetName(resetSignal) {
+			if !isWithinClockedIf(node, source) {
+				proc.ResetAsync = true
+			}
+		}
+		return
+	}
+
+	// Boolean reset patterns: "if rst then" or "if not rst_n then"
+	// These have no comparison operator — just a bare identifier (possibly negated).
+	if resetSignal != "" && !hasComparison && isResetName(resetSignal) {
+		// Check for negation: "not rst_n" → active_low; bare "rst" → active_high
+		isNegated := strings.HasPrefix(strings.TrimSpace(condContent), "not ")
+		polarity := "active_high"
+		if isNegated {
+			polarity = "active_low"
+		}
+		if !proc.HasReset {
+			proc.HasReset = true
+			proc.ResetSignal = resetSignal
+			proc.ResetPolarity = polarity
+			if !isWithinClockedIf(node, source) {
+				proc.ResetAsync = true
+			}
+		} else if !proc.ResetAsync {
 			if !isWithinClockedIf(node, source) {
 				proc.ResetAsync = true
 			}
@@ -3786,8 +4255,18 @@ func (e *Extractor) extractClockEdgeFromIfStatement(node *sitter.Node, source []
 	}
 }
 
-// extractClockEdgeFromCondition extracts clock edge from a condition wrapper node
-// Looks for rising_edge(clk) or falling_edge(clk) patterns
+// extractClockEdgeFromCondition extracts clock edge from a condition wrapper node.
+//
+// Supported patterns:
+//   - rising_edge(clk)        -> clock="clk", edge="rising"
+//   - falling_edge(clk)       -> clock="clk", edge="falling"
+//   - clk'event and clk = '1' -> clock="clk", edge="rising"
+//   - clk'event and clk = '0' -> clock="clk", edge="falling"
+//
+// Unsupported (not detected):
+//   - Reversed event check: clk = '1' and clk'event
+//   - Selected names as clocks: sys.clk'event
+//   - Wrapper functions: is_rising(clk) or custom edge detectors
 func (e *Extractor) extractClockEdgeFromCondition(condNode *sitter.Node, source []byte, proc *Process) {
 	condContent := strings.ToLower(condNode.Content(source))
 
@@ -3801,6 +4280,9 @@ func (e *Extractor) extractClockEdgeFromCondition(condNode *sitter.Node, source 
 	// Look for both patterns
 	for i := 0; i < int(condNode.ChildCount()); i++ {
 		child := condNode.Child(i)
+		if child == nil {
+			continue
+		}
 
 		if child.Type() == "indexed_name" {
 			// Structured indexed_name: prefix="rising_edge", content=clock_signal
@@ -3818,6 +4300,9 @@ func (e *Extractor) extractClockEdgeFromCondition(condNode *sitter.Node, source 
 			if funcName == "" || argName == "" {
 				for j := 0; j < int(child.ChildCount()); j++ {
 					c := child.Child(j)
+					if c == nil {
+						continue
+					}
 					if c.Type() == "identifier" {
 						if funcName == "" {
 							funcName = strings.ToLower(c.Content(source))
@@ -3876,6 +4361,9 @@ func clockEdgeFromEventCondition(condNode *sitter.Node, source []byte, clk strin
 	seenClk := false
 	for i := 0; i < int(condNode.ChildCount()); i++ {
 		child := condNode.Child(i)
+		if child == nil {
+			continue
+		}
 		if child.Type() == "identifier" && strings.EqualFold(child.Content(source), clk) {
 			seenClk = true
 			continue
@@ -3913,6 +4401,9 @@ func (e *Extractor) extractSensitivityList(node *sitter.Node, source []byte) []s
 	// Otherwise, collect signal names
 	for i := 0; i < childCount; i++ {
 		child := node.Child(i)
+		if child == nil {
+			continue
+		}
 		childType := child.Type()
 
 		switch childType {
@@ -3927,65 +4418,246 @@ func (e *Extractor) extractSensitivityList(node *sitter.Node, source []byte) []s
 	return signals
 }
 
-func (e *Extractor) extractProcedureCall(node *sitter.Node, source []byte, processLabel, archContext string) ProcedureCall {
+func (e *Extractor) extractProcedureCall(node *sitter.Node, source []byte, processLabel, archContext string, facts *FileFacts) ProcedureCall {
+	callNode := node
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		if child == nil {
+			continue
+		}
+		if child.Type() == "procedure_call" {
+			callNode = child
+			break
+		}
+	}
 	call := ProcedureCall{
 		Line:      int(node.StartPoint().Row) + 1,
 		InProcess: processLabel,
 		InArch:    archContext,
 		Args:      []string{},
 	}
-
-	if prefixNode := node.ChildByFieldName("prefix"); prefixNode != nil {
-		info := e.extractNameInfo(prefixNode, source)
-		name := info.FullPath
-		if name == "" {
-			name = info.Base
+	var info NameInfo
+	prefixCount := 0
+	for i := 0; i < int(callNode.ChildCount()); i++ {
+		if callNode.FieldNameForChild(i) == "prefix" {
+			prefixCount++
 		}
-		if suffixNode := node.ChildByFieldName("suffix"); suffixNode != nil {
-			suffix := strings.TrimSpace(suffixNode.Content(source))
-			if suffix != "" {
+	}
+
+	if nameNode := callNode.ChildByFieldName("name"); nameNode != nil {
+		info = e.extractNameInfo(nameNode, source)
+		call.Name = info.Base
+		call.FullName = info.FullPath
+	}
+
+	if call.Name == "" && prefixCount <= 1 {
+		incFallback(facts, "proc_call_prefix_fallback")
+		if prefixNode := callNode.ChildByFieldName("prefix"); prefixNode != nil {
+			info = e.extractNameInfo(prefixNode, source)
+			name := info.FullPath
+			if name == "" {
+				name = info.Base
+			}
+			for i := 0; i < int(callNode.ChildCount()); i++ {
+				if callNode.FieldNameForChild(i) != "suffix" {
+					continue
+				}
+				suffix := strings.TrimSpace(callNode.Child(i).Content(source))
+				if suffix == "" {
+					continue
+				}
 				if name != "" {
 					name = name + "." + suffix
 				} else {
 					name = suffix
 				}
 			}
+			call.Name = info.Base
+			call.FullName = name
 		}
-		call.Name = info.Base
-		call.FullName = name
-		if call.FullName != "" {
+	}
+
+	if call.Name == "" && prefixCount > 1 {
+		incFallback(facts, "proc_call_multi_prefix_derive")
+		if derived := deriveCallNameFromContent(callNode.Content(source)); derived != "" {
+			call.FullName = derived
+			call.Name = baseNameFromFull(derived)
+		}
+	}
+
+	if call.Name == "" {
+		incFallback(facts, "proc_call_child_scan")
+		var nameNode *sitter.Node
+		for i := 0; i < int(callNode.ChildCount()); i++ {
+			child := callNode.Child(i)
+			if child == nil {
+				continue
+			}
+			switch child.Type() {
+			case "identifier", "selected_name", "indexed_name":
+				nameNode = child
+				i = int(node.ChildCount())
+			}
+		}
+
+		if nameNode == nil {
 			return call
 		}
+
+		info = e.extractNameInfo(nameNode, source)
+		call.Name = info.Base
+		call.FullName = info.FullPath
 	}
 
-	var nameNode *sitter.Node
-	for i := 0; i < int(node.ChildCount()); i++ {
-		child := node.Child(i)
-		switch child.Type() {
-		case "identifier", "selected_name", "indexed_name":
-			nameNode = child
-			i = int(node.ChildCount())
+	if call.Name == "" {
+		incFallback(facts, "proc_call_last_resort_derive")
+		if derived := deriveCallNameFromContent(callNode.Content(source)); derived != "" {
+			call.FullName = derived
+			call.Name = baseNameFromFull(derived)
 		}
 	}
 
-	if nameNode == nil {
-		return call
+	if strings.EqualFold(call.Name, "null") {
+		return ProcedureCall{}
 	}
 
-	info := e.extractNameInfo(nameNode, source)
-	call.Name = info.Base
-	call.FullName = info.FullPath
-
-	// Use indexed_name content as argument list (if present)
-	for _, argList := range info.IndexExprs {
-		for _, arg := range splitArgs(argList) {
-			if arg != "" {
-				call.Args = append(call.Args, arg)
+	if argsNode := callNode.ChildByFieldName("arguments"); argsNode != nil {
+		args := e.extractArgsFromAssociationList(argsNode, source)
+		if len(args) == 0 {
+			argContent := strings.TrimSpace(argsNode.Content(source))
+			if strings.HasPrefix(argContent, "(") && strings.HasSuffix(argContent, ")") && len(argContent) >= 2 {
+				argContent = strings.TrimSpace(argContent[1 : len(argContent)-1])
 			}
+			if argContent != "" {
+				args = append(args, splitArgsRespectParens(argContent)...)
+			}
+		}
+		call.Args = append(call.Args, args...)
+	}
+
+	if len(call.Args) == 0 {
+		// Use indexed_name content as argument list (fallback)
+		for _, argList := range info.IndexExprs {
+			for _, arg := range splitArgsRespectParens(argList) {
+				if arg != "" {
+					call.Args = append(call.Args, arg)
+				}
+			}
+		}
+	}
+	parseArgsFromRaw := func() []string {
+		content := stripLineComments(node.Content(source))
+		idx := strings.Index(content, "(")
+		if idx == -1 {
+			return nil
+		}
+		depth := 0
+		closeIdx := -1
+		for i := idx; i < len(content); i++ {
+			switch content[i] {
+			case '(':
+				depth++
+			case ')':
+				depth--
+				if depth == 0 {
+					closeIdx = i
+					i = len(content)
+				}
+			}
+		}
+		if closeIdx == -1 || closeIdx <= idx {
+			return nil
+		}
+		argList := content[idx+1 : closeIdx]
+		var args []string
+		for _, arg := range splitArgsRespectParens(argList) {
+			if arg != "" {
+				args = append(args, arg)
+			}
+		}
+		return args
+	}
+	if len(call.Args) == 0 {
+		// Last resort: parse args from raw text
+		if parsed := parseArgsFromRaw(); len(parsed) > 0 {
+			call.Args = append(call.Args, parsed...)
+		}
+	}
+	if len(call.Args) == 1 && strings.Count(call.Args[0], "=>") > 1 && !strings.Contains(call.Args[0], ",") {
+		if parsed := parseArgsFromRaw(); len(parsed) > 1 {
+			call.Args = parsed
 		}
 	}
 
 	return call
+}
+
+func deriveCallNameFromContent(content string) string {
+	if content == "" {
+		return ""
+	}
+	trimmed := strings.TrimSpace(content)
+	trimmed = strings.TrimSpace(strings.TrimRight(trimmed, ";"))
+	if trimmed == "" {
+		return ""
+	}
+	if idx := strings.Index(trimmed, "("); idx != -1 {
+		trimmed = strings.TrimSpace(trimmed[:idx])
+	}
+	if fields := strings.Fields(trimmed); len(fields) > 0 {
+		return fields[0]
+	}
+	return trimmed
+}
+
+func baseNameFromFull(full string) string {
+	if full == "" {
+		return ""
+	}
+	if idx := strings.LastIndex(full, "."); idx != -1 && idx+1 < len(full) {
+		return full[idx+1:]
+	}
+	return full
+}
+
+func (e *Extractor) extractArgsFromAssociationList(node *sitter.Node, source []byte) []string {
+	if node == nil {
+		return nil
+	}
+	if node.Type() != "association_list" {
+		for i := 0; i < int(node.ChildCount()); i++ {
+			child := node.Child(i)
+			if child == nil {
+				continue
+			}
+			if child.Type() == "association_list" {
+				return e.extractArgsFromAssociationList(child, source)
+			}
+			if args := e.extractArgsFromAssociationList(child, source); len(args) > 0 {
+				return args
+			}
+		}
+		return nil
+	}
+	var args []string
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		if child == nil {
+			continue
+		}
+		if child.Type() != "association_element" {
+			continue
+		}
+		formal, actual := e.extractAssociationElement(child, source, nil)
+		if actual != "" {
+			if formal != "" {
+				args = append(args, fmt.Sprintf("%s => %s", formal, actual))
+			} else {
+				args = append(args, actual)
+			}
+		}
+	}
+	return args
 }
 
 func (e *Extractor) extractFunctionCall(node *sitter.Node, source []byte, processLabel, archContext string) FunctionCall {
@@ -4001,14 +4673,19 @@ func (e *Extractor) extractFunctionCall(node *sitter.Node, source []byte, proces
 	}
 
 	if argsNode := node.ChildByFieldName("arguments"); argsNode != nil {
-		for i := 0; i < int(argsNode.ChildCount()); i++ {
-			child := argsNode.Child(i)
-			if child.Type() == "," || child.Type() == "(" || child.Type() == ")" {
-				continue
-			}
-			arg := strings.TrimSpace(child.Content(source))
-			if arg != "" {
-				call.Args = append(call.Args, arg)
+		if args := e.extractArgsFromAssociationList(argsNode, source); len(args) > 0 {
+			call.Args = append(call.Args, args...)
+			return call
+		}
+		argContent := strings.TrimSpace(argsNode.Content(source))
+		if strings.HasPrefix(argContent, "(") && strings.HasSuffix(argContent, ")") && len(argContent) >= 2 {
+			argContent = strings.TrimSpace(argContent[1 : len(argContent)-1])
+		}
+		if argContent != "" {
+			for _, arg := range splitArgsRespectParens(argContent) {
+				if arg != "" {
+					call.Args = append(call.Args, arg)
+				}
 			}
 		}
 	}
@@ -4016,7 +4693,7 @@ func (e *Extractor) extractFunctionCall(node *sitter.Node, source []byte, proces
 	return call
 }
 
-func (e *Extractor) extractFunctionCallFromPrefixContent(node *sitter.Node, source []byte, processLabel, archContext string, declaredSignals map[string]bool, variableSet map[string]bool) FunctionCall {
+func (e *Extractor) extractFunctionCallFromPrefixContent(node *sitter.Node, source []byte, processLabel, archContext string, declaredSignals map[string]bool, variableSet map[string]bool, facts *FileFacts) FunctionCall {
 	call := FunctionCall{}
 	if node == nil {
 		return call
@@ -4024,6 +4701,10 @@ func (e *Extractor) extractFunctionCallFromPrefixContent(node *sitter.Node, sour
 
 	switch node.Type() {
 	case "wait_statement", "procedure_call_statement":
+		return call
+	case "indexed_name", "function_call", "sequential_signal_assignment", "assignment_statement":
+		// Allowed node types for fallback call parsing.
+	default:
 		return call
 	}
 
@@ -4040,8 +4721,10 @@ func (e *Extractor) extractFunctionCallFromPrefixContent(node *sitter.Node, sour
 	if name == "" {
 		name = strings.TrimSpace(prefixNode.Content(source))
 	}
-	if suffixNode := node.ChildByFieldName("suffix"); suffixNode != nil {
-		suffix := strings.TrimSpace(suffixNode.Content(source))
+	var suffixNode *sitter.Node
+	if sn := node.ChildByFieldName("suffix"); sn != nil {
+		suffixNode = sn
+		suffix := strings.TrimSpace(sn.Content(source))
 		if suffix != "" {
 			if name != "" {
 				name = name + "." + suffix
@@ -4055,30 +4738,43 @@ func (e *Extractor) extractFunctionCallFromPrefixContent(node *sitter.Node, sour
 	}
 
 	var args []string
-	for i := 0; i < int(node.ChildCount()); i++ {
-		if node.FieldNameForChild(i) != "content" {
-			continue
+	argsFromFallback := false
+	if suffixNode != nil && suffixNode.Type() == "association_list" {
+		args = append(args, e.extractArgsFromAssociationList(suffixNode, source)...)
+	} else if assoc := e.extractArgsFromAssociationList(node, source); len(assoc) > 0 {
+		args = append(args, assoc...)
+	} else {
+		var contentParts []string
+		for i := 0; i < int(node.ChildCount()); i++ {
+			if node.FieldNameForChild(i) != "content" {
+				continue
+			}
+			argContent := strings.TrimSpace(node.Child(i).Content(source))
+			if argContent != "" {
+				contentParts = append(contentParts, argContent)
+			}
 		}
-		argContent := strings.TrimSpace(node.Child(i).Content(source))
-		if argContent == "" {
-			continue
-		}
-		for _, arg := range splitArgs(argContent) {
-			if arg != "" {
-				args = append(args, arg)
+		if len(contentParts) > 0 {
+			argContent := strings.TrimSpace(strings.Join(contentParts, " "))
+			for _, arg := range splitArgsRespectParens(argContent) {
+				if arg != "" {
+					args = append(args, arg)
+				}
 			}
 		}
 	}
+	raw := ""
 	if len(args) == 0 {
 		// Fallback: if content fields are not preserved, parse arguments from raw text
-		raw := node.Content(source)
+		incFallback(facts, "func_call_args_from_raw")
+		raw = node.Content(source)
 		if idx := strings.Index(raw, name); idx != -1 {
 			rest := raw[idx+len(name):]
 			if openIdx := strings.Index(rest, "("); openIdx != -1 {
 				rest = rest[openIdx+1:]
 				if closeIdx := strings.Index(rest, ")"); closeIdx != -1 {
 					argContent := strings.TrimSpace(rest[:closeIdx])
-					for _, arg := range splitArgs(argContent) {
+					for _, arg := range splitArgsRespectParens(argContent) {
 						if arg != "" {
 							args = append(args, arg)
 						}
@@ -4086,8 +4782,49 @@ func (e *Extractor) extractFunctionCallFromPrefixContent(node *sitter.Node, sour
 				}
 			}
 		}
+		if len(args) > 0 {
+			argsFromFallback = true
+		}
+	} else {
+		raw = node.Content(source)
+	}
+	if raw != "" && argsFromFallback {
+		incFallback(facts, "func_call_string_reparse")
+		baseName := info.Base
+		if baseName == "" {
+			baseName = baseNameFromFull(name)
+		}
+		parsed := e.extractFunctionCallsFromString(raw, int(node.StartPoint().Row)+1, processLabel, archContext, declaredSignals, variableSet)
+		for _, candidate := range parsed {
+			if !strings.EqualFold(candidate.Name, baseName) && !strings.EqualFold(candidate.Name, name) {
+				continue
+			}
+			if len(candidate.Args) > len(args) {
+				args = candidate.Args
+				break
+			}
+		}
 	}
 	if len(args) == 0 {
+		return call
+	}
+
+	raw = node.Content(source)
+	if (len(args) == 1 && strings.TrimSpace(args[0]) == ".") ||
+		(strings.Contains(name, ".") && !strings.Contains(raw, name+"(")) {
+		baseName := info.Base
+		if baseName == "" {
+			baseName = baseNameFromFull(name)
+		}
+		parsed := e.extractFunctionCallsFromString(raw, int(node.StartPoint().Row)+1, processLabel, archContext, declaredSignals, variableSet)
+		for _, candidate := range parsed {
+			if candidate.Name == baseName || candidate.Name == name {
+				return candidate
+			}
+		}
+		if len(parsed) > 0 {
+			return parsed[0]
+		}
 		return call
 	}
 
@@ -4124,6 +4861,9 @@ func (e *Extractor) extractWaitStatement(node *sitter.Node, source []byte) WaitS
 	mode := ""
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
+		if child == nil {
+			continue
+		}
 		switch strings.ToLower(child.Content(source)) {
 		case "on":
 			mode = "on"
@@ -4196,38 +4936,58 @@ func (e *Extractor) extractWaitStatement(node *sitter.Node, source []byte) WaitS
 }
 
 func (e *Extractor) extractVerificationTags(source []byte, facts *FileFacts) {
-	if len(facts.VerificationBlocks) == 0 {
-		return
-	}
 	lines := strings.Split(string(source), "\n")
-	for _, block := range facts.VerificationBlocks {
-		start := block.LineStart
-		end := block.LineEnd
-		if start < 1 {
-			start = 1
-		}
-		if end > len(lines) {
-			end = len(lines)
-		}
-		for i := start; i <= end; i++ {
-			line := lines[i-1]
-			idx := strings.Index(line, "--@check")
-			if idx < 0 {
-				continue
+	blocks := facts.VerificationBlocks
+
+	blockForLine := func(line int) (VerificationBlock, bool) {
+		for _, block := range blocks {
+			if line >= block.LineStart && line <= block.LineEnd {
+				return block, true
 			}
-			tag, err := parseVerificationTagLine(line[idx:], i)
-			if err != nil {
+		}
+		return VerificationBlock{}, false
+	}
+
+	for i, line := range lines {
+		lineNo := i + 1
+		block, inBlock := blockForLine(lineNo)
+		if idx := strings.Index(line, "--@check"); idx >= 0 {
+			if inBlock {
+				tag, err := parseVerificationTagLine(line[idx:], lineNo)
+				if err != nil {
+					facts.VerificationTagErrors = append(facts.VerificationTagErrors, VerificationTagError{
+						Line:    lineNo,
+						Raw:     strings.TrimSpace(line),
+						Message: err.Error(),
+						InArch:  block.InArch,
+					})
+				} else {
+					tag.Raw = strings.TrimSpace(line)
+					tag.InArch = block.InArch
+					facts.VerificationTags = append(facts.VerificationTags, tag)
+				}
+			} else {
 				facts.VerificationTagErrors = append(facts.VerificationTagErrors, VerificationTagError{
-					Line:    i,
+					Line:    lineNo,
+					Raw:     strings.TrimSpace(line),
+					Message: "stray verification tag outside verification block",
+				})
+			}
+		}
+		if idx := strings.Index(line, "--@waive"); idx >= 0 && inBlock {
+			waiver, err := parseVerificationWaiverLine(line[idx:], lineNo)
+			if err != nil {
+				facts.VerificationWaiverErrors = append(facts.VerificationWaiverErrors, VerificationWaiverError{
+					Line:    lineNo,
 					Raw:     strings.TrimSpace(line),
 					Message: err.Error(),
 					InArch:  block.InArch,
 				})
-				continue
+			} else {
+				waiver.Raw = strings.TrimSpace(line)
+				waiver.InArch = block.InArch
+				facts.VerificationWaivers = append(facts.VerificationWaivers, waiver)
 			}
-			tag.Raw = strings.TrimSpace(line)
-			tag.InArch = block.InArch
-			facts.VerificationTags = append(facts.VerificationTags, tag)
 		}
 	}
 }
@@ -4245,16 +5005,11 @@ func parseVerificationTagLine(line string, lineNo int) (VerificationTag, error) 
 	if rest == "" {
 		return tag, fmt.Errorf("empty tag line")
 	}
-	for _, part := range strings.Fields(rest) {
-		kv := strings.SplitN(part, "=", 2)
-		if len(kv) != 2 {
-			return tag, fmt.Errorf("invalid tag token %q", part)
-		}
-		key := strings.TrimSpace(strings.ToLower(kv[0]))
-		val := strings.TrimSpace(kv[1])
-		if key == "" || val == "" {
-			return tag, fmt.Errorf("invalid tag token %q", part)
-		}
+	kv, err := parseKeyValueTokens(rest)
+	if err != nil {
+		return tag, err
+	}
+	for key, val := range kv {
 		switch key {
 		case "id":
 			tag.ID = val
@@ -4273,6 +5028,106 @@ func parseVerificationTagLine(line string, lineNo int) (VerificationTag, error) 
 	return tag, nil
 }
 
+func parseVerificationWaiverLine(line string, lineNo int) (VerificationWaiver, error) {
+	waiver := VerificationWaiver{Line: lineNo}
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "--@waive") {
+		return waiver, fmt.Errorf("waiver line must start with --@waive")
+	}
+	rest := strings.TrimSpace(strings.TrimPrefix(line, "--@waive"))
+	if rest == "" {
+		return waiver, fmt.Errorf("empty waiver line")
+	}
+	kv, err := parseKeyValueTokens(rest)
+	if err != nil {
+		return waiver, err
+	}
+	for key, val := range kv {
+		switch key {
+		case "id":
+			waiver.ID = val
+		case "scope":
+			waiver.Scope = val
+		case "reason":
+			waiver.Reason = val
+		case "owner":
+			waiver.Owner = val
+		case "expires":
+			waiver.Expires = val
+		default:
+			return waiver, fmt.Errorf("unknown waiver field %q", key)
+		}
+	}
+	if waiver.ID == "" {
+		return waiver, fmt.Errorf("missing id")
+	}
+	if waiver.Scope == "" {
+		return waiver, fmt.Errorf("missing scope")
+	}
+	if waiver.Reason == "" {
+		return waiver, fmt.Errorf("missing reason")
+	}
+	return waiver, nil
+}
+
+func parseKeyValueTokens(rest string) (map[string]string, error) {
+	out := make(map[string]string)
+	i := 0
+	for i < len(rest) {
+		for i < len(rest) && (rest[i] == ' ' || rest[i] == '\t') {
+			i++
+		}
+		if i >= len(rest) {
+			break
+		}
+		startKey := i
+		for i < len(rest) && rest[i] != '=' && rest[i] != ' ' && rest[i] != '\t' {
+			i++
+		}
+		if i >= len(rest) || rest[i] != '=' {
+			return nil, fmt.Errorf("invalid token near %q", rest[startKey:])
+		}
+		key := strings.ToLower(strings.TrimSpace(rest[startKey:i]))
+		i++ // skip '='
+		if i >= len(rest) {
+			return nil, fmt.Errorf("missing value for %q", key)
+		}
+		var val string
+		if rest[i] == '"' {
+			i++
+			var b strings.Builder
+			for i < len(rest) {
+				if rest[i] == '\\' && i+1 < len(rest) {
+					b.WriteByte(rest[i+1])
+					i += 2
+					continue
+				}
+				if rest[i] == '"' {
+					i++
+					break
+				}
+				b.WriteByte(rest[i])
+				i++
+			}
+			val = b.String()
+		} else {
+			startVal := i
+			for i < len(rest) && rest[i] != ' ' && rest[i] != '\t' {
+				i++
+			}
+			val = strings.TrimSpace(rest[startVal:i])
+		}
+		if key == "" || val == "" {
+			return nil, fmt.Errorf("invalid token for %q", key)
+		}
+		out[key] = val
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("empty annotation")
+	}
+	return out, nil
+}
+
 func splitArgs(raw string) []string {
 	parts := strings.Split(raw, ",")
 	var args []string
@@ -4289,16 +5144,33 @@ func splitArgsRespectParens(raw string) []string {
 	var args []string
 	start := 0
 	depth := 0
+	inString := false
 	for i := 0; i < len(raw); i++ {
 		switch raw[i] {
+		case '"':
+			if i+1 < len(raw) && raw[i+1] == '"' {
+				i++
+			} else {
+				inString = !inString
+			}
+		case '\'':
+			if inString {
+				continue
+			}
+			// Skip over character literals like ',' or '0' to avoid splitting on commas within.
+			if i+2 < len(raw) && raw[i+2] == '\'' {
+				i += 2
+			}
 		case '(':
-			depth++
+			if !inString {
+				depth++
+			}
 		case ')':
-			if depth > 0 {
+			if !inString && depth > 0 {
 				depth--
 			}
 		case ',':
-			if depth == 0 {
+			if depth == 0 && !inString {
 				part := strings.TrimSpace(raw[start:i])
 				if part != "" {
 					args = append(args, part)
@@ -4329,6 +5201,7 @@ func (e *Extractor) extractNestedCallsFromArgs(args []string, line int, processL
 
 func (e *Extractor) extractFunctionCallsFromString(raw string, line int, processLabel, archContext string, declaredSignals map[string]bool, variableSet map[string]bool) []FunctionCall {
 	var calls []FunctionCall
+	raw = stripLineComments(raw)
 	i := 0
 	for i < len(raw) {
 		ch := raw[i]
@@ -4348,6 +5221,16 @@ func (e *Extractor) extractFunctionCallsFromString(raw string, line int, process
 		if i >= len(raw) || raw[i] != '(' || name == "" {
 			continue
 		}
+		// Skip attribute references like Type'val(...)
+		if start > 0 {
+			k := start - 1
+			for k > 0 && raw[k] == ' ' {
+				k--
+			}
+			if raw[k] == '\'' {
+				continue
+			}
+		}
 
 		depth := 0
 		j := i
@@ -4366,12 +5249,46 @@ func (e *Extractor) extractFunctionCallsFromString(raw string, line int, process
 			i++
 			continue
 		}
+		// Skip indexed names like Signal(1).Field(...) (array/record access)
+		next := j + 1
+		for next < len(raw) && raw[next] == ' ' {
+			next++
+		}
+		if next < len(raw) && raw[next] == '.' {
+			i = j + 1
+			continue
+		}
+		// Skip record field slices like Rec(1).Field(7 downto 0)
+		if start > 0 {
+			prev := start - 1
+			for prev > 0 && raw[prev] == ' ' {
+				prev--
+			}
+			if raw[prev] == '.' && prev > 0 {
+				back := prev - 1
+				for back > 0 && raw[back] == ' ' {
+					back--
+				}
+				if back >= 0 && raw[back] == ')' {
+					i = j + 1
+					continue
+				}
+			}
+		}
 
 		base := name
 		if idx := strings.LastIndex(base, "."); idx != -1 {
 			base = base[idx+1:]
 		}
 		baseLower := strings.ToLower(base)
+		if isCallOperatorName(baseLower) && !strings.Contains(name, ".") {
+			i = j + 1
+			continue
+		}
+		if strings.HasSuffix(baseLower, "_c") && !strings.Contains(name, ".") {
+			i = j + 1
+			continue
+		}
 		if baseLower == "rising_edge" || baseLower == "falling_edge" {
 			i = j + 1
 			continue
@@ -4380,8 +5297,19 @@ func (e *Extractor) extractFunctionCallsFromString(raw string, line int, process
 			i = j + 1
 			continue
 		}
+		if strings.Contains(name, ".") {
+			prefix := strings.SplitN(name, ".", 2)[0]
+			if isDeclaredSignalName(prefix, declaredSignals, variableSet) {
+				i = j + 1
+				continue
+			}
+		}
 
 		argContent := strings.TrimSpace(raw[i+1 : j])
+		if strings.Contains(name, ".") && looksLikeSliceContent(argContent) && !strings.Contains(argContent, ",") {
+			i = j + 1
+			continue
+		}
 		call := FunctionCall{
 			Name:      name,
 			Args:      splitArgsRespectParens(argContent),
@@ -4396,6 +5324,28 @@ func (e *Extractor) extractFunctionCallsFromString(raw string, line int, process
 		i = j + 1
 	}
 	return calls
+}
+
+func stripLineComments(raw string) string {
+	if !strings.Contains(raw, "--") {
+		return raw
+	}
+	lines := strings.Split(raw, "\n")
+	for i, line := range lines {
+		if idx := strings.Index(line, "--"); idx != -1 {
+			lines[i] = line[:idx]
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func looksLikeSliceContent(raw string) bool {
+	lower := strings.ToLower(strings.TrimSpace(raw))
+	return strings.Contains(lower, " downto ") || strings.Contains(lower, " to ") || strings.Contains(lower, "'range")
+}
+
+func isCallOperatorName(name string) bool {
+	return CallOperatorNames[strings.ToLower(name)]
 }
 
 func isIdentifierStart(ch byte) bool {
@@ -4423,15 +5373,22 @@ func (e *Extractor) extractCaseStatement(node *sitter.Node, source []byte, archC
 	// Walk children to find case_alternative nodes
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
+		if child == nil {
+			continue
+		}
 		if child.Type() == "case_alternative" {
 			// Extract choices from this alternative
 			for j := 0; j < int(child.ChildCount()); j++ {
 				choiceChild := child.Child(j)
+				if choiceChild == nil {
+					continue
+				}
 				if choiceChild.Type() == "case_choice" {
 					// Check if this choice contains others_choice
 					isOthers := false
 					for k := 0; k < int(choiceChild.ChildCount()); k++ {
-						if choiceChild.Child(k).Type() == "others_choice" {
+						ck := choiceChild.Child(k)
+						if ck != nil && ck.Type() == "others_choice" {
 							caseStmt.HasOthers = true
 							caseStmt.Choices = append(caseStmt.Choices, "others")
 							isOthers = true
@@ -4593,6 +5550,9 @@ func (e *Extractor) extractComparisonFromSiblings(opNode, parent *sitter.Node, s
 	// Look backwards for left operand (skip non-value nodes)
 	for i := opIndex - 1; i >= 0; i-- {
 		child := parent.Child(i)
+		if child == nil {
+			continue
+		}
 		if isValueNode(child) {
 			comp.LeftOperand = e.extractExpressionSignal(child, source)
 			break
@@ -4602,6 +5562,9 @@ func (e *Extractor) extractComparisonFromSiblings(opNode, parent *sitter.Node, s
 	// Look forwards for right operand
 	for i := opIndex + 1; i < int(parent.ChildCount()); i++ {
 		child := parent.Child(i)
+		if child == nil {
+			continue
+		}
 		if isValueNode(child) {
 			comp.RightOperand = e.extractExpressionSignal(child, source)
 			// Check for literal (hex string, number, etc.)
@@ -4775,6 +5738,9 @@ func (e *Extractor) extractArithmeticOpsFromProcess(node *sitter.Node, source []
 				// Fallback: extract first identifier if condition field is missing
 				for i := 0; i < int(n.ChildCount()); i++ {
 					child := n.Child(i)
+					if child == nil {
+						continue
+					}
 					if child.Type() == "identifier" {
 						guardStack = append(guardStack, child.Content(source))
 						break
@@ -4794,6 +5760,9 @@ func (e *Extractor) extractArithmeticOpsFromProcess(node *sitter.Node, source []
 			// Recurse into operands for nested operations, skip the operator node
 			for i := 0; i < int(n.ChildCount()); i++ {
 				child := n.Child(i)
+				if child == nil {
+					continue
+				}
 				if child.Type() != "multiplicative_operator" && child.Type() != "arithmetic_operator" {
 					walk(child)
 				}
@@ -4809,6 +5778,9 @@ func (e *Extractor) extractArithmeticOpsFromProcess(node *sitter.Node, source []
 			// Recurse into operands for nested operations
 			for i := 0; i < int(n.ChildCount()); i++ {
 				child := n.Child(i)
+				if child == nil {
+					continue
+				}
 				if child.Type() != "arithmetic_operator" {
 					walk(child)
 				}
@@ -4941,6 +5913,9 @@ func (e *Extractor) extractArithmeticOpFromSiblings(opNode, parent *sitter.Node,
 
 	for i := opIndex - 1; i >= 0; i-- {
 		child := parent.Child(i)
+		if child == nil {
+			continue
+		}
 		if isValueNode(child) {
 			if sig := e.extractExpressionSignal(child, source); sig != "" {
 				op.Operands = append(op.Operands, sig)
@@ -4951,6 +5926,9 @@ func (e *Extractor) extractArithmeticOpFromSiblings(opNode, parent *sitter.Node,
 
 	for i := opIndex + 1; i < int(parent.ChildCount()); i++ {
 		child := parent.Child(i)
+		if child == nil {
+			continue
+		}
 		if isValueNode(child) {
 			if sig := e.extractExpressionSignal(child, source); sig != "" {
 				op.Operands = append(op.Operands, sig)
@@ -5003,6 +5981,9 @@ func (e *Extractor) extractSignalDepsFromAssignment(node *sitter.Node, source []
 		// Extract full path from inside the wrapper
 		for i := 0; i < int(targetNode.ChildCount()) && target == ""; i++ {
 			child := targetNode.Child(i)
+			if child == nil {
+				continue
+			}
 			if child.Type() == "identifier" {
 				target = child.Content(source)
 				break
@@ -5018,12 +5999,12 @@ func (e *Extractor) extractSignalDepsFromAssignment(node *sitter.Node, source []
 	e.extractReadsWithFullPathsSkipping(node, source, readSet, false, targetNode)
 
 	// Create dependencies
-	for source := range readSet {
-		if targetIsIndexed && source == target {
+	for _, srcSig := range sortedStringSetKeys(readSet) {
+		if targetIsIndexed && srcSig == target {
 			continue
 		}
 		deps = append(deps, SignalDep{
-			Source:       source,
+			Source:       srcSig,
 			Target:       target,
 			InProcess:    processLabel,
 			IsSequential: isSequential,
@@ -5089,6 +6070,9 @@ func (e *Extractor) extractReadsWithFullPathsSkipping(node *sitter.Node, source 
 			// Still recurse into index expressions to find signals used in indices
 			for i := 0; i < int(n.ChildCount()); i++ {
 				child := n.Child(i)
+				if child == nil {
+					continue
+				}
 				childType := child.Type()
 				// Skip the base (first identifier, selected_name, or indexed_name)
 				if childType != "identifier" && childType != "selected_name" && childType != "indexed_name" {
@@ -5159,6 +6143,9 @@ func (e *Extractor) extractSignalDepsFromConcurrent(node *sitter.Node, source []
 		}
 		for i := 0; i < int(targetNode.ChildCount()) && target == ""; i++ {
 			child := targetNode.Child(i)
+			if child == nil {
+				continue
+			}
 			switch child.Type() {
 			case "identifier":
 				target = child.Content(source)
@@ -5170,7 +6157,7 @@ func (e *Extractor) extractSignalDepsFromConcurrent(node *sitter.Node, source []
 
 	e.extractReadsWithFullPathsSkipping(node, source, readSet, false, targetNode)
 
-	for src := range readSet {
+	for _, src := range sortedStringSetKeys(readSet) {
 		if targetIsIndexed && src == target {
 			continue
 		}
@@ -5209,6 +6196,9 @@ func (e *Extractor) extractGenerateStatement(node *sitter.Node, source []byte, c
 	var bodyNode *sitter.Node
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
+		if child == nil {
+			continue
+		}
 		childType := child.Type()
 
 		switch childType {
@@ -5275,6 +6265,9 @@ func (e *Extractor) extractRangeFromNode(node *sitter.Node, source []byte, gen *
 	// Look for range_expression child with named fields
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
+		if child == nil {
+			continue
+		}
 		if child.Type() == "range_expression" {
 			// Use grammar fields for clean extraction
 			if lowNode := child.ChildByFieldName("low"); lowNode != nil {
@@ -5299,18 +6292,7 @@ func (e *Extractor) extractRangeFromNode(node *sitter.Node, source []byte, gen *
 
 // isVHDLKeyword checks if a string is a VHDL keyword (used to filter out keywords in range extraction)
 func isVHDLKeyword(s string) bool {
-	switch s {
-	case "for", "in", "generate", "loop", "if", "then", "else", "elsif", "end",
-		"begin", "is", "when", "case", "of", "signal", "variable", "constant",
-		"type", "subtype", "array", "record", "range", "others", "null",
-		"process", "function", "procedure", "package", "entity", "architecture",
-		"component", "port", "generic", "map", "use", "library", "all",
-		"and", "or", "not", "xor", "nand", "nor", "xnor",
-		"abs", "mod", "rem", "sll", "srl", "sla", "sra", "rol", "ror":
-		return true
-	default:
-		return false
-	}
+	return VHDLKeywords[strings.ToLower(s)]
 }
 
 // parseForGenerateRange extracts low/high/dir from for-generate text
@@ -5495,7 +6477,7 @@ func (e *Extractor) extractTypeDeclaration(node *sitter.Node, source []byte, pkg
 				td.Kind = "access"
 			} else if strings.HasPrefix(content, "file") {
 				td.Kind = "file"
-			} else if strings.Contains(content, "range") {
+			} else if hasChildOfType(defNode, "range_constraint") || hasChildWithTypeContaining(defNode, "range") {
 				td.Kind = "range"
 				// Try to extract range details
 				e.extractRangeDetails(defNode, source, &td)
@@ -5503,10 +6485,9 @@ func (e *Extractor) extractTypeDeclaration(node *sitter.Node, source []byte, pkg
 				td.Kind = "alias" // Simple type alias
 				// Fallback: some grammars inline the range tokens and the definition
 				// field may only capture numeric children. Use the full declaration text.
-				full := strings.ToLower(node.Content(source))
-				if strings.Contains(full, " range ") {
+				if hasChildOfType(node, "range_constraint") || hasChildWithTypeContaining(node, "range") {
 					td.Kind = "range"
-					e.extractRangeDetailsFromText(full, &td)
+					e.extractRangeDetailsFromText(strings.ToLower(node.Content(source)), &td)
 				}
 			}
 		}
@@ -5523,6 +6504,9 @@ func (e *Extractor) extractEnumLiteralsFromDef(node *sitter.Node, source []byte)
 	var literals []string
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
+		if child == nil {
+			continue
+		}
 		switch child.Type() {
 		case "identifier":
 			literals = append(literals, child.Content(source))
@@ -5540,6 +6524,9 @@ func (e *Extractor) extractRecordFields(node *sitter.Node, source []byte) []Reco
 
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
+		if child == nil {
+			continue
+		}
 		if child.Type() == "element_declaration" {
 			// element_declaration: name[, name...] : type;
 			fieldLine := int(child.StartPoint().Row) + 1
@@ -5622,6 +6609,9 @@ func (e *Extractor) extractArrayTypeDetails(node *sitter.Node, source []byte, td
 	// Walk children to find index types and element type
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
+		if child == nil {
+			continue
+		}
 		childType := child.Type()
 
 		// Index constraints come before 'of' keyword
@@ -5660,6 +6650,9 @@ func (e *Extractor) extractPhysicalTypeDetails(node *sitter.Node, source []byte,
 	// Physical type: range X to Y units base_unit; secondary_units... end units;
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
+		if child == nil {
+			continue
+		}
 		if child.Type() == "identifier" && td.BaseUnit == "" {
 			td.BaseUnit = child.Content(source)
 			break
@@ -5789,6 +6782,9 @@ func (e *Extractor) extractSubtypeDeclaration(node *sitter.Node, source []byte, 
 		sawIs := false
 		for i := 0; i < int(node.ChildCount()); i++ {
 			child := node.Child(i)
+			if child == nil {
+				continue
+			}
 			childContent := child.Content(source)
 
 			if strings.ToLower(childContent) == "is" {
@@ -5825,6 +6821,48 @@ func (e *Extractor) extractSubtypeDeclaration(node *sitter.Node, source []byte, 
 	return st
 }
 
+// hasChildOfType returns true if the node has a direct child with the given type.
+func hasChildOfType(node *sitter.Node, childType string) bool {
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		if child != nil && child.Type() == childType {
+			return true
+		}
+	}
+	return false
+}
+
+// hasChildWithTypeContaining returns true if the node has a direct child whose
+// type name contains the given substring.
+func hasChildWithTypeContaining(node *sitter.Node, substr string) bool {
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		if child != nil && strings.Contains(child.Type(), substr) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasBodyStatements checks whether a subprogram node contains a body by looking
+// for executable child nodes (statements, assignments, calls).
+// This is more robust than string-matching "begin" in the source text.
+func hasBodyStatements(node *sitter.Node) bool {
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		if child == nil {
+			continue
+		}
+		ct := child.Type()
+		if strings.HasSuffix(ct, "_statement") || strings.HasSuffix(ct, "_assignment") ||
+			ct == "variable_declaration" || ct == "sequence_of_statements" ||
+			ct == "procedure_call" || ct == "return_statement" {
+			return true
+		}
+	}
+	return false
+}
+
 // extractFunctionDeclaration extracts a function declaration or body
 // Grammar: [pure|impure] function name [parameters] return type [is ... end];
 func (e *Extractor) extractFunctionDeclaration(node *sitter.Node, source []byte, pkgContext, archContext string) FunctionDeclaration {
@@ -5841,10 +6879,8 @@ func (e *Extractor) extractFunctionDeclaration(node *sitter.Node, source []byte,
 		fd.IsPure = false
 	}
 
-	// Check if this has a body (contains "is" followed by "begin")
-	if strings.Contains(content, "begin") {
-		fd.HasBody = true
-	}
+	// Check if this has a body by scanning for statement child nodes
+	fd.HasBody = hasBodyStatements(node)
 
 	// Extract function name
 	if nameNode := node.ChildByFieldName("name"); nameNode != nil {
@@ -5871,11 +6907,8 @@ func (e *Extractor) extractProcedureDeclaration(node *sitter.Node, source []byte
 		InArch:    archContext,
 	}
 
-	// Check if this has a body
-	content := strings.ToLower(node.Content(source))
-	if strings.Contains(content, "begin") {
-		pd.HasBody = true
-	}
+	// Check if this has a body by scanning for statement child nodes
+	pd.HasBody = hasBodyStatements(node)
 
 	// Extract procedure name
 	if nameNode := node.ChildByFieldName("name"); nameNode != nil {
@@ -5886,6 +6919,110 @@ func (e *Extractor) extractProcedureDeclaration(node *sitter.Node, source []byte
 	pd.Parameters = e.extractSubprogramParameters(node, source)
 
 	return pd
+}
+
+// extractAliasDeclaration extracts function/procedure aliases from alias_declaration nodes.
+// Only subprogram aliases with a signature are captured; object/type aliases are ignored.
+func (e *Extractor) extractAliasDeclaration(node *sitter.Node, source []byte, pkgContext, archContext string) (*FunctionDeclaration, *ProcedureDeclaration) {
+	if node == nil {
+		return nil, nil
+	}
+	nameNode := node.ChildByFieldName("name")
+	if nameNode == nil {
+		return nil, nil
+	}
+	aliasName := strings.TrimSpace(nameNode.Content(source))
+	if aliasName == "" {
+		return nil, nil
+	}
+
+	params, returnType := extractAliasSignature(node.Content(source))
+	if len(params) == 0 && returnType == "" {
+		// No signature: likely object/type alias; ignore for subprogram tracking.
+		return nil, nil
+	}
+
+	line := int(node.StartPoint().Row) + 1
+	if returnType != "" {
+		fd := FunctionDeclaration{
+			Name:       aliasName,
+			ReturnType: returnType,
+			Line:       line,
+			InPackage:  pkgContext,
+			InArch:     archContext,
+		}
+		for i, p := range params {
+			fd.Parameters = append(fd.Parameters, SubprogramParameter{
+				Name: fmt.Sprintf("arg%d", i+1),
+				Type: p,
+				Line: line,
+			})
+		}
+		return &fd, nil
+	}
+
+	pd := ProcedureDeclaration{
+		Name:      aliasName,
+		Line:      line,
+		InPackage: pkgContext,
+		InArch:    archContext,
+	}
+	for i, p := range params {
+		pd.Parameters = append(pd.Parameters, SubprogramParameter{
+			Name: fmt.Sprintf("arg%d", i+1),
+			Type: p,
+			Line: line,
+		})
+	}
+	return nil, &pd
+}
+
+func (e *Extractor) extractObjectAlias(node *sitter.Node, source []byte) (string, string) {
+	if node == nil {
+		return "", ""
+	}
+	raw := node.Content(source)
+	re := regexp.MustCompile(`(?is)\balias\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*([^;]+?)\s+is\b`)
+	match := re.FindStringSubmatch(raw)
+	if match == nil {
+		return "", ""
+	}
+	name := strings.TrimSpace(match[1])
+	typ := strings.TrimSpace(match[2])
+	if name == "" || typ == "" {
+		return "", ""
+	}
+	return name, typ
+}
+
+func extractAliasSignature(content string) (params []string, returnType string) {
+	start := strings.Index(content, "[")
+	end := strings.LastIndex(content, "]")
+	if start == -1 || end == -1 || end <= start {
+		return nil, ""
+	}
+	sig := strings.TrimSpace(content[start+1 : end])
+	if sig == "" {
+		return nil, ""
+	}
+
+	lower := strings.ToLower(sig)
+	retIdx := strings.Index(lower, "return")
+	paramPart := sig
+	if retIdx != -1 {
+		paramPart = strings.TrimSpace(sig[:retIdx])
+		returnType = strings.TrimSpace(sig[retIdx+len("return"):])
+	}
+
+	if paramPart != "" {
+		for _, part := range strings.Split(paramPart, ",") {
+			p := strings.TrimSpace(part)
+			if p != "" {
+				params = append(params, p)
+			}
+		}
+	}
+	return params, strings.TrimSpace(returnType)
 }
 
 // extractSubprogramParameters extracts parameters from a function/procedure
@@ -5934,6 +7071,9 @@ func (e *Extractor) extractSubprogramParameters(node *sitter.Node, source []byte
 			// Walk children for names and type
 			for i := 0; i < int(n.ChildCount()); i++ {
 				child := n.Child(i)
+				if child == nil {
+					continue
+				}
 				childContent := child.Content(source)
 
 				if childContent == ":" {
@@ -5983,61 +7123,6 @@ func (e *Extractor) extractSubprogramParameters(node *sitter.Node, source []byte
 	return params
 }
 
-// extractSimple is a fallback regex-based extractor when Tree-sitter isn't available
-func (e *Extractor) extractSimple(filePath string, content []byte) (FileFacts, error) {
-	facts := FileFacts{File: filePath}
-
-	// Simple line-by-line parsing for basic fact extraction
-	// This is a placeholder - real implementation would use regex patterns
-
-	text := string(content)
-	lines := splitLines(text)
-
-	for i, line := range lines {
-		lineNum := i + 1
-
-		// Very basic pattern matching
-		if matches := matchEntity(line); matches != nil {
-			facts.Entities = append(facts.Entities, Entity{
-				Name: matches[0],
-				Line: lineNum,
-			})
-		}
-
-		if matches := matchArchitecture(line); matches != nil {
-			facts.Architectures = append(facts.Architectures, Architecture{
-				Name:       matches[0],
-				EntityName: matches[1],
-				Line:       lineNum,
-			})
-		}
-
-		if matches := matchPackage(line); matches != nil {
-			facts.Packages = append(facts.Packages, Package{
-				Name: matches[0],
-				Line: lineNum,
-			})
-		}
-	}
-
-	return facts, nil
-}
-
-func splitLines(s string) []string {
-	var lines []string
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\n' {
-			lines = append(lines, s[start:i])
-			start = i + 1
-		}
-	}
-	if start < len(s) {
-		lines = append(lines, s[start:])
-	}
-	return lines
-}
-
 // =============================================================================
 // GENERATE ELABORATION
 // =============================================================================
@@ -6065,8 +7150,8 @@ func elaborateGenerate(gen *GenerateStatement, constants map[string]int) bool {
 	}
 
 	// Try to evaluate low and high bounds
-	low, okLow := evaluateRangeExpr(gen.RangeLow, constants)
-	high, okHigh := evaluateRangeExpr(gen.RangeHigh, constants)
+	low, okLow := evaluateRangeExpr(gen.RangeLow, constants, 0)
+	high, okHigh := evaluateRangeExpr(gen.RangeHigh, constants, 0)
 
 	if !okLow || !okHigh {
 		gen.IterationCount = -1
@@ -6097,9 +7182,14 @@ func elaborateGenerate(gen *GenerateStatement, constants map[string]int) bool {
 	return true
 }
 
-// evaluateRangeExpr evaluates a simple range expression
-// Handles: integer literals, identifiers (from constants), simple arithmetic
-func evaluateRangeExpr(expr string, constants map[string]int) (int, bool) {
+// evaluateRangeExpr evaluates a simple range expression.
+// Handles: integer literals, identifiers (from constants), simple arithmetic.
+// depth limits recursion to prevent stack overflow on pathological input.
+func evaluateRangeExpr(expr string, constants map[string]int, depth int) (int, bool) {
+	const maxEvalDepth = 20
+	if depth > maxEvalDepth {
+		return 0, false
+	}
 	expr = strings.TrimSpace(expr)
 	if expr == "" {
 		return 0, false
@@ -6117,59 +7207,92 @@ func evaluateRangeExpr(expr string, constants map[string]int) (int, bool) {
 
 	// Try to evaluate simple arithmetic expressions
 	// Handle: CONST - 1, CONST + 1, CONST * 2, CONST / 2
-	return evaluateSimpleArithmetic(expr, constants)
+	return evaluateSimpleArithmetic(expr, constants, depth+1)
 }
 
 // parseIntLiteral parses an integer literal (decimal, hex, binary, octal)
 func parseIntLiteral(s string) (int, error) {
 	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty integer literal")
+	}
 
 	// Handle VHDL-style based literals: 16#FF#, 2#1010#, 8#77#
 	if strings.Contains(s, "#") {
 		return parseBasedLiteral(s)
 	}
 
-	// Standard Go parsing handles decimal
-	var val int
-	_, err := fmt.Sscanf(s, "%d", &val)
-	return val, err
+	// Strict decimal parsing: reject partial tokens like "10ns".
+	s = strings.ReplaceAll(s, "_", "")
+	val, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, fmt.Errorf("invalid decimal literal %q: %w", s, err)
+	}
+	return val, nil
 }
 
 // parseBasedLiteral parses VHDL based literals like 16#FF#, 2#1010#
 func parseBasedLiteral(s string) (int, error) {
+	s = strings.TrimSpace(s)
 	parts := strings.Split(s, "#")
-	if len(parts) < 2 {
+	if len(parts) < 3 {
 		return 0, fmt.Errorf("invalid based literal: %s", s)
 	}
 
-	base, err := fmt.Sscanf(parts[0], "%d", new(int))
-	if err != nil || base == 0 {
+	baseStr := strings.ReplaceAll(strings.TrimSpace(parts[0]), "_", "")
+	baseVal, err := strconv.Atoi(baseStr)
+	if err != nil || baseVal < 2 || baseVal > 16 {
 		return 0, fmt.Errorf("invalid base: %s", parts[0])
 	}
 
-	var baseVal int
-	fmt.Sscanf(parts[0], "%d", &baseVal)
-
 	// Parse the value part in the given base
-	valueStr := strings.ToLower(parts[1])
-	var result int
-	for _, c := range valueStr {
-		var digit int
-		if c >= '0' && c <= '9' {
-			digit = int(c - '0')
-		} else if c >= 'a' && c <= 'f' {
-			digit = int(c - 'a' + 10)
-		} else {
-			continue // Skip underscores
-		}
-		result = result*baseVal + digit
+	valueStr := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(parts[1]), "_", ""))
+	if valueStr == "" || strings.Contains(valueStr, ".") {
+		return 0, fmt.Errorf("invalid based integer digits: %q", parts[1])
 	}
 
-	return result, nil
+	for _, c := range valueStr {
+		switch {
+		case c >= '0' && c <= '9':
+			if int(c-'0') >= baseVal {
+				return 0, fmt.Errorf("digit %q out of range for base %d", c, baseVal)
+			}
+		case c >= 'a' && c <= 'f':
+			if int(c-'a'+10) >= baseVal {
+				return 0, fmt.Errorf("digit %q out of range for base %d", c, baseVal)
+			}
+		default:
+			return 0, fmt.Errorf("invalid digit %q in based literal", c)
+		}
+	}
+
+	val64, err := strconv.ParseInt(valueStr, baseVal, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse based literal: %w", err)
+	}
+
+	expPart := strings.TrimSpace(parts[2])
+	if expPart != "" {
+		if expPart[0] != 'e' && expPart[0] != 'E' {
+			return 0, fmt.Errorf("invalid based literal exponent: %q", expPart)
+		}
+		exp, err := strconv.Atoi(strings.ReplaceAll(strings.TrimSpace(expPart[1:]), "_", ""))
+		if err != nil || exp < 0 {
+			return 0, fmt.Errorf("invalid based literal exponent: %q", expPart)
+		}
+		mul := int64(1)
+		for i := 0; i < exp; i++ {
+			mul *= int64(baseVal)
+		}
+		val64 *= mul
+	}
+
+	return int(val64), nil
 }
 
-// evaluateSimpleArithmetic handles simple expressions like "WIDTH - 1"
-func evaluateSimpleArithmetic(expr string, constants map[string]int) (int, bool) {
+// evaluateSimpleArithmetic handles simple expressions like "WIDTH - 1".
+// depth is forwarded to evaluateRangeExpr to cap mutual recursion.
+func evaluateSimpleArithmetic(expr string, constants map[string]int, depth int) (int, bool) {
 	// Try common patterns: X - N, X + N, X * N, X / N
 	operators := []string{" - ", " + ", " * ", " / ", "-", "+", "*", "/"}
 
@@ -6178,8 +7301,8 @@ func evaluateSimpleArithmetic(expr string, constants map[string]int) (int, bool)
 			left := strings.TrimSpace(expr[:idx])
 			right := strings.TrimSpace(expr[idx+len(op):])
 
-			leftVal, okLeft := evaluateRangeExpr(left, constants)
-			rightVal, okRight := evaluateRangeExpr(right, constants)
+			leftVal, okLeft := evaluateRangeExpr(left, constants, depth)
+			rightVal, okRight := evaluateRangeExpr(right, constants, depth)
 
 			if okLeft && okRight {
 				opChar := strings.TrimSpace(op)
@@ -6216,6 +7339,21 @@ func BuildConstantMap(constants []ConstantDeclaration) map[string]int {
 
 // DetectCDCCrossings analyzes processes to find signals crossing clock domains
 // A CDC crossing occurs when a signal written in one clock domain is read in another
+// DetectCDCCrossings identifies clock domain crossing signals by comparing
+// write/read clock domains across sequential processes.
+//
+// Detection scope:
+//   - Single-file analysis only (cross-file CDC requires indexer-level support)
+//   - Simple 2-stage flip-flop synchronizer chains (sig_meta <= async; sig_sync <= sig_meta)
+//   - Multi-bit crossing flagging based on signal width
+//
+// Not detected:
+//   - Gray code synchronizers
+//   - Handshake-based CDC protocols
+//   - FIFO-based CDC (async FIFOs)
+//   - Vendor synchronizer primitives (e.g., Xilinx xpm_cdc_*)
+//   - Synchronizers with enable/reset logic between stages
+//   - MCP (multi-cycle path) constrained signals
 func DetectCDCCrossings(facts *FileFacts) []CDCCrossing {
 	var crossings []CDCCrossing
 
@@ -6227,7 +7365,9 @@ func DetectCDCCrossings(facts *FileFacts) []CDCCrossing {
 	}
 	signalWriters := make(map[string][]writeInfo)
 
-	// Build map: signal -> bit width (for multi-bit detection)
+	// Build map: signal -> bit width (for multi-bit detection).
+	// CalculateWidth returns -1 for "unknown but likely multi-bit" vector types;
+	// we treat those conservatively as multi-bit for CDC analysis.
 	signalWidths := make(map[string]int)
 	for _, sig := range facts.Signals {
 		signalWidths[strings.ToLower(sig.Name)] = CalculateWidth(sig.Type)
@@ -6280,7 +7420,7 @@ func DetectCDCCrossings(facts *FileFacts) []CDCCrossing {
 					Line:        proc.Line,
 					File:        facts.File,
 					InArch:      proc.InArch,
-					IsMultiBit:  signalWidths[readLower] > 1,
+					IsMultiBit:  signalWidths[readLower] > 1 || signalWidths[readLower] == -1,
 				}
 
 				// Check if this signal goes through a synchronizer
@@ -6393,26 +7533,37 @@ func detectSynchronizers(processes []Process) map[string]int {
 	return result
 }
 
-// CalculateWidth computes the exact bit width from a VHDL type string
-// Returns the width in bits, or 0 if the width cannot be determined
-// (e.g., parameterized types like std_logic_vector(WIDTH-1 downto 0))
+// Pre-compiled regexes for type width calculation (avoid per-call compilation).
+var (
+	reVectorRange  = regexp.MustCompile(`\(\s*(\d+)\s+(?:downto|to)\s+(\d+)\s*\)`)
+	reIntegerRange = regexp.MustCompile(`(?:integer|natural|positive)\s+range\s+(\d+)\s+to\s+(\d+)`)
+)
+
+// CalculateWidth computes the exact bit width from a VHDL type string.
+// Returns:
+//
+//	>0  exact width in bits
+//	 0  not a data-carrying type or implementation-defined width
+//	-1  vector/array type whose width cannot be resolved (parameterized, attribute-based, etc.)
+//
+// Callers should treat -1 as "unknown but likely multi-bit" — e.g. CDC analysis
+// should conservatively flag these as multi-bit crossings.
 func CalculateWidth(typeStr string) int {
 	typeLower := strings.ToLower(strings.TrimSpace(typeStr))
 
 	// Single-bit types - exact width known
-	switch typeLower {
-	case "std_logic", "std_ulogic", "bit", "boolean":
+	if SingleBitTypes[typeLower] {
 		return 1
 	}
 
 	// Vector types with explicit numeric range
 	// std_logic_vector(7 downto 0) -> 8 bits
 	// unsigned(15 downto 0) -> 16 bits
-	if strings.Contains(typeLower, "vector") ||
-		strings.HasPrefix(typeLower, "unsigned") ||
-		strings.HasPrefix(typeLower, "signed") {
-		// Match: (number downto/to number)
-		if match := regexp.MustCompile(`\(\s*(\d+)\s+(?:downto|to)\s+(\d+)\s*\)`).FindStringSubmatch(typeLower); match != nil {
+	isVector := strings.Contains(typeLower, "vector") ||
+		strings.HasPrefix(typeLower, "unsigned(") ||
+		strings.HasPrefix(typeLower, "signed(")
+	if isVector {
+		if match := reVectorRange.FindStringSubmatch(typeLower); match != nil {
 			high, _ := strconv.Atoi(match[1])
 			low, _ := strconv.Atoi(match[2])
 			width := high - low
@@ -6421,21 +7572,26 @@ func CalculateWidth(typeStr string) int {
 			}
 			return width + 1
 		}
-		// Parameterized range (e.g., WIDTH-1 downto 0) - cannot calculate
-		return 0
+		// Parameterized range (e.g., WIDTH-1 downto 0) or attribute-based ('range)
+		// Width is unknown but the type IS multi-bit
+		return -1
+	}
+
+	// Bare unsigned/signed without parenthesized range — unconstrained vector type
+	if typeLower == "unsigned" || typeLower == "signed" {
+		return -1
 	}
 
 	// Integer subtypes with explicit range
 	// integer range 0 to 255 -> 8 bits (ceil(log2(256)))
 	// natural range 0 to 7 -> 3 bits
-	if match := regexp.MustCompile(`(?:integer|natural|positive)\s+range\s+(\d+)\s+to\s+(\d+)`).FindStringSubmatch(typeLower); match != nil {
+	if match := reIntegerRange.FindStringSubmatch(typeLower); match != nil {
 		low, _ := strconv.Atoi(match[1])
 		high, _ := strconv.Atoi(match[2])
 		rangeSize := high - low + 1
 		if rangeSize <= 0 {
 			return 0
 		}
-		// Calculate bits needed: ceil(log2(rangeSize))
 		bits := 0
 		for n := rangeSize - 1; n > 0; n >>= 1 {
 			bits++
@@ -6446,12 +7602,12 @@ func CalculateWidth(typeStr string) int {
 		return bits
 	}
 
-	// Unconstrained integer types - implementation defined, return 0
+	// Unconstrained integer types - implementation defined
 	if typeLower == "integer" || typeLower == "natural" || typeLower == "positive" {
-		return 0 // Width is implementation-defined
+		return 0
 	}
 
-	// Unknown or custom type - return 0 (need type lookup)
+	// Unknown or custom type
 	return 0
 }
 

@@ -14,8 +14,12 @@ func TestCalculateWidth(t *testing.T) {
 		{"signed(15 downto 8)", 8},
 		{"integer range 0 to 255", 8},
 		{"natural range 0 to 7", 3},
-		{"std_logic_vector(WIDTH-1 downto 0)", 0},
+		{"std_logic_vector(WIDTH-1 downto 0)", -1}, // unknown but likely multi-bit
+		{"unsigned(data'length-1 downto 0)", -1},    // attribute-based range
+		{"signed", -1},                               // unconstrained vector
+		{"unsigned", -1},                             // unconstrained vector
 		{"", 0},
+		{"my_custom_record", 0},                      // unknown custom type
 	}
 
 	for _, tt := range tests {

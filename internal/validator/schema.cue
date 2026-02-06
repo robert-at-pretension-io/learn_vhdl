@@ -17,10 +17,12 @@ package schema
     entities:               [...#Entity]
     architectures:          [...#Architecture]
     packages:               [...#Package]
+    package_bodies:         [...#PackageBody]
     components:             [...#Component]
     use_clauses:            [...#UseClause]
     library_clauses:        [...#LibraryClause]
     context_clauses:        [...#ContextClause]
+    context_declarations:  [...#ContextDeclaration]
     signals:                [...#Signal]
     ports:                  [...#Port]
     dependencies:           [...#Dependency]
@@ -31,6 +33,8 @@ package schema
     verification_blocks:    [...#VerificationBlock]
     verification_tags:      [...#VerificationTag]
     verification_tag_errors:[...#VerificationTagError]
+    verification_waivers:   [...#VerificationWaiver]
+    verification_waiver_errors:[...#VerificationWaiverError]
     files:                  [...#FileInfo]
     instances:              [...#Instance]
     case_statements:        [...#CaseStatement]
@@ -38,6 +42,7 @@ package schema
     concurrent_assignments: [...#ConcurrentAssignment]
     generates:              [...#GenerateStatement]
     configurations:         [...#Configuration]
+    configuration_bindings: [...#ConfigurationBinding]
     signal_usages:          [...#SignalUsage]
     // Type system
     types:                  [...#TypeDeclaration]
@@ -63,8 +68,19 @@ package schema
 #Configuration: {
     name:        #Identifier
     entity_name: #Identifier
+    arch_name:   string
     file:        string & =~".+\\.(vhd|vhdl)$"
     line:        int & >=1
+}
+
+#ConfigurationBinding: {
+    scope_path:     [...string]
+    instance_label: string
+    component_name: string
+    target_entity:  string
+    target_arch:    string
+    file:           string & =~".+\\.(vhd|vhdl)$"
+    line:           int & >=1
 }
 
 // LintConfig contains rule configuration passed to the policy engine
@@ -91,6 +107,13 @@ package schema
 
 // Package declaration
 #Package: {
+    name: #Identifier
+    file: string & =~".+\\.(vhd|vhdl)$"
+    line: int & >=1
+    in_arch?: string
+}
+
+#PackageBody: {
     name: #Identifier
     file: string & =~".+\\.(vhd|vhdl)$"
     line: int & >=1
@@ -124,6 +147,7 @@ package schema
     direction: "in" | "out" | "inout" | "buffer" | "linkage" | ""
     type:      string & !=""  // Type must not be empty
     default:   string
+    file:      string & =~".+\\.(vhd|vhdl)$"
     line:      int & >=1
     in_entity: string  // Which entity this port belongs to
     width:     int & >=0  // Estimated bit width (0 if unknown)
@@ -156,6 +180,15 @@ package schema
     name: string
     file: string & =~".+\\.(vhd|vhdl)$"
     line: int & >=1
+}
+
+#ContextDeclaration: {
+    name:         #Identifier
+    file:         string & =~".+\\.(vhd|vhdl)$"
+    line:         int & >=1
+    libraries:    [...string]
+    use_items:    [...string]
+    context_refs: [...string]
 }
 
 #Association: {
@@ -212,7 +245,7 @@ package schema
 // Global symbol in the cross-file symbol table
 #Symbol: {
     name: #QualifiedIdentifier  // Qualified: work.my_entity or work.my_pkg.my_type
-    kind: "entity" | "package" | "component" | "architecture" | "type" | "constant" | "function" | "procedure"
+    kind: "entity" | "package" | "component" | "architecture" | "type" | "constant" | "function" | "procedure" | "context"
     file: string & =~".+\\.(vhd|vhdl)$"
     line: int & >=1
 }
@@ -279,11 +312,32 @@ package schema
     in_arch: string
 }
 
+#VerificationWaiver: {
+    id:      string
+    scope:   string & =~"^(entity|arch):.+$"
+    reason:  string & !=""
+    owner?:  string
+    expires?: string
+    file:    string & =~".+\\.(vhd|vhdl)$"
+    line:    int & >=1
+    raw:     string
+    in_arch: string
+}
+
+#VerificationWaiverError: {
+    file:    string & =~".+\\.(vhd|vhdl)$"
+    line:    int & >=1
+    raw:     string
+    message: string & !=""
+    in_arch: string
+}
+
 // Instance represents a component/entity instantiation with port/generic mappings
 // Enables system-level analysis (cross-module signal tracing)
 #Instance: {
     name:        #Identifier  // Instance label
     target:      string & !=""                          // Target entity/component
+    target_arch: string                                 // Target architecture (if specified)
     port_map:    {[string]: string}                     // Formal -> actual signal
     generic_map: {[string]: string}                     // Formal -> actual value
     associations: [...#Association]
@@ -316,9 +370,11 @@ package schema
     has_reset:        bool                              // Has reset logic
     reset_signal:     string                            // Reset signal name
     reset_async:      bool                              // Async reset if checked before clock
-    assigned_signals: [...string]                       // Signals written
-    read_signals:     [...string]                       // Signals read
-    variables:        [...#VariableDecl]
+    assigned_signals:   [...string]                       // Signals written
+    read_signals:       [...string]                       // Signals read
+    assigned_variables: [...string]                       // Variables assigned in process
+    read_variables:     [...string]                       // Variables read in process
+    variables:          [...#VariableDecl]
     procedure_calls:  [...#ProcedureCall]
     function_calls:   [...#FunctionCall]
     wait_statements:  [...#WaitStatement]
