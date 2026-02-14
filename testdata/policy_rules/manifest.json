@@ -31,7 +31,6 @@
   "dsp_candidate_no_control": "power_rules.vhd",
   "duplicate_signal_in_entity": "quality_rules.vhd",
   "duplicate_signal_name": "signals_rules.vhd",
-  "unlabeled_generate": "unlabeled_generate_rules.vhd",
   "duplicate_port_in_entity": "quality_optional_rules.vhd",
   "duplicate_entity_in_file": "quality_optional_rules.vhd",
   "empty_architecture": "style_rules.vhd",

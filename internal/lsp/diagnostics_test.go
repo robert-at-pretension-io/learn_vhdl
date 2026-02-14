@@ -1,6 +1,8 @@
 package lsp
 
 import (
+	"path/filepath"
+	"strings"
 	"testing"
 
 	protocol "github.com/tliron/glsp/protocol_3_16"
@@ -192,10 +194,28 @@ func TestFileToURI(t *testing.T) {
 	}
 }
 
+func TestFileToURI_RelativeWithoutWorkspaceRootBecomesAbsolute(t *testing.T) {
+	uri := fileToURI("src/test.vhd", "")
+	if !strings.HasPrefix(uri, "file:///") {
+		t.Fatalf("expected absolute file URI, got: %s", uri)
+	}
+	if !strings.HasSuffix(uri, "/src/test.vhd") {
+		t.Fatalf("expected src/test.vhd suffix, got: %s", uri)
+	}
+}
+
 func TestURIToFile(t *testing.T) {
 	path := uriToFile("file:///home/user/test.vhd")
 	if path != "/home/user/test.vhd" {
 		t.Errorf("unexpected path: %s", path)
+	}
+}
+
+func TestURIToFile_DecodesEscapes(t *testing.T) {
+	path := uriToFile("file:///tmp/my%20file.vhd")
+	expected := filepath.Clean("/tmp/my file.vhd")
+	if path != expected {
+		t.Fatalf("expected %q, got %q", expected, path)
 	}
 }
 
@@ -219,5 +239,34 @@ func TestLineZeroBased(t *testing.T) {
 	}
 	if fileDiags[1].Range.Start.Line != 0 { // line 0 stays 0
 		t.Errorf("line 0 should map to 0, got %d", fileDiags[1].Range.Start.Line)
+	}
+}
+
+func TestMapResultToDiagnostics_AttachesDataAndRelatedInfo(t *testing.T) {
+	result := &LintResult{
+		Violations: []Violation{
+			{Rule: "unused_signal", Severity: "warning", File: "/tmp/dut.vhd", Line: 7, Message: "unused"},
+		},
+		MissingChecks: []MissingCheckTask{
+			{
+				File:       "/tmp/dut.vhd",
+				Scope:      "arch:rtl",
+				MissingIDs: []string{"check_reset"},
+				Bindings:   map[string]string{"clk": "sys_clk"},
+				Notes:      []string{"inferred scope"},
+			},
+		},
+	}
+	diags := mapResultToDiagnostics(result, "/tmp")
+	uri := fileToURI("/tmp/dut.vhd", "/tmp")
+	fileDiags := diags[uri]
+	if len(fileDiags) != 2 {
+		t.Fatalf("expected 2 diagnostics, got %d", len(fileDiags))
+	}
+	if fileDiags[0].Data == nil {
+		t.Fatal("expected diagnostic data for violation")
+	}
+	if len(fileDiags[1].RelatedInformation) == 0 {
+		t.Fatal("expected related information for missing check")
 	}
 }

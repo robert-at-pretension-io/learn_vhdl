@@ -65,3 +65,61 @@ func TestWordAtPositionNonexistentDoc(t *testing.T) {
 		t.Errorf("expected empty word for missing doc, got %q", word)
 	}
 }
+
+func TestWordAtPositionUnicodeIdentifier(t *testing.T) {
+	ds := NewDocumentStore()
+	ds.Set("file:///unicode.vhd", "signal σclk : integer;")
+
+	// UTF-16 position 8 is on "c" in "σclk".
+	word := ds.WordAtPosition("file:///unicode.vhd", 0, 8)
+	if word != "σclk" {
+		t.Fatalf("expected unicode identifier, got %q", word)
+	}
+}
+
+func TestUTF16ColumnToRuneIndex(t *testing.T) {
+	runes := []rune("a😀b")
+
+	tests := []struct {
+		column   int
+		want     int
+		wantOkay bool
+	}{
+		{0, 0, true},
+		{1, 1, true}, // start of 😀
+		{2, 1, true}, // inside surrogate pair snaps to 😀
+		{3, 2, true}, // b
+		{4, 3, true}, // end of line
+		{5, 0, false},
+	}
+
+	for _, tt := range tests {
+		got, ok := utf16ColumnToRuneIndex(runes, tt.column)
+		if got != tt.want || ok != tt.wantOkay {
+			t.Fatalf("utf16ColumnToRuneIndex(%d) = (%d,%v), want (%d,%v)",
+				tt.column, got, ok, tt.want, tt.wantOkay)
+		}
+	}
+}
+
+func TestWordRangeAndPrefixAtPosition(t *testing.T) {
+	ds := NewDocumentStore()
+	uri := "file:///test.vhd"
+	ds.Set(uri, "signal alpha_beta : std_logic;")
+
+	word, start, end, ok := ds.WordRangeAtPosition(uri, 0, 10)
+	if !ok {
+		t.Fatal("expected word range")
+	}
+	if word != "alpha_beta" {
+		t.Fatalf("unexpected word %q", word)
+	}
+	if start >= end {
+		t.Fatalf("expected valid range, got start=%d end=%d", start, end)
+	}
+
+	prefix := ds.PrefixAtPosition(uri, 0, 10)
+	if prefix != "alp" {
+		t.Fatalf("expected prefix 'alp', got %q", prefix)
+	}
+}

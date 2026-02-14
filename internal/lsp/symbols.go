@@ -1,6 +1,7 @@
 package lsp
 
 import (
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -119,10 +120,11 @@ type symbolEntry struct {
 
 // SymbolStore provides an in-memory searchable index of VHDL symbols.
 type SymbolStore struct {
-	mu      sync.RWMutex
-	entries []symbolEntry
-	byName  map[string][]int // lowercase name -> entry indices
-	byFile  map[string][]int // file path -> entry indices
+	mu            sync.RWMutex
+	workspaceRoot string
+	entries       []symbolEntry
+	byName        map[string][]int // lowercase name -> entry indices
+	byFile        map[string][]int // file path -> entry indices
 }
 
 // NewSymbolStore creates an empty symbol store.
@@ -134,13 +136,30 @@ func NewSymbolStore() *SymbolStore {
 }
 
 // Rebuild replaces all symbols from a fresh SymbolIndex.
-func (ss *SymbolStore) Rebuild(idx *SymbolIndex) {
+func (ss *SymbolStore) Rebuild(idx *SymbolIndex, workspaceRoot string) {
 	if idx == nil {
 		return
 	}
 
 	var entries []symbolEntry
+	type symbolKey struct {
+		name     string
+		kind     string
+		file     string
+		line     int
+		detail   string
+		inParent string
+	}
+	seen := make(map[symbolKey]struct{})
 	add := func(name, kind, file string, line int, detail, inParent string) {
+		key := symbolKey{
+			name: strings.ToLower(name), kind: kind, file: file, line: line,
+			detail: detail, inParent: inParent,
+		}
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
 		entries = append(entries, symbolEntry{
 			name: name, kind: kind, file: file, line: line,
 			detail: detail, inParent: inParent,
@@ -193,6 +212,7 @@ func (ss *SymbolStore) Rebuild(idx *SymbolIndex) {
 	}
 
 	ss.mu.Lock()
+	ss.workspaceRoot = workspaceRoot
 	ss.entries = entries
 	ss.byName = byName
 	ss.byFile = byFile
@@ -205,6 +225,7 @@ func (ss *SymbolStore) Rebuild(idx *SymbolIndex) {
 func (ss *SymbolStore) FindDefinition(name string) []protocol.Location {
 	ss.mu.RLock()
 	defer ss.mu.RUnlock()
+	workspaceRoot := ss.workspaceRoot
 
 	indices := ss.byName[strings.ToLower(name)]
 	if len(indices) == 0 {
@@ -221,7 +242,7 @@ func (ss *SymbolStore) FindDefinition(name string) []protocol.Location {
 	var defLocs, allLocs []protocol.Location
 	for _, i := range indices {
 		e := ss.entries[i]
-		loc := entryToLocation(e)
+		loc := entryToLocation(e, workspaceRoot)
 		allLocs = append(allLocs, loc)
 		if defKinds[e.kind] {
 			defLocs = append(defLocs, loc)
@@ -238,11 +259,12 @@ func (ss *SymbolStore) FindDefinition(name string) []protocol.Location {
 func (ss *SymbolStore) FindReferences(name string) []protocol.Location {
 	ss.mu.RLock()
 	defer ss.mu.RUnlock()
+	workspaceRoot := ss.workspaceRoot
 
 	indices := ss.byName[strings.ToLower(name)]
 	locs := make([]protocol.Location, 0, len(indices))
 	for _, i := range indices {
-		locs = append(locs, entryToLocation(ss.entries[i]))
+		locs = append(locs, entryToLocation(ss.entries[i], workspaceRoot))
 	}
 	return locs
 }
@@ -251,6 +273,7 @@ func (ss *SymbolStore) FindReferences(name string) []protocol.Location {
 func (ss *SymbolStore) WorkspaceSymbols(query string) []protocol.SymbolInformation {
 	ss.mu.RLock()
 	defer ss.mu.RUnlock()
+	workspaceRoot := ss.workspaceRoot
 
 	query = strings.ToLower(query)
 	var results []protocol.SymbolInformation
@@ -266,7 +289,7 @@ func (ss *SymbolStore) WorkspaceSymbols(query string) []protocol.SymbolInformati
 				Name: e.name,
 				Kind: symbolKindToLSP(e.kind),
 				Location: protocol.Location{
-					URI: fileToURI(e.file, ""),
+					URI: fileToURI(e.file, workspaceRoot),
 					Range: protocol.Range{
 						Start: protocol.Position{Line: lineToLSP(e.line), Character: 0},
 						End:   protocol.Position{Line: lineToLSP(e.line), Character: 0},
@@ -324,9 +347,45 @@ func (ss *SymbolStore) LookupByName(name string) []symbolEntry {
 	return result
 }
 
-func entryToLocation(e symbolEntry) protocol.Location {
+// EntriesInFile returns all symbol entries that belong to the given file path.
+func (ss *SymbolStore) EntriesInFile(file string) []symbolEntry {
+	ss.mu.RLock()
+	defer ss.mu.RUnlock()
+	target := normalizeSymbolPath(file, ss.workspaceRoot)
+	var out []symbolEntry
+	for _, e := range ss.entries {
+		if samePath(normalizeSymbolPath(e.file, ss.workspaceRoot), target) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// AllEntries returns a copy of all symbol entries.
+func (ss *SymbolStore) AllEntries() []symbolEntry {
+	ss.mu.RLock()
+	defer ss.mu.RUnlock()
+	out := make([]symbolEntry, 0, len(ss.entries))
+	out = append(out, ss.entries...)
+	return out
+}
+
+func normalizeSymbolPath(path, workspaceRoot string) string {
+	if path == "" {
+		return ""
+	}
+	if !filepath.IsAbs(path) && workspaceRoot != "" {
+		path = filepath.Join(workspaceRoot, path)
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	return filepath.Clean(path)
+}
+
+func entryToLocation(e symbolEntry, workspaceRoot string) protocol.Location {
 	return protocol.Location{
-		URI: fileToURI(e.file, ""),
+		URI: fileToURI(e.file, workspaceRoot),
 		Range: protocol.Range{
 			Start: protocol.Position{Line: lineToLSP(e.line), Character: 0},
 			End:   protocol.Position{Line: lineToLSP(e.line), Character: 0},

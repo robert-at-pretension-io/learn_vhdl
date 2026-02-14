@@ -1,5 +1,31 @@
 {
   "files.exclude": {
     "**/.vhdl_lint_cache": true
-  }
+  },
+  "files.associations": {
+    "*.vhd": "vhdl",
+    "*.vhdl": "vhdl"
+  },
+  "vhdlLsp.server.path": "/home/elliot/Projects/vhdl_compiler/vhdl-lsp",
+  "vhdlLsp.lint.path": "/home/elliot/Projects/vhdl_compiler/vhdl-lint",
+  "vhdlLsp.server.debounceMs": 100,
+  "editor.codeLens": true,
+  "editor.renderValidationDecorations": "on",
+  "problems.showCurrentInStatus": true,
+  "vhdlLsp.trace.server": "messages",
+  "vhdlLsp.ui.statusBar.enabled": true,
+  "vhdlLsp.ui.showStartupNotification": true,
+  "vhdlLsp.ui.autoRevealProblems": true,
+  "problems.autoReveal": true,
+  "vhdlLsp.ui.inlineDiagnostics.enabled": true,
+  "vhdlLsp.ui.inlineDiagnostics.maxPerFile": 120,
+  "vhdlLsp.ui.inlineDiagnostics.includeSeverities": [
+    "error",
+    "warning",
+    "information"
+  ],
+  "vhdlLsp.lint.configPath": "/home/elliot/Projects/vhdl_compiler/.vscode/vhdl_lsp_config.json",
+  "vhdlLsp.ui.inlineDiagnostics.maxMessagesPerLine": 2,
+  "vhdlLsp.ui.richDiagnostics.enabled": true,
+  "vhdlLsp.ui.richDiagnostics.maxInHover": 8
 }

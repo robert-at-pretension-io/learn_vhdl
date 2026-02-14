@@ -36,7 +36,7 @@ func testSymbolIndex() *SymbolIndex {
 
 func TestSymbolStoreRebuild(t *testing.T) {
 	ss := NewSymbolStore()
-	ss.Rebuild(testSymbolIndex())
+	ss.Rebuild(testSymbolIndex(), "")
 
 	// Check byName lookups
 	entries := ss.LookupByName("uart_tx")
@@ -56,7 +56,7 @@ func TestSymbolStoreRebuild(t *testing.T) {
 
 func TestSymbolStoreFindDefinition(t *testing.T) {
 	ss := NewSymbolStore()
-	ss.Rebuild(testSymbolIndex())
+	ss.Rebuild(testSymbolIndex(), "")
 
 	// Entity definition
 	locs := ss.FindDefinition("uart_tx")
@@ -79,7 +79,7 @@ func TestSymbolStoreFindDefinition(t *testing.T) {
 
 func TestSymbolStoreFindReferences(t *testing.T) {
 	ss := NewSymbolStore()
-	ss.Rebuild(testSymbolIndex())
+	ss.Rebuild(testSymbolIndex(), "")
 
 	locs := ss.FindReferences("uart_tx")
 	// entity + architecture(entityName mapped to detail, not name) + instance target
@@ -90,7 +90,7 @@ func TestSymbolStoreFindReferences(t *testing.T) {
 
 func TestSymbolStoreWorkspaceSymbols(t *testing.T) {
 	ss := NewSymbolStore()
-	ss.Rebuild(testSymbolIndex())
+	ss.Rebuild(testSymbolIndex(), "")
 
 	// Partial match
 	results := ss.WorkspaceSymbols("uart")
@@ -112,9 +112,58 @@ func TestSymbolStoreWorkspaceSymbols(t *testing.T) {
 
 func TestSymbolStoreNilIndex(t *testing.T) {
 	ss := NewSymbolStore()
-	ss.Rebuild(nil) // should not panic
+	ss.Rebuild(nil, "") // should not panic
 	locs := ss.FindDefinition("anything")
 	if len(locs) != 0 {
 		t.Error("expected no results from empty store")
+	}
+}
+
+func TestSymbolStoreRelativePathUsesWorkspaceRoot(t *testing.T) {
+	ss := NewSymbolStore()
+	idx := &SymbolIndex{
+		Entities: []EntitySummary{
+			{Name: "uart_tx", File: "src/uart_tx.vhd", Line: 5},
+		},
+	}
+	ss.Rebuild(idx, "/workspace/project")
+
+	locs := ss.FindDefinition("uart_tx")
+	if len(locs) != 1 {
+		t.Fatalf("expected 1 location, got %d", len(locs))
+	}
+	if locs[0].URI != "file:///workspace/project/src/uart_tx.vhd" {
+		t.Fatalf("unexpected URI: %s", locs[0].URI)
+	}
+}
+
+func TestSymbolStoreRebuild_DeduplicatesPortsFromEntityAndTopLevel(t *testing.T) {
+	ss := NewSymbolStore()
+	idx := &SymbolIndex{
+		Entities: []EntitySummary{
+			{
+				Name: "uart_tx",
+				File: "/src/uart_tx.vhd",
+				Line: 5,
+				Ports: []PortSummary{
+					{Name: "clk", Direction: "in", Type: "std_logic", File: "/src/uart_tx.vhd", Line: 6, InEntity: "uart_tx"},
+				},
+			},
+		},
+		Ports: []PortSummary{
+			{Name: "clk", Direction: "in", Type: "std_logic", File: "/src/uart_tx.vhd", Line: 6, InEntity: "uart_tx"},
+		},
+	}
+	ss.Rebuild(idx, "")
+
+	entries := ss.LookupByName("clk")
+	portCount := 0
+	for _, e := range entries {
+		if e.kind == "port" {
+			portCount++
+		}
+	}
+	if portCount != 1 {
+		t.Fatalf("expected 1 deduplicated port entry, got %d", portCount)
 	}
 }

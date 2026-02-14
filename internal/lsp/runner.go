@@ -2,6 +2,7 @@ package lsp
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -91,26 +92,63 @@ func NewRunner() (*Runner, error) {
 
 // Run executes vhdl-lint against the workspace root and returns parsed results.
 func (r *Runner) Run(workspaceRoot string, symbolsJSON bool) (*LintResult, error) {
+	return r.RunWithContext(context.Background(), workspaceRoot, symbolsJSON)
+}
+
+// RunTarget executes vhdl-lint for a specific file or directory target.
+// workingDir controls command execution context for config/path resolution.
+func (r *Runner) RunTarget(targetPath, workingDir string, symbolsJSON bool) (*LintResult, error) {
+	return r.RunTargetWithContext(context.Background(), targetPath, workingDir, symbolsJSON)
+}
+
+// RunWithContext executes vhdl-lint against the workspace root with cancellation support.
+func (r *Runner) RunWithContext(ctx context.Context, workspaceRoot string, symbolsJSON bool) (*LintResult, error) {
+	return r.run(ctx, workspaceRoot, workspaceRoot, symbolsJSON)
+}
+
+// RunTargetWithContext executes vhdl-lint for a specific file/directory with cancellation support.
+func (r *Runner) RunTargetWithContext(ctx context.Context, targetPath, workingDir string, symbolsJSON bool) (*LintResult, error) {
+	if workingDir == "" {
+		workingDir = filepath.Dir(targetPath)
+	}
+	return r.run(ctx, targetPath, workingDir, symbolsJSON)
+}
+
+func (r *Runner) run(ctx context.Context, targetPath, workingDir string, symbolsJSON bool) (*LintResult, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	args := make([]string, 0, 4)
+	if cfgPath := os.Getenv("VHDL_LINT_CONFIG"); cfgPath != "" {
+		args = append(args, "-c", cfgPath)
+	}
 
 	flag := "-j"
 	if symbolsJSON {
 		flag = "--symbols-json"
 	}
+	args = append(args, flag, targetPath)
 
-	cmd := exec.Command(r.binaryPath, flag, workspaceRoot)
-	cmd.Dir = workspaceRoot
+	cmd := exec.CommandContext(ctx, r.binaryPath, args...)
+	cmd.Dir = workingDir
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
 	err := cmd.Run()
-	// vhdl-lint may exit non-zero on lint errors; we still parse stdout
 	if err != nil {
-		if _, ok := err.(*exec.ExitError); !ok {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		exitErr, ok := err.(*exec.ExitError)
+		if !ok {
 			return nil, fmt.Errorf("vhdl-lint exec failed: %w: %s", err, stderr.String())
+		}
+		// vhdl-lint can return non-zero while still producing JSON output.
+		// If there's no JSON payload, treat this as a hard execution failure.
+		if stdout.Len() == 0 {
+			return nil, fmt.Errorf("vhdl-lint exited with code %d: %s", exitErr.ExitCode(), stderr.String())
 		}
 	}
 
@@ -120,6 +158,9 @@ func (r *Runner) Run(workspaceRoot string, symbolsJSON bool) (*LintResult, error
 
 	var result LintResult
 	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		if stderr.Len() > 0 {
+			return nil, fmt.Errorf("parse vhdl-lint output: %w (stderr: %s)", err, stderr.String())
+		}
 		return nil, fmt.Errorf("parse vhdl-lint output: %w", err)
 	}
 	return &result, nil

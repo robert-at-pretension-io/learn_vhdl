@@ -31,7 +31,6 @@
   "dsp_candidate_no_control": "clean_power_rules.vhd",
   "duplicate_signal_in_entity": "clean_rules.vhd",
   "duplicate_signal_name": "clean_rules.vhd",
-  "unlabeled_generate": "clean_rules.vhd",
   "duplicate_port_in_entity": "clean_rules.vhd",
   "duplicate_entity_in_file": "clean_rules.vhd",
   "empty_architecture": "clean_rules.vhd",

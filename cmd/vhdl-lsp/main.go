@@ -39,6 +39,7 @@ Options:
 
 Environment Variables:
   VHDL_LINT_BIN        Override vhdl-lint binary path
+  VHDL_LINT_CONFIG     Override vhdl-lint config path (passed as -c <config>)
   VHDL_LSP_DEBOUNCE_MS Debounce delay in milliseconds (default: 500)
   VHDL_LSP_LOG_LEVEL   Log level: debug, info, warn, error
 

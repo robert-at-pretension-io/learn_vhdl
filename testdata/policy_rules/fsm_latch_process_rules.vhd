@@ -14,7 +14,7 @@ architecture rtl of fsm_latch_rules is
   type lg_state_t is (LG_IDLE, LG_START, LG_RUN, LG_WAIT, LG_DONE);
   signal state     : state_t;
   signal state_vec : std_logic_vector(1 downto 0);
-  signal lg_state  : lg_state_t;
+  signal lg_state  : lg_state_t; 
   signal s0 : std_logic;
   signal s1 : std_logic;
   signal s2 : std_logic;

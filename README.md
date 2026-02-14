@@ -57,6 +57,8 @@ VHDL Files
 - CUE schemas: `internal/validator/schema.cue` (input) + `internal/validator/output_schema.cue` (output)
 - Policy rules: `src/policy`
 - Test fixtures: `testdata/`
+- VS Code extension client: `editors/vscode-vhdl-lsp`
+- VS Code setup script: `tools/setup_vscode_vhdl_lsp.sh`
 
 ## How to Think About Changes
 

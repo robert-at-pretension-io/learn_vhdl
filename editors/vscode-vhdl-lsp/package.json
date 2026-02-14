@@ -1,0 +1,168 @@
+{
+  "name": "vhdl-lsp-client",
+  "displayName": "VHDL LSP (vhdl-lint)",
+  "description": "VS Code client for the vhdl-lsp language server",
+  "version": "0.1.0",
+  "publisher": "local",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.84.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters"
+  ],
+  "activationEvents": [
+    "onLanguage:vhdl",
+    "onCommand:vhdlLsp.restartServer",
+    "onCommand:vhdlLsp.showOutput"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "vhdl",
+        "aliases": [
+          "VHDL",
+          "vhdl"
+        ],
+        "extensions": [
+          ".vhd",
+          ".vhdl"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "vhdlLsp.restartServer",
+        "title": "VHDL LSP: Restart Server"
+      },
+      {
+        "command": "vhdlLsp.showOutput",
+        "title": "VHDL LSP: Show Output"
+      }
+    ],
+    "configuration": {
+      "title": "VHDL LSP",
+      "properties": {
+        "vhdlLsp.server.path": {
+          "type": "string",
+          "default": "vhdl-lsp",
+          "description": "Path to the vhdl-lsp executable."
+        },
+        "vhdlLsp.server.args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Arguments passed to vhdl-lsp."
+        },
+        "vhdlLsp.server.env": {
+          "type": "object",
+          "default": {},
+          "description": "Extra environment variables passed to vhdl-lsp."
+        },
+        "vhdlLsp.lint.path": {
+          "type": "string",
+          "default": "",
+          "description": "Optional path to vhdl-lint binary (mapped to VHDL_LINT_BIN)."
+        },
+        "vhdlLsp.lint.configPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional path to vhdl-lint config (mapped to VHDL_LINT_CONFIG)."
+        },
+        "vhdlLsp.server.debounceMs": {
+          "type": "number",
+          "default": 150,
+          "minimum": 1,
+          "description": "Debounce delay in milliseconds (mapped to VHDL_LSP_DEBOUNCE_MS)."
+        },
+        "vhdlLsp.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "LSP protocol trace level."
+        },
+        "vhdlLsp.ui.statusBar.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show VHDL LSP status and diagnostics counts in the status bar."
+        },
+        "vhdlLsp.ui.showStartupNotification": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a startup notification when vhdl-lsp transitions to running."
+        },
+        "vhdlLsp.ui.autoRevealProblems": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically reveal the Problems panel when VHDL diagnostics appear."
+        },
+        "vhdlLsp.ui.inlineDiagnostics.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show inline end-of-line diagnostic text in VHDL editors."
+        },
+        "vhdlLsp.ui.inlineDiagnostics.maxPerFile": {
+          "type": "number",
+          "default": 80,
+          "minimum": 1,
+          "description": "Maximum number of inline diagnostics rendered per VHDL file."
+        },
+        "vhdlLsp.ui.inlineDiagnostics.maxMessagesPerLine": {
+          "type": "number",
+          "default": 2,
+          "minimum": 1,
+          "description": "Maximum number of inline diagnostic messages previewed per line."
+        },
+        "vhdlLsp.ui.inlineDiagnostics.includeSeverities": {
+          "type": "array",
+          "default": [
+            "error",
+            "warning"
+          ],
+          "items": {
+            "type": "string",
+            "enum": [
+              "error",
+              "warning",
+              "information",
+              "hint"
+            ]
+          },
+          "description": "Diagnostic severities to display inline."
+        },
+        "vhdlLsp.ui.richDiagnostics.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show rich learner-focused diagnostic explanations in hover overlays."
+        },
+        "vhdlLsp.ui.richDiagnostics.maxInHover": {
+          "type": "number",
+          "default": 8,
+          "minimum": 1,
+          "description": "Maximum number of diagnostics to explain in a single hover overlay."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -w -p ./"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.74",
+    "@types/vscode": "^1.84.0",
+    "typescript": "^5.7.3"
+  }
+}
