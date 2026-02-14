@@ -1,0 +1,48 @@
+[submodule "external_tests/Compliance-Tests"]
+	path = external_tests/Compliance-Tests
+	url = https://github.com/VHDL/Compliance-Tests.git
+[submodule "external_tests/PoC"]
+	path = external_tests/PoC
+	url = https://github.com/VLSI-EDA/PoC.git
+[submodule "external_tests/ghdl"]
+	path = external_tests/ghdl
+	url = https://github.com/ghdl/ghdl.git
+[submodule "external_tests/ghdl-language-server"]
+	path = external_tests/ghdl-language-server
+	url = https://github.com/ghdl/ghdl-language-server.git
+[submodule "external_tests/grlib"]
+	path = external_tests/grlib
+	url = https://github.com/suoto/grlib
+[submodule "external_tests/hdl4fpga"]
+	path = external_tests/hdl4fpga
+	url = https://github.com/hdl4fpga/hdl4fpga.git
+[submodule "external_tests/jcore"]
+	path = external_tests/jcore
+	url = https://github.com/j-core/jcore-soc.git
+[submodule "external_tests/neorv32"]
+	path = external_tests/neorv32
+	url = https://github.com/stnolting/neorv32.git
+[submodule "external_tests/open-logic"]
+	path = external_tests/open-logic
+	url = https://github.com/open-logic/open-logic.git
+[submodule "external_tests/osvvm"]
+	path = external_tests/osvvm
+	url = https://github.com/OSVVM/OsvvmLibraries
+[submodule "external_tests/uvvm"]
+	path = external_tests/uvvm
+	url = https://github.com/UVVM/UVVM.git
+[submodule "external_tests/vendor/OsvvmLibraries"]
+	path = external_tests/vendor/OsvvmLibraries
+	url = https://github.com/OSVVM/OsvvmLibraries
+[submodule "external_tests/vests"]
+	path = external_tests/vests
+	url = https://github.com/nickg/vests.git
+[submodule "external_tests/vhdl-tests"]
+	path = external_tests/vhdl-tests
+	url = https://gitlab.ispras.ru/mvg/mvg-rtl/benchmark/vhdl-tests.git
+[submodule "external_tests/vunit"]
+	path = external_tests/vunit
+	url = https://github.com/VUnit/vunit
+[submodule "external_tests/zipcpu"]
+	path = external_tests/zipcpu
+	url = https://github.com/ZipCPU/zipcpu.git
