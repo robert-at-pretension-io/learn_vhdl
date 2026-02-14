@@ -335,8 +335,8 @@ module.exports = grammar({
       /[a-zA-Z](_?[a-zA-Z0-9])*/,
       /\\([^\\]|\\\\)+\\/
     )),
-    selector_clause: $=> prec.left(3, repeat1(seq('.', choice($.identifier, $._operator_symbol, $._kw_all)))),
-    library_clause: $=> seq($._kw_library, $.identifier, repeat(seq(',', $.identifier)), ';'),
+    selector_clause: $ => prec.left(3, repeat1(seq('.', choice($.identifier, $._operator_symbol, $._kw_all)))),
+    library_clause: $ => seq($._kw_library, $.identifier, repeat(seq(',', $.identifier)), ';'),
     use_clause: $ => seq(
       $._kw_use,
       $.identifier,
@@ -393,7 +393,7 @@ module.exports = grammar({
       $.generic_function_declaration,
       $.generic_procedure_declaration,
       seq($._kw_package, $.identifier, $._kw_is, $._kw_new, $._name,  // Generic package instantiation
-          optional(seq($._kw_generic, $._kw_map, '(', optional($.association_list), ')'))),
+        optional(seq($._kw_generic, $._kw_map, '(', optional($.association_list), ')'))),
       $.parameter  // Generic constant (like normal parameter)
     ),
 
