@@ -391,7 +391,7 @@ package schema
     file:           string & =~".+\\.(vhd|vhdl)$"
     line:           int & >=1
     in_arch:        string                                  // Containing architecture
-    kind:           "simple" | "conditional" | "selected"   // Assignment type
+    kind:           "simple" | "conditional" | "selected" | "force_release"   // Assignment type
     in_generate:    bool                                    // True if inside generate block
     generate_label: string                                  // Label of containing generate
 }

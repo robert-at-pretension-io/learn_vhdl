@@ -117,6 +117,7 @@
   "undeclared_signal_usage": "signals_rules.vhd",
   "undriven_output_port": "ports_rules.vhd",
   "undriven_signal": "signals_rules.vhd",
+  "unlabeled_generate": "unlabeled_generate_rules.vhd",
   "unguarded_division": "power_rules.vhd",
   "unguarded_exponent": "power_rules.vhd",
   "unguarded_multiplication": "power_rules.vhd",

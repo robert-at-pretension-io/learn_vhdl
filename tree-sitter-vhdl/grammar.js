@@ -1677,8 +1677,7 @@ module.exports = grammar({
     // IMPORTANT: for_generate, if_generate, case_generate are VISIBLE nodes (no underscore)
     // This allows the extractor to easily detect generate type
     generate_statement: $ => seq(
-      field('label', $._generate_label),
-      ':',
+      optional(seq(field('label', $._generate_label), ':')),
       choice(
         $.for_generate,
         $.if_generate,

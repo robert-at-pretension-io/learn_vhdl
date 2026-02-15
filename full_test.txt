@@ -1,0 +1,51 @@
+=== RUN   TestExtractorE2ENamesAndAttributes
+DEBUG: walk visiting type=process_statement, content=p_read : process(clk)
+  begin
+    if rising_edge(clk) then
+      r.data <= a;
+      s(0) <= a(0);
+      if s'length = 4 then
+        s <= r.data;
+      end if;
+      d <= << signal .tb.dut.ext_sig : std_logic_vector(3 downto 0) >>;
+    end if;
+  end process;
+DEBUG: walk visiting type=if_statement, content=if rising_edge(clk) then
+      r.data <= a;
+      s(0) <= a(0);
+      if s'length = 4 then
+        s <= r.data;
+      end if;
+      d <= << signal .tb.dut.ext_sig : std_logic_vector(3 downto 0) >>;
+    end if;
+DEBUG: adding to readSet: clk (type=identifier, full=clk)
+DEBUG: walk visiting type=sequential_signal_assignment, content=r.data <= a;
+DEBUG: adding to readSet: a (type=identifier, full=a)
+DEBUG: walk visiting type=assignment_target, content=r.data
+DEBUG: walk visiting type=selected_name, content=r.data
+DEBUG: adding to readSet: a (type=indexed_name, full=a)
+DEBUG: walk visiting type=if_statement, content=if s'length = 4 then
+        s <= r.data;
+      end if;
+DEBUG: adding to readSet: s (type=attribute_name, full=s)
+DEBUG: walk visiting type=sequential_signal_assignment, content=s <= r.data;
+DEBUG: adding to readSet: r (type=selected_name, full=r.data)
+DEBUG: walk visiting type=selected_name, content=r.data
+DEBUG: Final readSet keys: [a clk r s]
+DEBUG: adding to ReadSignals: a
+DEBUG: adding to ReadSignals: clk
+DEBUG: adding to ReadSignals: r
+DEBUG: adding to ReadSignals: s
+DEBUG: adding to readSet: s (type=identifier, full=s)
+DEBUG: adding to readSet: s (type=identifier, full=s)
+DEBUG: adding to readSet: s (type=identifier, full=s)
+DEBUG: adding to readSet: en (type=identifier, full=en)
+DEBUG: adding to readSet: d (type=identifier, full=d)
+DEBUG: adding to readSet: s (type=identifier, full=s)
+DEBUG: adding to readSet: en (type=identifier, full=en)
+DEBUG: adding to readSet: d (type=identifier, full=d)
+    extractor_e2e_test.go:1005: expected "r" in []string{"d", "s"}
+--- FAIL: TestExtractorE2ENamesAndAttributes (0.00s)
+FAIL
+FAIL	github.com/robert-at-pretension-io/vhdl-lint/internal/extractor	0.005s
+FAIL
