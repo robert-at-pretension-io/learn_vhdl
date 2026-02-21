@@ -49,6 +49,10 @@
           "named": true
         },
         {
+          "type": "psl_assumption",
+          "named": true
+        },
+        {
           "type": "selected_assignment",
           "named": true
         },
@@ -738,6 +742,10 @@
           "named": true
         },
         {
+          "type": "psl_assumption",
+          "named": true
+        },
+        {
           "type": "selected_assignment",
           "named": true
         },
@@ -938,6 +946,70 @@
   },
   {
     "type": "psl_assertion",
+    "named": true,
+    "fields": {
+      "property": {
+        "multiple": true,
+        "required": true,
+        "types": [
+          {
+            "type": "(",
+            "named": false
+          },
+          {
+            "type": ")",
+            "named": false
+          },
+          {
+            "type": "binary_expression",
+            "named": true
+          },
+          {
+            "type": "char_literal",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "indexed_name",
+            "named": true
+          },
+          {
+            "type": "number",
+            "named": true
+          },
+          {
+            "type": "psl_eventually",
+            "named": true
+          },
+          {
+            "type": "psl_implication",
+            "named": true
+          },
+          {
+            "type": "psl_stable",
+            "named": true
+          },
+          {
+            "type": "selected_name",
+            "named": true
+          },
+          {
+            "type": "string_literal",
+            "named": true
+          },
+          {
+            "type": "unary_expression",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "psl_assumption",
     "named": true,
     "fields": {
       "property": {
@@ -1921,6 +1993,10 @@
   },
   {
     "type": "assert",
+    "named": false
+  },
+  {
+    "type": "assume",
     "named": false
   },
   {

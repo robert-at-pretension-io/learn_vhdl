@@ -21,7 +21,7 @@
           },
           {
             "type": "PATTERN",
-            "value": "[^\\\\r\\\\n]*"
+            "value": "[^\\r\\n]*"
           }
         ]
       }
@@ -771,6 +771,10 @@
         {
           "type": "SYMBOL",
           "name": "psl_assertion"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "psl_assumption"
         }
       ]
     },
@@ -1406,6 +1410,35 @@
         {
           "type": "STRING",
           "value": "assert"
+        },
+        {
+          "type": "STRING",
+          "value": "always"
+        },
+        {
+          "type": "FIELD",
+          "name": "property",
+          "content": {
+            "type": "SYMBOL",
+            "name": "_psl_expression"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": ";"
+        }
+      ]
+    },
+    "psl_assumption": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "psl"
+        },
+        {
+          "type": "STRING",
+          "value": "assume"
         },
         {
           "type": "STRING",

@@ -208,6 +208,8 @@ func (e *Extractor) extractArchitecture(archNode *sitter.Node) {
 				e.module.Statements = append(e.module.Statements, e.extractGenerateStatement(node))
 			} else if node.Kind() == "psl_assertion" {
 				e.module.Statements = append(e.module.Statements, e.extractPslAssertion(node))
+			} else if node.Kind() == "psl_assumption" {
+				e.module.Statements = append(e.module.Statements, e.extractPslAssumption(node))
 			}
 			if !cursor.GotoNextSibling() {
 				break
@@ -569,6 +571,18 @@ func (e *Extractor) extractGenerateStatement(node *sitter.Node) *GenerateStateme
 
 func (e *Extractor) extractPslAssertion(node *sitter.Node) *PslAssertion {
 	stmt := &PslAssertion{
+		LineNum: uint32(node.StartPosition().Row + 1),
+	}
+
+	if propNode := node.ChildByFieldName("property"); propNode != nil {
+		stmt.Property = e.extractExpression(propNode)
+	}
+
+	return stmt
+}
+
+func (e *Extractor) extractPslAssumption(node *sitter.Node) *PslAssumption {
+	stmt := &PslAssumption{
 		LineNum: uint32(node.StartPosition().Row + 1),
 	}
 

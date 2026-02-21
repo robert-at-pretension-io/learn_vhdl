@@ -169,6 +169,17 @@ type PslAssertion struct {
 func (p *PslAssertion) isStatement()   {}
 func (p *PslAssertion) Line() uint32 { return p.LineNum }
 
+// PslAssumption represents `psl assume always property;`
+// Emits verif.assume in BMC mode (constrains solver input space) and gates
+// __verif_bad with the assumption conjunction in IC3 mode.
+type PslAssumption struct {
+	Property Expression
+	LineNum  uint32
+}
+
+func (p *PslAssumption) isStatement()   {}
+func (p *PslAssumption) Line() uint32 { return p.LineNum }
+
 type PortMapEntry struct {
 	Formal string
 	Actual Expression

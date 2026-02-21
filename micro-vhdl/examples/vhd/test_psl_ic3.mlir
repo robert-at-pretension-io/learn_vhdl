@@ -1,7 +1,7 @@
 hw.module @my_module(in %clk: !seq.clock, in %req: i1, out ack: i1, out __verif_bad: i1) {
   // --- Body ---
   %ack = seq.compreg %req, %clk : i1
-  %4 = seq.compreg %req, %clk initial  : i1
+  %4 = seq.compreg %req, %clk : i1
   %5 = hw.constant -1 : i1
   %6 = comb.xor %4, %5 : i1
   %1 = comb.or %6, %ack : i1

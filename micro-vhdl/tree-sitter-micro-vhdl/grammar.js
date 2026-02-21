@@ -44,7 +44,7 @@ module.exports = grammar({
     // -------------------------------------------------------------------------
     source_file: $ => repeat($._design_unit),
 
-    comment: $ => token(seq('--', /[^\\r\\n]*/)),
+    comment: $ => token(seq('--', /[^\r\n]*/)),
 
     identifier: $ => /[a-zA-Z][a-zA-Z0-9_]*/,
 
@@ -166,8 +166,9 @@ module.exports = grammar({
       $.selected_assignment,
       $.synchronous_process,
       $.generate_statement,
-      $.entity_instantiation, 
-      $.psl_assertion
+      $.entity_instantiation,
+      $.psl_assertion,
+      $.psl_assumption
     ),
 
     // JUSTIFICATION: Combinational math executes continuously. Conditionals here 
@@ -259,6 +260,11 @@ module.exports = grammar({
     // of the LLM across billions of clock cycles.
     psl_assertion: $ => seq(
       'psl', 'assert', 'always',
+      field('property', $._psl_expression), ';'
+    ),
+
+    psl_assumption: $ => seq(
+      'psl', 'assume', 'always',
       field('property', $._psl_expression), ';'
     ),
 

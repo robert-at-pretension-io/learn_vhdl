@@ -15,21 +15,23 @@
 **PSL operators supported**:
 - `|=>` (next-cycle implication): delay register + boolean implication → `verif.assert : i1`
 - `stable(x)`: delay register + `comb.icmp eq` → `verif.assert : i1`
+- `assume always`: emits `verif.assume` in BMC MLIR; IC3 step is skipped (see below)
 - `eventually!`: stubbed as `hw.constant true` + TODO comment (liveness, skipped in BMC)
 
 **MLIR emission modes**:
-- **BMC mode** (default): emits `verif.assert`, `seq.initial` for zero-initialized registers
-- **IC3 mode** (`_ic3.mlir`): emits `__verif_bad: i1` hw.output (negated conjunction), no `seq.initial` (PDR explores from unconstrained initial states)
+- **BMC mode** (default): emits `verif.assert`, `verif.assume`, `seq.initial` for zero-initialized registers
+- **IC3 mode** (`_ic3.mlir`): emits `__verif_bad: i1` hw.output (negated assertion conjunction), no `seq.initial` (PDR explores from unconstrained initial states); `psl assume` is omitted because `circt-translate --export-aiger` does not support the verif dialect
 
 **Toolchain**:
-- `circt-bmc` + Z3: BMC, up to 15 cycles (configurable via `BOUND=N`)
-- `circt-synth` → `circt-translate --export-aiger` → `yosys-abc pdr`: unbounded IC3/PDR
+- `circt-bmc` + Z3: BMC, up to 15 cycles (configurable via `BOUND=N`); respects `verif.assume`
+- `circt-synth` → `circt-translate --export-aiger` → `yosys-abc pdr`: unbounded IC3/PDR; skipped when `psl assume` is present
 - `firtool`: SystemVerilog output
 
 **Known gotchas**:
 - `yosys-abc read_aiger` only accepts binary `.aig` format; ASCII `.aag` silently fails
 - `circt-synth` cannot handle `seq.initial` — IC3 MLIR omits it by design
 - IC3 step is skipped automatically when no PSL assertions are present
+- IC3 step is skipped when `psl assume` is present — `verif.assume` cannot pass through `circt-translate --export-aiger` (verif dialect not supported in AIGER lowering); BMC handles the constrained verification correctly
 
 ---
 
@@ -156,7 +158,7 @@ This requires ABC's liveness mode and a different AIGER encoding convention — 
 | Extension | Status | Effort | Value |
 |---|---|---|---|
 | IC3/PDR via ABC pdr | **Done** | — | Unbounded safety proofs |
-| `psl assume` | Not started | Very low | Critical — constrains adversarial inputs |
+| `psl assume` | **Done** | — | BMC-constrained verification; IC3 skips when assumes present |
 | `psl never` | Not started | Very low | Readability |
 | `psl cover` | Not started | Very low | Coverage completeness |
 | Reset-conditional (`after_reset`) | Not started | Low | Eliminates cycle-0 false positives in IC3 |
@@ -167,4 +169,4 @@ This requires ABC's liveness mode and a different AIGER encoding convention — 
 | `verif.formal` blocks | Not started | High | Cross-module and LEC |
 | Liveness via ABC fairness | Not started | High | Full temporal logic |
 
-**Highest immediate value**: `psl assume` — without it, most input-touching assertions produce trivial counterexamples because the solver is free to choose worst-case inputs. This is the single change that makes formal verification of real protocols useful.
+**Highest remaining value**: reset-conditional (`after_reset`) — the next most common source of false positives after unconstrained inputs. Particularly important for IC3, which starts from arbitrary initial register states.

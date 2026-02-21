@@ -22,6 +22,7 @@ type MLIREmitter struct {
 	ssaID       int
 	modules     map[string]*Module
 	assertions  []assertionEntry // accumulated per-module, reset in EmitModule
+	assumptions []assertionEntry // accumulated per-module, reset in EmitModule
 	ic3Mode     bool             // emit __verif_bad hw.output instead of verif.assert
 	badStateSSA string           // set by emitCombinedAssertions in ic3Mode
 }
@@ -247,7 +248,11 @@ func (e *MLIREmitter) emitExpression(expr Expression, mod *Module, env map[strin
 		clk := e.clockSSA(mod)
 		initSSA := e.emitSeqInitial("i1")
 		delayedVal := e.nextSSA()
-		e.p("%s = seq.compreg %s, %s initial %s : i1", delayedVal, leftVal, clk, initSSA)
+		if initSSA != "" {
+			e.p("%s = seq.compreg %s, %s initial %s : i1", delayedVal, leftVal, clk, initSSA)
+		} else {
+			e.p("%s = seq.compreg %s, %s : i1", delayedVal, leftVal, clk)
+		}
 
 		// Boolean implication: !left_d1 || right
 		trueVal := e.nextSSA()
@@ -471,13 +476,15 @@ func (e *MLIREmitter) EmitModules(mods []*Module) {
 	}
 }
 
-// emitCombinedAssertions emits the accumulated PSL assertions after the module body.
+// emitCombinedAssertions emits the accumulated PSL assertions and assumptions
+// after the module body.
 //
-// In BMC mode (default): circt-bmc requires exactly one verif.assert per module;
-// multiple i1 assertions are ANDed into a single combined check.
+// In BMC mode: assumptions become verif.assume (constrains solver input space);
+// assertions are ANDed into a single verif.assert (circt-bmc requires exactly one).
 //
-// In IC3 mode: instead of verif.assert, the negated conjunction is stored in
-// e.badStateSSA so EmitModule can wire it to the __verif_bad hw.output port.
+// In IC3 mode: assertions become the negated bad-state signal stored in
+// e.badStateSSA; assumptions gate it so the bad state is only active when all
+// assumptions hold: __verif_bad = NOT(assertions) AND combined_assumptions.
 // ABC pdr treats hw.output signals as "bad state" indicators: output=1 means
 // the property is violated.
 func (e *MLIREmitter) emitCombinedAssertions(mod *Module) {
@@ -490,6 +497,27 @@ func (e *MLIREmitter) emitCombinedAssertions(mod *Module) {
 		} else {
 			temporalAsserts = append(temporalAsserts, a)
 		}
+	}
+
+	// Build conjunction of all boolean assumptions (i1 only; temporal assumptions not yet supported).
+	var combinedAssume string
+	for _, a := range e.assumptions {
+		if a.typ != "i1" {
+			e.p("// temporal assumption skipped (type %s): %s", a.typ, a.val)
+			continue
+		}
+		if combinedAssume == "" {
+			combinedAssume = a.val
+		} else {
+			res := e.nextSSA()
+			e.p("%s = comb.and %s, %s : i1", res, combinedAssume, a.val)
+			combinedAssume = res
+		}
+	}
+
+	// In BMC mode emit a single verif.assume for the combined assumption.
+	if combinedAssume != "" && !e.ic3Mode {
+		e.p("verif.assume %s : i1", combinedAssume)
 	}
 
 	// Build conjunction of all boolean assertions.
@@ -509,6 +537,10 @@ func (e *MLIREmitter) emitCombinedAssertions(mod *Module) {
 		if e.ic3Mode {
 			// IC3 path: negate the conjunction to get the bad-state signal.
 			// __verif_bad = 1 when at least one assertion is violated.
+			// Note: assumptions are NOT encoded here — circt-translate --export-aiger
+			// does not support the verif dialect, so assumptions cannot be forwarded
+			// to ABC pdr as AIGER constraints.  compile.sh skips the IC3 step entirely
+			// when assumptions are present; BMC (Z3) handles the constrained check.
 			trueVal := e.nextSSA()
 			badSSA := e.nextSSA()
 			e.p("%s = hw.constant -1 : i1", trueVal)
@@ -527,7 +559,8 @@ func (e *MLIREmitter) emitCombinedAssertions(mod *Module) {
 
 // EmitModule translates the Module into a hw.module definition
 func (e *MLIREmitter) EmitModule(mod *Module) {
-	e.assertions = e.assertions[:0] // reset accumulator for this module
+	e.assertions = e.assertions[:0]  // reset accumulator for this module
+	e.assumptions = e.assumptions[:0] // reset accumulator for this module
 	e.badStateSSA = ""
 	// Construct signature
 	var ports []string
@@ -702,6 +735,10 @@ func (e *MLIREmitter) emitStatementList(stmts []Statement, mod *Module, env map[
 			propVal, propType := e.emitExpression(s.Property, mod, env, "", "")
 			// Accumulate instead of emitting directly; EmitModule combines them.
 			e.assertions = append(e.assertions, assertionEntry{propVal, propType})
+		case *PslAssumption:
+			propVal, propType := e.emitExpression(s.Property, mod, env, "", "")
+			// Accumulate assumptions; emitCombinedAssertions handles them.
+			e.assumptions = append(e.assumptions, assertionEntry{propVal, propType})
 		}
 	}
 }
