@@ -95,13 +95,56 @@ CIRCT's `ltl.eventually` is designed to feed into this kind of analysis, but `ci
 
 ---
 
-## In CIRCT's Context
+## Implementation in Micro-VHDL (Current State)
 
-`circt-bmc` implements BMC only. The `verif.bmc` op in the IR is the lowering target. CIRCT's infrastructure is designed to support k-induction and IC3 — the `verif` and `ltl` dialects have the right ops — but there is no bundled IC3 pass in the mainline CIRCT tree.
+Both BMC and IC3/PDR are now integrated and run automatically in sequence.
 
-The most realistic path for micro-vhdl would be:
+### Pipeline
 
-1. **Short term**: add a k-induction pass that unrolls the base case (already done by BMC) and separately emits the inductive step as a second SMT query.
-2. **Longer term**: integrate with an external IC3 engine (ABC's `pdr` command, or the open-source `avr` tool) by emitting the MLIR as AIGER or SMT-LIB and shelling out.
+```
+VHDL → Go compiler → build.mlir + build_ic3.mlir
+                           |               |
+                     circt-bmc (Z3)   circt-synth
+                     BMC, 15 cycles   → AIG dialect
+                           |               |
+                    "Assertion can    circt-translate
+                    be violated!"    --export-aiger
+                    or "Bound        → binary .aig
+                    reached"               |
+                                     yosys-abc pdr
+                                           |
+                                    "Property proved"
+                                    or counterexample
+```
 
-The MLIR representation is solver-agnostic by design. The `verif.bmc` op is specific to bounded checking, but the `hw.module` + `verif.assert` + `ltl.*` structure feeds equally well into any model checker that can consume structured hardware IR.
+### Two MLIR Variants
+
+The Go compiler emits two MLIR files from the same VHDL:
+
+**BMC MLIR** (`foo.mlir`):
+- `verif.assert %combined : i1` — circt-bmc consumes this directly
+- `seq.initial` blocks — pins registers to zero at cycle 0 for deterministic BMC
+- Used by both circt-bmc and firtool (SV output)
+
+**IC3 MLIR** (`foo_ic3.mlir`):
+- `out __verif_bad: i1` — negated conjunction as hw.output port
+- No `seq.initial` — PDR must explore from all possible initial states, not just zero
+- No `verif.assert` — only hw.output; circt-synth can lower this to AIG cleanly
+- Used only for the AIGER/ABC path
+
+### Key Design Decisions
+
+**Why no `seq.initial` in IC3 MLIR**: `circt-synth` cannot lower `seq.initial` to AIG (it is not a comb or seq register op). More importantly, pinning initial register state to zero would cause IC3 to miss bugs only reachable from other starting states. PDR by design explores from all initial states.
+
+**Why a separate MLIR file**: `verif.assert` cannot pass through `circt-synth`'s AIG lowering pipeline. Emitting a clean IC3 MLIR without `verif.assert` avoids needing a stripping pass.
+
+**Why `__verif_bad = NOT(conjunction)`**: The AIGER model checking convention is that hw.outputs represent "bad state" signals. ABC's `pdr` command proves these outputs are unreachable. The negation converts "property holds" (which the assertion checks) to "property violated" (which PDR checks for reachability).
+
+**Why binary AIGER only**: `yosys-abc read_aiger` rejects ASCII `.aag` files when symbol names contain bracket characters (e.g., `a[0]`). The binary `.aig` format is used throughout.
+
+### Limitations
+
+- IC3 counterexamples come back as generic `input_0`/`output_0` names, not the original VHDL signal names
+- Liveness properties (`psl eventually!`) are still stubbed as `hw.constant true`
+- `psl assume` is not yet implemented — inputs remain unconstrained for both solvers
+- Hierarchical designs are not yet flattened before AIGER export

@@ -84,8 +84,21 @@ func main() {
 		fmt.Printf("Error writing MLIR to file: %v\n", err)
 		os.Exit(1)
 	}
-
 	fmt.Printf("\nMLIR written to %s\n", outputFile)
+
+	// Emit IC3 MLIR (bad-state output for ABC pdr) when a path is provided.
+	if len(os.Args) >= 4 {
+		ic3File := os.Args[3]
+		ic3Emitter := NewMLIREmitterIC3()
+		ic3Emitter.EmitModules(modules)
+		err = os.WriteFile(ic3File, []byte(ic3Emitter.String()), 0644)
+		if err != nil {
+			fmt.Printf("Error writing IC3 MLIR to file: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("IC3 MLIR written to %s\n", ic3File)
+	}
+
 	fmt.Println("\n--- Generated MLIR ---")
 	fmt.Println(emitter.String())
 }

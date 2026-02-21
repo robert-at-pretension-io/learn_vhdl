@@ -148,8 +148,8 @@ func.func @CheckEquivalence() {
   second {
     ^bb0(%a: i32, %b: i32):
       %c3      = hw.constant 3 : i32
-      %shifted = comb.shl %b, %c3 : i32  // 8*b
-      %r       = comb.add %b, %shifted : i32 // b + 8*b = 9*b (wrong example — just structure)
+      %shifted = comb.shl %b, %c3 : i32  // 8*b (shift-and-add approximation)
+      %r       = comb.add %b, %shifted : i32
       verif.yield %r : i32
   }
 }
@@ -216,13 +216,13 @@ Direct equivalent of SVA: `assert property (@(posedge clk) req |-> ##[1:3] ack)`
 
 #### `ltl.eventually` — liveness
 
-"At some future point, X must hold." Cannot be falsified in finite time — requires k-induction or IC3, not BMC.
+"At some future point, X must hold." Cannot be falsified in finite time — requires IC3 with fairness, not BMC.
 
 ```mlir
 %drain = ltl.eventually %not_full : i1
 %clocked = ltl.clock %drain, posedge %clk_i1 : !ltl.property
 verif.assert %clocked : !ltl.property
-// circt-bmc cannot verify this; requires IC3/PDR
+// circt-bmc cannot verify this; ABC pdr requires Buchi/fairness encoding
 ```
 
 #### `ltl.until` — conditional liveness
@@ -269,6 +269,8 @@ hw.module @HandshakeChecker(
 
 ## The Lowering Hierarchy
 
+### BMC path (circt-bmc + Z3)
+
 ```
 LTL property
     |
@@ -286,18 +288,42 @@ Z3 says UNSAT -> "Bound reached with no violations!"
 Z3 says SAT   -> "Assertion can be violated!" + counterexample trace
 ```
 
-**Key insight**: VerifToSMT *negates* the assertion. It asks "can the property be false?" If Z3 cannot find a way to make it false (UNSAT), the property is proved. If it finds a model (SAT), you get the exact signal values at each unrolled cycle demonstrating the violation.
+**Key insight**: VerifToSMT *negates* the assertion. It asks "can the property be false?" UNSAT means no violation in N cycles. SAT gives exact signal values at each unrolled cycle.
+
+### IC3/PDR path (circt-synth + AIGER + ABC pdr)
+
+```
+__verif_bad = NOT(combined assertion) as hw.output
+    |
+    v  (circt-synth --until-before=all)
+AIG dialect (synth.aig.and_inv, seq.compreg as latches)
+    |
+    v  (circt-translate --export-aiger)
+binary AIGER (.aig) — M inputs, L latches, O outputs (bad states)
+    |
+    v  (yosys-abc pdr)
+IC3 frame sequence construction
+    |
+    v
+"Property proved."   <- fixed-point invariant found (all cycles)
+or
+"CEX found in frame N"  <- concrete counterexample
+```
+
+**Key insight**: AIGER treats `hw.output` as bad-state signals. ABC `pdr` proves those outputs are unreachable from any initial state across all cycles.
 
 ---
 
-## What BMC Can vs. Cannot Prove
+## What Each Solver Proves
 
-| Property type | circt-bmc (BMC) | k-induction / IC3 |
+| Property type | circt-bmc (BMC) | ABC pdr (IC3) |
 |---|---|---|
-| Safety (`assert always P`) | Yes — finds violations within N cycles | Yes — proves for all cycles |
-| Invariants (register never reaches bad state) | Yes (bounded) | Yes (unbounded) |
-| LEC (input-output equivalence) | Yes via `verif.lec` | — |
-| Liveness (`ltl.eventually`) | No | Yes |
-| Fairness constraints | No | Yes (with fairness condition) |
+| Safety — finds bugs | Yes (within bound) | Yes (any depth) |
+| Safety — proves correct | No | Yes (unbounded) |
+| Bitvector arithmetic | Native (Z3 BV theory) | Bit-exploded (slower for wide types) |
+| Counterexample detail | Named MLIR signals | Generic input_N/output_N |
+| `verif.assume` support | Native | Needs manual encoding |
+| `ltl.eventually` (liveness) | No | Needs Buchi encoding (not yet wired) |
+| LEC | Yes via `verif.lec` | Via AIGER equivalence checking |
 
-In the micro-vhdl compiler, `ltl.eventually` (PSL `eventually!`) is emitted as `hw.constant true` with a TODO comment because circt-bmc cannot evaluate liveness properties within finite unrolling. Those properties require a different solver backend.
+The two solvers are complementary. BMC runs first (fast, finds shallow bugs, readable traces). IC3 runs second (proves the property holds for all cycles, or finds deep bugs BMC missed).

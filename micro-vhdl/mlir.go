@@ -17,17 +17,34 @@ type assertionEntry struct {
 
 // MLIREmitter handles translating populated Wires, Statements, and Modules into CIRCT HW/Comb MLIR text.
 type MLIREmitter struct {
-	builder    strings.Builder
-	indent     int
-	ssaID      int
-	modules    map[string]*Module
-	assertions []assertionEntry // accumulated per-module, reset in EmitModule
+	builder     strings.Builder
+	indent      int
+	ssaID       int
+	modules     map[string]*Module
+	assertions  []assertionEntry // accumulated per-module, reset in EmitModule
+	ic3Mode     bool             // emit __verif_bad hw.output instead of verif.assert
+	badStateSSA string           // set by emitCombinedAssertions in ic3Mode
 }
 
 func NewMLIREmitter() *MLIREmitter {
-	return &MLIREmitter{
-		modules: make(map[string]*Module),
+	return &MLIREmitter{modules: make(map[string]*Module)}
+}
+
+// NewMLIREmitterIC3 returns an emitter that targets the IC3/PDR path: PSL
+// assertions are emitted as a negated hw.output (__verif_bad) rather than
+// verif.assert, so the module can be exported to AIGER and checked by ABC pdr.
+func NewMLIREmitterIC3() *MLIREmitter {
+	return &MLIREmitter{modules: make(map[string]*Module), ic3Mode: true}
+}
+
+// hasPslAssertions reports whether mod contains any PSL assertion statements.
+func hasPslAssertions(mod *Module) bool {
+	for _, stmt := range mod.Statements {
+		if _, ok := stmt.(*PslAssertion); ok {
+			return true
+		}
 	}
+	return false
 }
 
 func (e *MLIREmitter) p(format string, args ...interface{}) {
@@ -58,9 +75,10 @@ func (e *MLIREmitter) clockSSA(mod *Module) string {
 
 // emitSeqInitial emits a seq.initial block that yields a zero value of the
 // given MLIR type and returns its SSA name.  Returns "" for complex types
-// (hw.array / hw.struct) where a zero literal cannot be trivially constructed.
+// (hw.array / hw.struct) or in IC3 mode (PDR explores from all initial states;
+// pinning them to zero would miss bugs only reachable from other start states).
 func (e *MLIREmitter) emitSeqInitial(mlirType string) string {
-	if strings.HasPrefix(mlirType, "!hw.") {
+	if e.ic3Mode || strings.HasPrefix(mlirType, "!hw.") {
 		return ""
 	}
 	initSSA := e.nextSSA()
@@ -455,10 +473,13 @@ func (e *MLIREmitter) EmitModules(mods []*Module) {
 
 // emitCombinedAssertions emits the accumulated PSL assertions after the module body.
 //
-// circt-bmc requires exactly one verif.assert per module; multiple i1 assertions
-// are ANDed together into a single combined check.  Temporal (!ltl.property)
-// assertions are emitted as verif.clocked_assert so --lower-ltl-to-core can handle
-// them independently (they require a separate preprocessing step before circt-bmc).
+// In BMC mode (default): circt-bmc requires exactly one verif.assert per module;
+// multiple i1 assertions are ANDed into a single combined check.
+//
+// In IC3 mode: instead of verif.assert, the negated conjunction is stored in
+// e.badStateSSA so EmitModule can wire it to the __verif_bad hw.output port.
+// ABC pdr treats hw.output signals as "bad state" indicators: output=1 means
+// the property is violated.
 func (e *MLIREmitter) emitCombinedAssertions(mod *Module) {
 	var boolAsserts []string
 	var temporalAsserts []assertionEntry
@@ -471,21 +492,34 @@ func (e *MLIREmitter) emitCombinedAssertions(mod *Module) {
 		}
 	}
 
-	// Combine all boolean assertions into one via comb.and chain.
+	// Build conjunction of all boolean assertions.
+	var combined string
 	if len(boolAsserts) == 1 {
-		e.p("verif.assert %s : i1", boolAsserts[0])
+		combined = boolAsserts[0]
 	} else if len(boolAsserts) > 1 {
-		combined := boolAsserts[0]
+		combined = boolAsserts[0]
 		for _, next := range boolAsserts[1:] {
 			res := e.nextSSA()
 			e.p("%s = comb.and %s, %s : i1", res, combined, next)
 			combined = res
 		}
-		e.p("verif.assert %s : i1", combined)
 	}
 
-	// Any remaining temporal (!ltl.property) assertions are not handled here;
-	// they would require --lower-ltl-to-core preprocessing before circt-bmc.
+	if combined != "" {
+		if e.ic3Mode {
+			// IC3 path: negate the conjunction to get the bad-state signal.
+			// __verif_bad = 1 when at least one assertion is violated.
+			trueVal := e.nextSSA()
+			badSSA := e.nextSSA()
+			e.p("%s = hw.constant -1 : i1", trueVal)
+			e.p("%s = comb.xor %s, %s : i1", badSSA, combined, trueVal)
+			e.badStateSSA = badSSA
+		} else {
+			e.p("verif.assert %s : i1", combined)
+		}
+	}
+
+	// Temporal (!ltl.property) assertions are not handled in either path here.
 	for _, ta := range temporalAsserts {
 		e.p("// temporal assertion skipped in BMC conjunction (type %s): %s", ta.typ, ta.val)
 	}
@@ -494,6 +528,7 @@ func (e *MLIREmitter) emitCombinedAssertions(mod *Module) {
 // EmitModule translates the Module into a hw.module definition
 func (e *MLIREmitter) EmitModule(mod *Module) {
 	e.assertions = e.assertions[:0] // reset accumulator for this module
+	e.badStateSSA = ""
 	// Construct signature
 	var ports []string
 	var outputs []string
@@ -510,6 +545,10 @@ func (e *MLIREmitter) EmitModule(mod *Module) {
 			ports = append(ports, fmt.Sprintf("out %s: %s", p.Name, t))
 			outputs = append(outputs, p.Name)
 		}
+	}
+	// In IC3 mode, add a bad-state output port when the module has PSL assertions.
+	if e.ic3Mode && hasPslAssertions(mod) {
+		ports = append(ports, "out __verif_bad: i1")
 	}
 
 	sigPorts := strings.Join(ports, ", ")
@@ -551,24 +590,28 @@ func (e *MLIREmitter) EmitModule(mod *Module) {
 	// Combine all accumulated PSL assertions into a single verif.assert.
 	e.emitCombinedAssertions(mod)
 
-	// Emit hw.output using the tracked drivers
+	// Emit hw.output using the tracked drivers.
+	// In IC3 mode, append the bad-state signal as the final output.
 	var outVals []string
 	var outTypes []string
-	if len(outputs) > 0 {
-		for i, p := range mod.Ports {
-			if p.Direction == "out" {
-				t := typeToMLIR(p.Type, mod)
-				if valName, ok := env[p.Name]; ok {
-					outVals = append(outVals, valName)
-				} else {
-					// Fallback if undriven
-					valName := fmt.Sprintf("%%c0_%d", i)
-					e.p("%s = hw.constant 0 : %s", valName, t)
-					outVals = append(outVals, valName)
-				}
-				outTypes = append(outTypes, t)
+	for i, p := range mod.Ports {
+		if p.Direction == "out" {
+			t := typeToMLIR(p.Type, mod)
+			if valName, ok := env[p.Name]; ok {
+				outVals = append(outVals, valName)
+			} else {
+				valName := fmt.Sprintf("%%c0_%d", i)
+				e.p("%s = hw.constant 0 : %s", valName, t)
+				outVals = append(outVals, valName)
 			}
+			outTypes = append(outTypes, t)
 		}
+	}
+	if e.badStateSSA != "" {
+		outVals = append(outVals, e.badStateSSA)
+		outTypes = append(outTypes, "i1")
+	}
+	if len(outVals) > 0 {
 		e.p("hw.output %s : %s", strings.Join(outVals, ", "), strings.Join(outTypes, ", "))
 	} else {
 		e.p("hw.output")

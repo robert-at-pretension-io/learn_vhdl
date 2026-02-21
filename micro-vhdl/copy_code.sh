@@ -19,6 +19,9 @@ print_file() {
     print_file "mlir.go"
     print_file "main.go"
     print_file "compile.sh"
+    print_file "verif-ltl-guide.md"
+    print_file "verif-extensions.md"
+    print_file "k-induction-ic3.md"
 ) > .paste_buffer.txt
 
 # Try to copy to clipboard if a tool is available
