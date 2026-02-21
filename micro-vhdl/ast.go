@@ -40,10 +40,11 @@ type Generic struct {
 
 // Module represents the complete Micro-VHDL design unit (Entity + Architecture).
 type Module struct {
-	Name       string
-	Generics   []*Generic
-	Ports      []*Port
-	Signals    []*Signal
+	Name      string
+	ClockPort string // name of the clock input port; empty for purely combinational modules
+	Generics  []*Generic
+	Ports     []*Port
+	Signals   []*Signal
 	Statements []Statement
 
 	// Symbol Table

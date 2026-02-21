@@ -76,13 +76,16 @@ func main() {
 	emitter.EmitModules(modules)
 
 	outputFile := "build.mlir"
+	if len(os.Args) >= 3 {
+		outputFile = os.Args[2]
+	}
 	err = os.WriteFile(outputFile, []byte(emitter.String()), 0644)
 	if err != nil {
 		fmt.Printf("Error writing MLIR to file: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("\nMLIR successfully generated and written to %s\n", outputFile)
+	fmt.Printf("\nMLIR written to %s\n", outputFile)
 	fmt.Println("\n--- Generated MLIR ---")
 	fmt.Println(emitter.String())
 }

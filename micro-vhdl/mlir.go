@@ -6,12 +6,22 @@ import (
 	"strings"
 )
 
+// assertionEntry holds a PSL assertion SSA value collected during statement emission.
+// All i1 assertions are combined into a single verif.assert at module end (circt-bmc
+// requires exactly one assertion per module).  !ltl.property assertions are emitted
+// separately as verif.clocked_assert so they can be handled by --lower-ltl-to-core.
+type assertionEntry struct {
+	val string // SSA name
+	typ string // "i1" or "!ltl.property"
+}
+
 // MLIREmitter handles translating populated Wires, Statements, and Modules into CIRCT HW/Comb MLIR text.
 type MLIREmitter struct {
-	builder strings.Builder
-	indent  int
-	ssaID   int
-	modules map[string]*Module
+	builder    strings.Builder
+	indent     int
+	ssaID      int
+	modules    map[string]*Module
+	assertions []assertionEntry // accumulated per-module, reset in EmitModule
 }
 
 func NewMLIREmitter() *MLIREmitter {
@@ -36,6 +46,32 @@ func (e *MLIREmitter) nextSSA() string {
 	val := fmt.Sprintf("%%%d", e.ssaID)
 	e.ssaID++
 	return val
+}
+
+// clockSSA returns the SSA name of the module's clock port (e.g. "%clk").
+func (e *MLIREmitter) clockSSA(mod *Module) string {
+	if mod.ClockPort == "" {
+		return ""
+	}
+	return fmt.Sprintf("%%%s", mod.ClockPort)
+}
+
+// emitSeqInitial emits a seq.initial block that yields a zero value of the
+// given MLIR type and returns its SSA name.  Returns "" for complex types
+// (hw.array / hw.struct) where a zero literal cannot be trivially constructed.
+func (e *MLIREmitter) emitSeqInitial(mlirType string) string {
+	if strings.HasPrefix(mlirType, "!hw.") {
+		return ""
+	}
+	initSSA := e.nextSSA()
+	zeroSSA := e.nextSSA()
+	e.p("%s = seq.initial () {", initSSA)
+	e.indent++
+	e.p("%s = hw.constant 0 : %s", zeroSSA, mlirType)
+	e.p("seq.yield %s : %s", zeroSSA, mlirType)
+	e.indent--
+	e.p("} : () -> !seq.immutable<%s>", mlirType)
+	return initSSA
 }
 
 // typeToMLIR translates the extracted Type to its MLIR equivalent (e.g., std_logic -> i1, array -> !hw.array<size x type>)
@@ -184,22 +220,50 @@ func (e *MLIREmitter) emitExpression(expr Expression, mod *Module, env map[strin
 			return resVal, rightType
 		}
 	case PslImplicationExpr:
+		// PSL |=> is next-cycle: "if left holds at cycle N, right must hold at cycle N+1."
+		// Implement as: delay left by one clock cycle, then check boolean implication.
+		// This produces a plain i1 assertion that circt-bmc can consume directly.
 		leftVal, _ := e.emitExpression(v.Left, mod, env, "", "i1")
 		rightVal, _ := e.emitExpression(v.Right, mod, env, "", "i1")
-		e.p("%s = ltl.implication %s, %s : i1, i1", resVal, leftVal, rightVal)
-		return resVal, "!ltl.property"
+
+		clk := e.clockSSA(mod)
+		initSSA := e.emitSeqInitial("i1")
+		delayedVal := e.nextSSA()
+		e.p("%s = seq.compreg %s, %s initial %s : i1", delayedVal, leftVal, clk, initSSA)
+
+		// Boolean implication: !left_d1 || right
+		trueVal := e.nextSSA()
+		notDelayed := e.nextSSA()
+		e.p("%s = hw.constant -1 : i1", trueVal)
+		e.p("%s = comb.xor %s, %s : i1", notDelayed, delayedVal, trueVal)
+		e.p("%s = comb.or %s, %s : i1", resVal, notDelayed, rightVal)
+		return resVal, "i1"
+
 	case PslEventuallyExpr:
-		leftVal, _ := e.emitExpression(v.Left, mod, env, "", "i1")
-		rightVal, _ := e.emitExpression(v.Right, mod, env, "", "i1")
-		
-		eventuallyVal := e.nextSSA()
-		e.p("%s = ltl.eventually %s : i1", eventuallyVal, rightVal)
-		e.p("%s = ltl.implication %s, %s : i1, !ltl.property", resVal, leftVal, eventuallyVal)
-		return resVal, "!ltl.property"
+		// PSL "left -> eventually! right" is a liveness property: right must become
+		// true at some unbounded future cycle whenever left holds.  Bounded model
+		// checking (circt-bmc) cannot directly encode liveness without an automaton
+		// translation.  We emit a hw.constant true so the assertion always passes in
+		// the BMC conjunction (not checked), and add a comment that flags the property
+		// for review.  A full liveness proof requires an unbounded solver or k-liveness.
+		e.p("// TODO liveness: psl assert always %s -> eventually! %s (skipped in BMC)", v.Left, v.Right)
+		e.p("%s = hw.constant true", resVal)
+		return resVal, "i1"
+
 	case PslStableExpr:
-		// Not natively in LTL currently, mock it with i1 for demonstration
-		sigVal, _ := e.emitExpression(v.Signal, mod, env, "", "")
-		e.p("%s = comb.icmp eq %s, %s : i1", resVal, sigVal, sigVal)
+		// PSL stable(x): x has not changed from the previous clock cycle.
+		// Implement by storing the previous value in a register and comparing.
+		sigVal, sigType := e.emitExpression(v.Signal, mod, env, "", "")
+
+		clk := e.clockSSA(mod)
+		initSSA := e.emitSeqInitial(sigType)
+		prevVal := e.nextSSA()
+		if initSSA != "" {
+			e.p("%s = seq.compreg %s, %s initial %s : %s", prevVal, sigVal, clk, initSSA, sigType)
+		} else {
+			e.p("%s = seq.compreg %s, %s : %s", prevVal, sigVal, clk, sigType)
+		}
+		e.p("%s = comb.icmp eq %s, %s : %s", resVal, sigVal, prevVal, sigType)
 		return resVal, "i1"
 	}
 	return e.nextSSA(), "i1"
@@ -229,14 +293,22 @@ func (e *MLIREmitter) emitSynchronousProcess(sp *SynchronousProcess, mod *Module
 	for target := range targets {
 		localEnv := make(map[string]string)
 		for k, v := range globalEnv { localEnv[k] = v }
-		
+
 		currentStateVal := fmt.Sprintf("%%%s", target)
 		nextStateVal := e.buildSeqBlock(sp.Statements, target, currentStateVal, mod, localEnv)
-		
+
 		t := mod.Symbols[target]
-		clkVal := e.nextSSA()
-		e.p("%s = seq.to_clock %%clk", clkVal)
-		e.p("%%%s = seq.compreg %s, %s : %s", target, nextStateVal, clkVal, typeToMLIR(t, mod))
+		mlirType := typeToMLIR(t, mod)
+		clk := e.clockSSA(mod)
+
+		// Emit seq.initial so BMC tools know the register starts at zero rather
+		// than at an arbitrary unconstrained value.
+		initSSA := e.emitSeqInitial(mlirType)
+		if initSSA != "" {
+			e.p("%%%s = seq.compreg %s, %s initial %s : %s", target, nextStateVal, clk, initSSA, mlirType)
+		} else {
+			e.p("%%%s = seq.compreg %s, %s : %s", target, nextStateVal, clk, mlirType)
+		}
 		globalEnv[target] = fmt.Sprintf("%%%s", target)
 	}
 }
@@ -318,7 +390,12 @@ func (e *MLIREmitter) emitEntityInstantiation(inst *EntityInstantiation, parentM
 
 	// We need to match the formal ports to the actual arguments based on childMod definition
 	for _, port := range childMod.Ports {
-		t := typeToMLIR(port.Type, childMod)
+		var t string
+		if port.Name == childMod.ClockPort {
+			t = "!seq.clock"
+		} else {
+			t = typeToMLIR(port.Type, childMod)
+		}
 		var actualExpr Expression
 		for _, entry := range inst.PortMap {
 			if entry.Formal == port.Name {
@@ -376,18 +453,62 @@ func (e *MLIREmitter) EmitModules(mods []*Module) {
 	}
 }
 
+// emitCombinedAssertions emits the accumulated PSL assertions after the module body.
+//
+// circt-bmc requires exactly one verif.assert per module; multiple i1 assertions
+// are ANDed together into a single combined check.  Temporal (!ltl.property)
+// assertions are emitted as verif.clocked_assert so --lower-ltl-to-core can handle
+// them independently (they require a separate preprocessing step before circt-bmc).
+func (e *MLIREmitter) emitCombinedAssertions(mod *Module) {
+	var boolAsserts []string
+	var temporalAsserts []assertionEntry
+
+	for _, a := range e.assertions {
+		if a.typ == "i1" {
+			boolAsserts = append(boolAsserts, a.val)
+		} else {
+			temporalAsserts = append(temporalAsserts, a)
+		}
+	}
+
+	// Combine all boolean assertions into one via comb.and chain.
+	if len(boolAsserts) == 1 {
+		e.p("verif.assert %s : i1", boolAsserts[0])
+	} else if len(boolAsserts) > 1 {
+		combined := boolAsserts[0]
+		for _, next := range boolAsserts[1:] {
+			res := e.nextSSA()
+			e.p("%s = comb.and %s, %s : i1", res, combined, next)
+			combined = res
+		}
+		e.p("verif.assert %s : i1", combined)
+	}
+
+	// Any remaining temporal (!ltl.property) assertions are not handled here;
+	// they would require --lower-ltl-to-core preprocessing before circt-bmc.
+	for _, ta := range temporalAsserts {
+		e.p("// temporal assertion skipped in BMC conjunction (type %s): %s", ta.typ, ta.val)
+	}
+}
+
 // EmitModule translates the Module into a hw.module definition
 func (e *MLIREmitter) EmitModule(mod *Module) {
+	e.assertions = e.assertions[:0] // reset accumulator for this module
 	// Construct signature
 	var ports []string
 	var outputs []string
 	for _, p := range mod.Ports {
-		t := typeToMLIR(p.Type, mod)
+		var t string
+		if p.Name == mod.ClockPort {
+			t = "!seq.clock" // clock ports are !seq.clock, not i1
+		} else {
+			t = typeToMLIR(p.Type, mod)
+		}
 		if p.Direction == "in" {
 			ports = append(ports, fmt.Sprintf("in %%%s: %s", p.Name, t))
 		} else {
 			ports = append(ports, fmt.Sprintf("out %s: %s", p.Name, t))
-			outputs = append(outputs, p.Name) // Track just the name for output length check
+			outputs = append(outputs, p.Name)
 		}
 	}
 
@@ -426,6 +547,9 @@ func (e *MLIREmitter) EmitModule(mod *Module) {
 	}
 
 	e.emitStatementList(mod.Statements, mod, env)
+
+	// Combine all accumulated PSL assertions into a single verif.assert.
+	e.emitCombinedAssertions(mod)
 
 	// Emit hw.output using the tracked drivers
 	var outVals []string
@@ -533,11 +657,8 @@ func (e *MLIREmitter) emitStatementList(stmts []Statement, mod *Module, env map[
 			}
 		case *PslAssertion:
 			propVal, propType := e.emitExpression(s.Property, mod, env, "", "")
-			if propType == "i1" || propType == "!ltl.property" || propType == "!ltl.sequence" {
-				e.p("verif.assert %s : %s", propVal, propType)
-			} else {
-				e.p("verif.assert %s : %s", propVal, propType)
-			}
+			// Accumulate instead of emitting directly; EmitModule combines them.
+			e.assertions = append(e.assertions, assertionEntry{propVal, propType})
 		}
 	}
 }

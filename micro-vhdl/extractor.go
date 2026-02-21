@@ -411,6 +411,10 @@ func (e *Extractor) extractSynchronousProcess(node *sitter.Node) *SynchronousPro
 	proc := &SynchronousProcess{
 		LineNum: uint32(node.StartPosition().Row + 1),
 	}
+	// The micro-vhdl grammar hardcodes 'clk' as the clock signal in every
+	// synchronous_process.  Record it on the module so the MLIR emitter can
+	// emit the port as !seq.clock instead of i1.
+	e.module.ClockPort = "clk"
 
 	cursor := node.Walk()
 	if cursor.GotoFirstChild() {
