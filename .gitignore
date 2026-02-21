@@ -38,3 +38,6 @@
 .aider*
 vhdl_lint.json
 .vhdl_lint.json
+cirt-bin/
+cirt/
+fix_mlir.py
