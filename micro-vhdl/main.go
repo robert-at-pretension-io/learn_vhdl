@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	sitter "github.com/tree-sitter/go-tree-sitter"
 	micro_vhdl "micro-vhdl/tree-sitter-micro-vhdl/bindings/go"
@@ -50,12 +51,22 @@ func main() {
 	checker := NewSemanticChecker(modules)
 	errors := checker.Check()
 
+	fatalErrors := false
 	if len(errors) > 0 {
-		fmt.Println("\nSemantic Checks Failed:")
 		for _, err := range errors {
-			fmt.Println("  -", err)
+			if strings.Contains(err, "Warning -") {
+				fmt.Println("  -", err)
+			} else {
+				if !fatalErrors {
+					fmt.Println("\nSemantic Checks Failed:")
+				}
+				fmt.Println("  -", err)
+				fatalErrors = true
+			}
 		}
-		os.Exit(1)
+		if fatalErrors {
+			os.Exit(1)
+		}
 	}
 
 	fmt.Println("\nSemantic Checks Passed. Ready for MLIR Emission.")

@@ -19,8 +19,101 @@ func (c *SemanticChecker) Check() []string {
 		c.checkUndeclaredWires(mod)
 		c.checkInputImmutability(mod)
 		c.checkMultiDrivenWires(mod)
+		c.checkVerificationCoverage(mod)
 	}
 	return c.errors
+}
+
+func (c *SemanticChecker) checkVerificationCoverage(mod *Module) {
+	// Build a set of all signals referenced in ANY PSL assertion.
+	verifiedSignals := make(map[string]bool)
+
+	var walkExpr func(expr Expression)
+	walkExpr = func(expr Expression) {
+		if expr == nil {
+			return
+		}
+		switch v := expr.(type) {
+		case IdentifierExpr:
+			verifiedSignals[v.Name] = true
+		case IndexedNameExpr:
+			verifiedSignals[v.Prefix] = true
+			walkExpr(v.Index)
+		case SelectedNameExpr:
+			verifiedSignals[v.Prefix] = true
+		case BinaryExpr:
+			walkExpr(v.Left)
+			walkExpr(v.Right)
+		case UnaryExpr:
+			walkExpr(v.Right)
+		case ParenExpr:
+			walkExpr(v.Expr)
+		case PslImplicationExpr:
+			walkExpr(v.Left)
+			walkExpr(v.Right)
+		case PslEventuallyExpr:
+			walkExpr(v.Left)
+			walkExpr(v.Right)
+		case PslStableExpr:
+			walkExpr(v.Signal)
+		}
+	}
+
+	for _, stmt := range mod.Statements {
+		if psl, ok := stmt.(*PslAssertion); ok {
+			walkExpr(psl.Property)
+		}
+	}
+
+	// 1. Output Port Coverage
+	for _, p := range mod.Ports {
+		if p.Direction == "out" && !verifiedSignals[p.Name] {
+			c.errors = append(c.errors, fmt.Sprintf("Line %d: Warning - Output port '%s' is unconstrained by any PSL contract", p.LineNum, p.Name))
+		}
+	}
+
+	// 2. State/Register Coverage
+	// Collect all registers (targets of sequential assignments inside SynchronousProcess)
+	registers := make(map[string]uint32)
+	var walkSeq func(stmts []SequentialStatement)
+	walkSeq = func(stmts []SequentialStatement) {
+		for _, stmt := range stmts {
+			switch s := stmt.(type) {
+			case *SequentialAssignment:
+				registers[s.Target] = s.LineNum
+			case *SequentialIf:
+				walkSeq(s.Then)
+				for _, e := range s.Elsifs {
+					walkSeq(e.Then)
+				}
+				walkSeq(s.Else)
+			}
+		}
+	}
+
+	for _, stmt := range mod.Statements {
+		if sp, ok := stmt.(*SynchronousProcess); ok {
+			walkSeq(sp.Statements)
+		}
+	}
+
+	for regName, lineNum := range registers {
+		if !verifiedSignals[regName] {
+			// Don't warn about outputs that were already warned about above
+			isOutput := false
+			for _, p := range mod.Ports {
+				if p.Name == regName && p.Direction == "out" {
+					isOutput = true
+					break
+				}
+			}
+			if !isOutput {
+				c.errors = append(c.errors, fmt.Sprintf("Line %d: Warning - State register '%s' lacks temporal assertions", lineNum, regName))
+			}
+		}
+	}
+	
+	// 3. MUX Completeness (Optional/Future: Ensuring 'others' clause logic isn't sweeping invalid states)
 }
 
 func (c *SemanticChecker) errorf(line uint32, format string, args ...interface{}) {

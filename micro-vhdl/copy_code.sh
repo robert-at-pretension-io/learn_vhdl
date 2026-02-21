@@ -1,0 +1,38 @@
+#!/bin/bash
+
+# Function to print a file with a header
+print_file() {
+    echo "================================================================================"
+    echo "FILE: $1"
+    echo "================================================================================"
+    cat "$1"
+    echo ""
+    echo ""
+}
+
+# Collect all the important source code
+(
+    print_file "tree-sitter-micro-vhdl/grammar.js"
+    print_file "ast.go"
+    print_file "extractor.go"
+    print_file "semantics.go"
+    print_file "mlir.go"
+    print_file "main.go"
+    print_file "compile.sh"
+) > .paste_buffer.txt
+
+# Try to copy to clipboard if a tool is available
+if command -v xclip &> /dev/null; then
+    xclip -selection clipboard < .paste_buffer.txt
+    echo "Successfully copied the source code to your clipboard using xclip!"
+elif command -v xsel &> /dev/null; then
+    xsel --clipboard < .paste_buffer.txt
+    echo "Successfully copied the source code to your clipboard using xsel!"
+elif command -v pbcopy &> /dev/null; then
+    pbcopy < .paste_buffer.txt
+    echo "Successfully copied the source code to your clipboard using pbcopy!"
+else
+    echo "Could not find a clipboard utility (xclip, xsel, pbcopy)."
+    echo "All the source code has been combined into 'micro-vhdl/.paste_buffer.txt'."
+    echo "You can view it or copy it manually from there."
+fi

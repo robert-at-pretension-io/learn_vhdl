@@ -46,3 +46,6 @@
 [submodule "external_tests/zipcpu"]
 	path = external_tests/zipcpu
 	url = https://github.com/ZipCPU/zipcpu.git
+[submodule "cirt"]
+	path = cirt
+	url = https://github.com/llvm/circt.git

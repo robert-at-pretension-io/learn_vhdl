@@ -23,6 +23,7 @@ type Port struct {
 	Name      string
 	Direction string // "in" or "out"
 	Type      Type
+	LineNum   uint32
 }
 
 // Signal represents a declared signal (copper wire).

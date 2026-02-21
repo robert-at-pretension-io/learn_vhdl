@@ -141,6 +141,7 @@ func (e *Extractor) extractPortDeclaration(node *sitter.Node) {
 						Name:      name,
 						Direction: direction,
 						Type:      typ,
+						LineNum:   uint32(n.StartPosition().Row + 1),
 					}
 					e.module.Ports = append(e.module.Ports, port)
 					e.module.Symbols[name] = typ

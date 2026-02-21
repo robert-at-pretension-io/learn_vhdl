@@ -39,5 +39,5 @@
 vhdl_lint.json
 .vhdl_lint.json
 cirt-bin/
-cirt/
+#cirt/
 fix_mlir.py

@@ -1,0 +1,2092 @@
+================================================================================
+FILE: tree-sitter-micro-vhdl/grammar.js
+================================================================================
+/* ============================================================================
+ * THE MICRO-VHDL MANIFESTO: AN ARCHITECTURE OF INTENT
+ * ============================================================================
+ * * CORE PHILOSOPHY
+ * Software executes in time. Hardware exists in space. 
+ * Traditional VHDL is bloated with "software-like" temporal constructs 
+ * (variables, unclocked loops, sequential logic) that blur the line between 
+ * algorithms and physics. This ambiguity is the root cause of the "Von Neumann 
+ * Hangover" in AI-generated hardware, where Large Language Models hallucinate 
+ * impossible silicon topologies like unclocked temporal paradoxes and multi-driven 
+ * short circuits.
+ * * THE MICRO-VHDL SANDBOX
+ * Micro-VHDL is not a new language; it is a ruthlessly stripped-down, compiler-
+ * enforced subset of standard VHDL. It is designed to act as a deterministic 
+ * physics engine. By restricting the grammar, we force both the engineer and 
+ * the AI to stop writing sequential recipes and start drawing 2D physical graphs 
+ * of logic gates, copper wires, and switchboxes.
+ * * THE AXIOMS OF THIS GRAMMAR
+ * 1. Time is Quarantined: Time only exists inside `rising_edge(clk)` registers. 
+ * All other logic evaluates continuously at the speed of light.
+ * 2. Spatial Routing over Control Flow: Combinational `if/else` is banned. 
+ * Conditional routing is achieved via explicit physical multiplexers (`with...select`).
+ * 3. Immutable Wires: The variable (`:=`) is banned. You may only solder wires 
+ * together using concurrent assignment (`<=`).
+ * 4. Deterministic Hierarchy: Components and configurations are banned. 
+ * Modules must be directly instantiated.
+ * 5. Provable Intent: Formal verification (PSL) is a first-class citizen.
+ * * If a construct violates these axioms, it is rejected by this parser in O(1) time.
+ * ============================================================================ */
+
+module.exports = grammar({
+  name: 'micro_vhdl',
+
+  extras: $ => [
+    /\s+/,
+    $.comment,
+  ],
+
+  word: $ => $.identifier,
+
+  rules: {
+    // -------------------------------------------------------------------------
+    // ENTRY POINT
+    // -------------------------------------------------------------------------
+    source_file: $ => repeat($._design_unit),
+
+    comment: $ => token(seq('--', /[^\\r\\n]*/)),
+
+    identifier: $ => /[a-zA-Z][a-zA-Z0-9_]*/,
+
+    _design_unit: $ => choice(
+      $.library_clause,
+      $.use_clause,
+      $.entity_declaration,
+      $.architecture_body
+    ),
+
+    // -------------------------------------------------------------------------
+    // BOILERPLATE
+    // -------------------------------------------------------------------------
+    library_clause: $ => seq('library', $.identifier, ';'),
+    use_clause: $ => seq('use', $.identifier, '.', $.identifier, '.', choice($.identifier, 'all'), ';'),
+
+    // -------------------------------------------------------------------------
+    // MODULE 1: THE CANVAS (Entity & Generics)
+    // -------------------------------------------------------------------------
+    entity_declaration: $ => seq(
+      'entity', field('name', $.identifier), 'is',
+      optional($.generic_clause),
+      optional($.port_clause),
+      'end', optional('entity'), optional($.identifier), ';'
+    ),
+
+    // JUSTIFICATION: Complex metaprogramming (generic types/functions) requires a 
+    // massive compile-time elaboration engine. Restricting generics strictly to 
+    // 'integer' allows for parameterized silicon (e.g., dynamic bus widths) 
+    // without sacrificing parser simplicity or deterministic lowering.
+    generic_clause: $ => seq(
+      'generic', '(',
+      $.generic_declaration,
+      repeat(seq(';', $.generic_declaration)),
+      ')', ';'
+    ),
+
+    generic_declaration: $ => seq(
+      field('name', $.identifier), ':', 'integer', ':=', field('default', $.number)
+    ),
+
+    port_clause: $ => seq(
+      'port', '(',
+      $.port_declaration,
+      repeat(seq(';', $.port_declaration)),
+      ')', ';'
+    ),
+
+    // JUSTIFICATION: 'inout' and 'buffer' allow bi-directional, tri-state logic. 
+    // This introduces quantum-like "Z" states that complicate formal verification 
+    // and SSA translation. We enforce strictly directional dataflow: 'in' or 'out'.
+    port_declaration: $ => seq(
+      field('names', $.identifier_list), ':',
+      field('direction', choice('in', 'out')),
+      field('type', alias($.type_mark, $.type_mark))
+    ),
+
+    architecture_body: $ => seq(
+      'architecture', field('name', $.identifier), 'of', field('entity', $.identifier), 'is',
+      repeat($._architecture_declarative_item),
+      'begin',
+      repeat($._concurrent_statement),
+      'end', optional('architecture'), optional($.identifier), ';'
+    ),
+
+    // -------------------------------------------------------------------------
+    // MODULE 2: THE COPPER (Declarations, Types, and Arrays)
+    // -------------------------------------------------------------------------
+    _architecture_declarative_item: $ => choice(
+      $.signal_declaration,
+      $.type_declaration
+    ),
+
+    // JUSTIFICATION: Variables are banned. A 'signal' is not a memory allocation; 
+    // it is a literal declaration of a physical copper wire.
+    signal_declaration: $ => seq(
+      'signal', field('names', $.identifier_list), ':', field('type', alias($.type_mark, $.type_mark)), ';'
+    ),
+
+    type_declaration: $ => seq(
+      'type', field('name', $.identifier), 'is',
+      choice($.enum_type_definition, $.record_type_definition, $.array_type_definition), ';'
+    ),
+
+    // JUSTIFICATION: Enums synthesize mathematically into the exact \log_2 wires
+    // needed for a Finite State Machine, preventing "magic number" hallucinations.
+    enum_type_definition: $ => seq('(', $.identifier, repeat(seq(',', $.identifier)), ')'),
+
+    // JUSTIFICATION: Records allow LLMs to bundle related wires (like a bus or packet)
+    // together, vastly reducing the cognitive load of routing dozens of individual pins.
+    record_type_definition: $ => seq(
+      'record',
+      repeat1($.record_field),
+      'end', 'record', optional($.identifier)
+    ),
+
+    record_field: $ => seq(field('names', $.identifier_list), ':', field('type', alias($.type_mark, $.type_mark)), ';'),
+
+    // JUSTIFICATION: Explicit 1D arrays are required so synthesis tools (and CIRCT) 
+    // can map large data structures directly into physical Block RAM (SRAM) 
+    // rather than wasting thousands of combinational logic gates.
+    array_type_definition: $ => seq(
+      'array', '(', $.number, 'to', $.number, ')', 'of', field('element_type', $.type_mark)
+    ),
+
+    type_mark: $ => choice(
+      'std_logic',
+      seq(choice('std_logic_vector', 'unsigned'), '(', $._expression, 'downto', $._expression, ')'),
+      $.identifier 
+    ),
+
+    identifier_list: $ => seq($.identifier, repeat(seq(',', $.identifier))),
+
+    // -------------------------------------------------------------------------
+    // MODULE 3 & 4: MATH, ROUTING, TIME & INSTANTIATION
+    // -------------------------------------------------------------------------
+    _concurrent_statement: $ => choice(
+      $.concurrent_assignment,
+      $.selected_assignment,
+      $.synchronous_process,
+      $.generate_statement,
+      $.entity_instantiation, 
+      $.psl_assertion
+    ),
+
+    // JUSTIFICATION: Combinational math executes continuously. Conditionals here 
+    // synthesize to physical priority encoders, not sequential branch execution.
+    concurrent_assignment: $ => seq(
+      field('target', $._name), '<=', field('value', $._expression),
+      optional(seq('when', field('condition', $._expression), 'else', field('alt_value', $._expression))),
+      ';'
+    ),
+
+    // JUSTIFICATION: The Multiplexer. Forces the AI to explicitly declare routing 
+    // paths for all states. The 'others' keyword ensures no floating wires (latches).
+    selected_assignment: $ => seq(
+      'with', field('selector', $._expression), 'select',
+      field('target', $._name), '<=',
+      $._expression, 'when', choice($._expression, 'others'),
+      repeat(seq(',', $._expression, 'when', choice($._expression, 'others'))),
+      ';'
+    ),
+
+    // JUSTIFICATION: The Lego Snap. Banning standard VHDL components and configurations 
+    // removes the dual-pass compilation requirement. Direct entity instantiation 
+    // allows for infinitely scalable, modular architectures.
+    entity_instantiation: $ => seq(
+      field('label', $.identifier), ':', 'entity', 'work', '.', field('entity_name', $.identifier),
+      optional(seq('generic', 'map', '(', field('generic_map', $.association_list), ')')),
+      'port', 'map', '(', field('port_map', $.association_list), ')', ';'
+    ),
+
+    association_list: $ => seq(
+      $.association_element, repeat(seq(',', $.association_element))
+    ),
+
+    association_element: $ => seq(
+      field('formal', $.identifier), '=>', field('actual', $._expression)
+    ),
+
+    // JUSTIFICATION: The Time Machine. This is the ONLY place time exists in Micro-VHDL. 
+    // By enforcing the `rising_edge(clk)` template, we guarantee that all state 
+    // maps directly to a synchronous D-Flip-Flop register. Unclocked processes are banned.
+    synchronous_process: $ => seq(
+      'process', '(', 'clk', ')', 'begin',
+      'if', 'rising_edge', '(', 'clk', ')', 'then',
+      repeat($._sequential_statement), 
+      'end', 'if', ';',
+      'end', 'process', ';'
+    ),
+
+    _sequential_statement: $ => choice(
+      $.sequential_assignment,
+      $.sequential_if 
+    ),
+
+    sequential_assignment: $ => seq(
+      field('target', $._name), '<=', field('value', $._expression), ';'
+    ),
+
+    // JUSTIFICATION: Allowing `if/else` strictly *inside* the clock block maps 
+    // cleanly to the enable ('en') and reset ('rst') pins of a physical register. 
+    // It keeps FSMs readable without breaking spatial routing laws.
+    sequential_if: $ => seq(
+      'if', field('condition', $._expression), 'then',
+      repeat($._sequential_statement),
+      repeat($.elsif_clause),
+      optional($.else_clause),
+      'end', 'if', ';'
+    ),
+
+    elsif_clause: $ => seq('elsif', field('condition', $._expression), 'then', repeat($._sequential_statement)),
+    else_clause: $ => seq('else', repeat($._sequential_statement)),
+
+    // -------------------------------------------------------------------------
+    // MODULE 5: THE CLONING MACHINE (Spatial Loops)
+    // -------------------------------------------------------------------------
+    // JUSTIFICATION: A sequential 'for' loop implies time. A 'generate' loop 
+    // implies space. This explicitly stamps out parallel hardware clones 
+    // (e.g., 64 Adders) across the 2D silicon canvas.
+    generate_statement: $ => seq(
+      field('label', $.identifier), ':', 'for', field('iterator', $.identifier), 'in', field('start', $.number), 'to', field('end', $.number), 'generate',
+      repeat($._concurrent_statement),
+      'end', 'generate', optional($.identifier), ';'
+    ),
+
+    // -------------------------------------------------------------------------
+    // MODULE 6: THE CONTRACT (PSL)
+    // -------------------------------------------------------------------------
+    // JUSTIFICATION: Hardware bugs cannot be patched over the air. PSL assertions 
+    // allow external SMT solvers to mathematically prove the architectural intent 
+    // of the LLM across billions of clock cycles.
+    psl_assertion: $ => seq(
+      'psl', 'assert', 'always',
+      field('property', $._psl_expression), ';'
+    ),
+
+    _psl_expression: $ => choice(
+      $._expression,
+      $.psl_implication,
+      $.psl_eventually,
+      $.psl_stable
+    ),
+
+    psl_implication: $ => prec.left(1, seq(field('left', $._psl_expression), '|=>', field('right', $._psl_expression))),
+    psl_eventually: $ => prec.left(2, seq(field('left', $._psl_expression), '->', 'eventually!', field('right', $._psl_expression))),
+    psl_stable: $ => seq('stable', '(', field('signal', $._name), ')'),
+
+    // -------------------------------------------------------------------------
+    // EXPRESSIONS & NAMES
+    // -------------------------------------------------------------------------
+    _name: $ => choice(
+      $.identifier,
+      $.indexed_name, 
+      $.selected_name        
+    ),
+
+    indexed_name: $ => seq(field('prefix', $.identifier), '(', field('index', $._expression), ')'),
+    selected_name: $ => seq(field('prefix', $.identifier), '.', field('suffix', $.identifier)),
+
+    _expression: $ => choice(
+      $._name,
+      $.number,
+      $.string_literal, 
+      $.char_literal,   
+      seq('(', $._expression, ')'),
+      $.binary_expression,
+      $.unary_expression
+    ),
+
+    binary_expression: $ => prec.left(1, seq(
+      field('left', $._expression), 
+      field('operator', choice('+', '-', '*', '=', '/=', '<', '>', '<=', '>=', 'and', 'or', 'xor', '&')), 
+      field('right', $._expression)
+    )),
+
+    unary_expression: $ => prec(2, seq(
+      field('operator', 'not'), 
+      field('argument', $._expression)
+    )),
+
+    number: $ => /[0-9]+/,
+    string_literal: $ => choice(/"[01]+"/, /x"[0-9a-fA-F]+"/),
+    char_literal: $ => /'[01]'/ 
+  }
+});
+
+================================================================================
+FILE: ast.go
+================================================================================
+package main
+
+// Type represents a VHDL type with its bit width and potential advanced structure.
+type Type struct {
+	Name  string
+	Width int // 1 for std_logic, N for std_logic_vector
+	
+	IsArray     bool
+	ArraySize   int
+	ElementType *Type
+	
+	IsRecord    bool
+	Fields      []RecordField
+}
+
+type RecordField struct {
+	Name string
+	Type Type
+}
+
+// Port represents an entity port.
+type Port struct {
+	Name      string
+	Direction string // "in" or "out"
+	Type      Type
+}
+
+// Signal represents a declared signal (copper wire).
+type Signal struct {
+	Name string
+	Type Type
+}
+
+// Generic represents a parameterized integer.
+type Generic struct {
+	Name    string
+	Default string
+}
+
+// Module represents the complete Micro-VHDL design unit (Entity + Architecture).
+type Module struct {
+	Name       string
+	Generics   []*Generic
+	Ports      []*Port
+	Signals    []*Signal
+	Statements []Statement
+
+	// Symbol Table
+	Symbols map[string]Type
+}
+
+func NewModule(name string) *Module {
+	return &Module{
+		Name:    name,
+		Symbols: make(map[string]Type),
+	}
+}
+
+// Statement is the interface for all statements in the architecture body.
+type Statement interface {
+	isStatement()
+	Line() uint32
+}
+
+// ConcurrentAssignment represents `target <= value [when condition else alt_value];`
+type ConcurrentAssignment struct {
+	Target    string
+	Value     Expression
+	Condition Expression // optional, nil if not present
+	AltValue  Expression // optional, nil if not present
+	LineNum   uint32
+}
+
+func (c *ConcurrentAssignment) isStatement()   {}
+func (c *ConcurrentAssignment) Line() uint32 { return c.LineNum }
+
+// SelectedAssignment represents `with selector select target <= value when condition, ...;`
+type SelectedAssignment struct {
+	Selector Expression
+	Target   string
+	Choices  []Choice
+	LineNum  uint32
+}
+
+func (s *SelectedAssignment) isStatement()   {}
+func (s *SelectedAssignment) Line() uint32 { return s.LineNum }
+
+type Choice struct {
+	Value     Expression
+	Condition Expression // nil if "others"
+	IsOthers  bool
+}
+
+// GenerateStatement represents `for iterator in start to end generate ... end generate;`
+type GenerateStatement struct {
+	Label      string
+	Iterator   string
+	Start      int
+	End        int
+	Statements []Statement
+	LineNum    uint32
+}
+
+func (g *GenerateStatement) isStatement()   {}
+func (g *GenerateStatement) Line() uint32 { return g.LineNum }
+
+// SynchronousProcess represents the strictly clocked process.
+type SynchronousProcess struct {
+	Statements []SequentialStatement
+	LineNum    uint32
+}
+
+func (s *SynchronousProcess) isStatement()   {}
+func (s *SynchronousProcess) Line() uint32 { return s.LineNum }
+
+// SequentialStatement is the interface for statements inside a synchronous process.
+type SequentialStatement interface {
+	isSequentialStatement()
+	Line() uint32
+}
+
+// SequentialAssignment represents `target <= value;` inside a process.
+type SequentialAssignment struct {
+	Target  string
+	Value   Expression
+	LineNum uint32
+}
+
+func (s *SequentialAssignment) isSequentialStatement() {}
+func (s *SequentialAssignment) Line() uint32           { return s.LineNum }
+
+// SequentialIf represents an `if ... then ... elsif ... else ... end if;` inside a process.
+type SequentialIf struct {
+	Condition Expression
+	Then      []SequentialStatement
+	Elsifs    []Elsif
+	Else      []SequentialStatement // optional
+	LineNum   uint32
+}
+
+func (s *SequentialIf) isSequentialStatement() {}
+func (s *SequentialIf) Line() uint32           { return s.LineNum }
+
+type Elsif struct {
+	Condition Expression
+	Then      []SequentialStatement
+}
+
+// EntityInstantiation represents direct component instantiation.
+type EntityInstantiation struct {
+	Label      string
+	EntityName string
+	GenericMap []PortMapEntry
+	PortMap    []PortMapEntry
+	LineNum    uint32
+}
+
+func (e *EntityInstantiation) isStatement()   {}
+func (e *EntityInstantiation) Line() uint32 { return e.LineNum }
+
+// PslAssertion represents `psl assert always property;`
+type PslAssertion struct {
+	Property Expression
+	LineNum  uint32
+}
+
+func (p *PslAssertion) isStatement()   {}
+func (p *PslAssertion) Line() uint32 { return p.LineNum }
+
+type PortMapEntry struct {
+	Formal string
+	Actual Expression
+}
+
+// Expression is the interface for math/logic operations.
+type Expression interface {
+	isExpression()
+}
+
+type IdentifierExpr struct {
+	Name string
+}
+
+func (IdentifierExpr) isExpression() {}
+
+type LiteralExpr struct {
+	Value string
+}
+
+func (LiteralExpr) isExpression() {}
+
+type BinaryExpr struct {
+	Op    string
+	Left  Expression
+	Right Expression
+}
+
+func (BinaryExpr) isExpression() {}
+
+type UnaryExpr struct {
+	Op    string
+	Right Expression
+}
+
+func (UnaryExpr) isExpression() {}
+
+type ParenExpr struct {
+	Expr Expression
+}
+
+func (ParenExpr) isExpression() {}
+
+type FunctionCallExpr struct {
+	Name string
+	Args []Expression
+}
+
+func (FunctionCallExpr) isExpression() {}
+
+type IndexedNameExpr struct {
+	Prefix string
+	Index  Expression
+}
+
+func (IndexedNameExpr) isExpression() {}
+
+type SelectedNameExpr struct {
+	Prefix string
+	Suffix string
+}
+
+func (SelectedNameExpr) isExpression() {}
+
+type PslImplicationExpr struct {
+	Left  Expression
+	Right Expression
+}
+
+func (PslImplicationExpr) isExpression() {}
+
+type PslEventuallyExpr struct {
+	Left  Expression
+	Right Expression
+}
+
+func (PslEventuallyExpr) isExpression() {}
+
+type PslStableExpr struct {
+	Signal Expression
+}
+
+func (PslStableExpr) isExpression() {}
+
+
+================================================================================
+FILE: extractor.go
+================================================================================
+package main
+
+import (
+	"strconv"
+	"strings"
+
+	sitter "github.com/tree-sitter/go-tree-sitter"
+)
+
+type Extractor struct {
+	source []byte
+	module *Module
+}
+
+func NewExtractor(source []byte) *Extractor {
+	return &Extractor{source: source}
+}
+
+func (e *Extractor) text(n *sitter.Node) string {
+	if n == nil {
+		return ""
+	}
+	return string(e.source[n.StartByte():n.EndByte()])
+}
+
+func (e *Extractor) ExtractAll(root *sitter.Node) ([]*Module, error) {
+	var modules []*Module
+	
+	entities := make(map[string]*sitter.Node)
+	arches := make(map[string]*sitter.Node)
+
+	cursor := root.Walk()
+	if cursor.GotoFirstChild() {
+		for {
+			node := cursor.Node()
+			if node.Kind() == "entity_declaration" {
+				if nameNode := node.ChildByFieldName("name"); nameNode != nil {
+					entities[e.text(nameNode)] = node
+				}
+			} else if node.Kind() == "architecture_body" {
+				if entityNode := node.ChildByFieldName("entity"); entityNode != nil {
+					arches[e.text(entityNode)] = node
+				}
+			}
+			if !cursor.GotoNextSibling() {
+				break
+			}
+		}
+	}
+
+	for name, entityNode := range entities {
+		e.module = NewModule(name)
+		e.extractInterface(entityNode)
+		if archNode, ok := arches[name]; ok {
+			e.extractArchitecture(archNode)
+		}
+		modules = append(modules, e.module)
+	}
+
+	return modules, nil
+}
+
+func (e *Extractor) extractInterface(entityNode *sitter.Node) {
+	cursor := entityNode.Walk()
+	if cursor.GotoFirstChild() {
+		for {
+			node := cursor.Node()
+			if node.Kind() == "port_clause" {
+				pCursor := node.Walk()
+				if pCursor.GotoFirstChild() {
+					for {
+						pNode := pCursor.Node()
+						if pNode.Kind() == "port_declaration" {
+							e.extractPortDeclaration(pNode)
+						}
+						if !pCursor.GotoNextSibling() {
+							break
+						}
+					}
+				}
+			} else if node.Kind() == "generic_clause" {
+				gCursor := node.Walk()
+				if gCursor.GotoFirstChild() {
+					for {
+						gNode := gCursor.Node()
+						if gNode.Kind() == "generic_declaration" {
+							e.extractGenericDeclaration(gNode)
+						}
+						if !gCursor.GotoNextSibling() {
+							break
+						}
+					}
+				}
+			}
+			if !cursor.GotoNextSibling() {
+				break
+			}
+		}
+	}
+}
+
+func (e *Extractor) extractGenericDeclaration(node *sitter.Node) {
+	nameNode := node.ChildByFieldName("name")
+	defaultNode := node.ChildByFieldName("default")
+	
+	if nameNode != nil {
+		gen := &Generic{
+			Name: e.text(nameNode),
+		}
+		if defaultNode != nil {
+			gen.Default = e.text(defaultNode)
+		}
+		e.module.Generics = append(e.module.Generics, gen)
+		e.module.Symbols[gen.Name] = Type{Name: "integer", Width: 32} // Generics are 32-bit integers in our subset
+	}
+}
+
+func (e *Extractor) extractPortDeclaration(node *sitter.Node) {
+	namesNode := node.ChildByFieldName("names")
+	dirNode := node.ChildByFieldName("direction")
+
+	var typeNode *sitter.Node
+	for i := uint(0); i < node.ChildCount(); i++ {
+		if node.Child(i).Kind() == "type_mark" {
+			typeNode = node.Child(i)
+			break
+		}
+	}
+
+	direction := e.text(dirNode)
+	typ := e.extractType(typeNode)
+
+	if namesNode != nil {
+		cursor := namesNode.Walk()
+		if cursor.GotoFirstChild() {
+			for {
+				n := cursor.Node()
+				if n.Kind() == "identifier" {
+					name := e.text(n)
+					port := &Port{
+						Name:      name,
+						Direction: direction,
+						Type:      typ,
+					}
+					e.module.Ports = append(e.module.Ports, port)
+					e.module.Symbols[name] = typ
+				}
+				if !cursor.GotoNextSibling() {
+					break
+				}
+			}
+		}
+	}
+}
+
+func (e *Extractor) extractType(node *sitter.Node) Type {
+	if node == nil {
+		return Type{Name: "unknown", Width: 0}
+	}
+	text := e.text(node)
+	if text == "std_logic" {
+		return Type{Name: "std_logic", Width: 1}
+	} else if text == "integer" {
+		return Type{Name: "integer", Width: 32}
+	}
+
+	// Simple check for std_logic_vector
+	if strings.Contains(text, "downto") {
+		startIdx := strings.Index(text, "(")
+		downtoIdx := strings.Index(text, "downto")
+		endIdx := strings.Index(text, ")")
+		if startIdx != -1 && downtoIdx != -1 && endIdx != -1 {
+			base := strings.TrimSpace(text[:startIdx])
+			leftStr := strings.TrimSpace(text[startIdx+1 : downtoIdx])
+			rightStr := strings.TrimSpace(text[downtoIdx+6 : endIdx])
+
+			left, err1 := strconv.Atoi(leftStr)
+			right, err2 := strconv.Atoi(rightStr)
+			if err1 == nil && err2 == nil {
+				width := left - right + 1
+				return Type{Name: base, Width: width}
+			}
+		}
+	}
+
+	return Type{Name: text, Width: 0}
+}
+
+func (e *Extractor) extractArchitecture(archNode *sitter.Node) {
+	cursor := archNode.Walk()
+	if cursor.GotoFirstChild() {
+		for {
+			node := cursor.Node()
+			if node.Kind() == "type_declaration" {
+				e.extractTypeDeclaration(node)
+			} else if node.Kind() == "signal_declaration" {
+				e.extractSignalDeclaration(node)
+			} else if node.Kind() == "concurrent_assignment" {
+				e.module.Statements = append(e.module.Statements, e.extractConcurrentAssignment(node))
+			} else if node.Kind() == "selected_assignment" {
+				e.module.Statements = append(e.module.Statements, e.extractSelectedAssignment(node))
+			} else if node.Kind() == "synchronous_process" {
+				e.module.Statements = append(e.module.Statements, e.extractSynchronousProcess(node))
+			} else if node.Kind() == "entity_instantiation" {
+				e.module.Statements = append(e.module.Statements, e.extractEntityInstantiation(node))
+			} else if node.Kind() == "generate_statement" {
+				e.module.Statements = append(e.module.Statements, e.extractGenerateStatement(node))
+			} else if node.Kind() == "psl_assertion" {
+				e.module.Statements = append(e.module.Statements, e.extractPslAssertion(node))
+			}
+			if !cursor.GotoNextSibling() {
+				break
+			}
+		}
+	}
+}
+
+func (e *Extractor) extractTypeDeclaration(node *sitter.Node) {
+	nameNode := node.ChildByFieldName("name")
+	if nameNode == nil {
+		return
+	}
+	name := e.text(nameNode)
+
+	var t Type
+	t.Name = name
+
+	for i := uint(0); i < node.ChildCount(); i++ {
+		child := node.Child(i)
+		switch child.Kind() {
+		case "enum_type_definition":
+			t.Width = 32
+		case "array_type_definition":
+			t.IsArray = true
+			var bounds []int
+			for j := uint(0); j < child.ChildCount(); j++ {
+				if child.Child(j).Kind() == "number" {
+					if val, err := strconv.Atoi(e.text(child.Child(j))); err == nil {
+						bounds = append(bounds, val)
+					}
+				}
+			}
+			if len(bounds) >= 2 {
+				t.ArraySize = bounds[1] - bounds[0] + 1
+			}
+			
+			var elTypeNode *sitter.Node
+			for j := uint(0); j < child.ChildCount(); j++ {
+				if child.Child(j).Kind() == "type_mark" {
+					elTypeNode = child.Child(j)
+					break
+				}
+			}
+			if elTypeNode != nil {
+				elType := e.extractType(elTypeNode)
+				t.ElementType = &elType
+			}
+		case "record_type_definition":
+			t.IsRecord = true
+			cursor := child.Walk()
+			if cursor.GotoFirstChild() {
+				for {
+					n := cursor.Node()
+					if n.Kind() == "record_field" {
+						namesNode := n.ChildByFieldName("names")
+						
+						var fieldTypeNode *sitter.Node
+						for j := uint(0); j < n.ChildCount(); j++ {
+							if n.Child(j).Kind() == "type_mark" {
+								fieldTypeNode = n.Child(j)
+								break
+							}
+						}
+						
+						fType := e.extractType(fieldTypeNode)
+
+						if namesNode != nil {
+							nCursor := namesNode.Walk()
+							if nCursor.GotoFirstChild() {
+								for {
+									idNode := nCursor.Node()
+									if idNode.Kind() == "identifier" {
+										t.Fields = append(t.Fields, RecordField{
+											Name: e.text(idNode),
+											Type: fType,
+										})
+									}
+									if !nCursor.GotoNextSibling() {
+										break
+									}
+								}
+							}
+						}
+					}
+					if !cursor.GotoNextSibling() {
+						break
+					}
+				}
+			}
+		}
+	}
+
+	e.module.Symbols[name] = t
+}
+
+func (e *Extractor) extractSignalDeclaration(node *sitter.Node) {
+	namesNode := node.ChildByFieldName("names")
+	var typeNode *sitter.Node
+	for i := uint(0); i < node.ChildCount(); i++ {
+		if node.Child(i).Kind() == "type_mark" {
+			typeNode = node.Child(i)
+			break
+		}
+	}
+
+	typ := e.extractType(typeNode)
+
+	if namesNode != nil {
+		cursor := namesNode.Walk()
+		if cursor.GotoFirstChild() {
+			for {
+				n := cursor.Node()
+				if n.Kind() == "identifier" {
+					name := e.text(n)
+					sig := &Signal{
+						Name: name,
+						Type: typ,
+					}
+					e.module.Signals = append(e.module.Signals, sig)
+					e.module.Symbols[name] = typ
+				}
+				if !cursor.GotoNextSibling() {
+					break
+				}
+			}
+		}
+	}
+}
+
+func (e *Extractor) extractConcurrentAssignment(node *sitter.Node) *ConcurrentAssignment {
+	stmt := &ConcurrentAssignment{
+		LineNum: uint32(node.StartPosition().Row + 1),
+	}
+
+	if targetNode := node.ChildByFieldName("target"); targetNode != nil {
+		stmt.Target = e.text(targetNode)
+	}
+	if valueNode := node.ChildByFieldName("value"); valueNode != nil {
+		stmt.Value = e.extractExpression(valueNode)
+	}
+	if condNode := node.ChildByFieldName("condition"); condNode != nil {
+		stmt.Condition = e.extractExpression(condNode)
+	}
+	if altNode := node.ChildByFieldName("alt_value"); altNode != nil {
+		stmt.AltValue = e.extractExpression(altNode)
+	}
+
+	return stmt
+}
+
+func (e *Extractor) extractSelectedAssignment(node *sitter.Node) *SelectedAssignment {
+	stmt := &SelectedAssignment{
+		LineNum: uint32(node.StartPosition().Row + 1),
+	}
+
+	if selectorNode := node.ChildByFieldName("selector"); selectorNode != nil {
+		stmt.Selector = e.extractExpression(selectorNode)
+	}
+	if targetNode := node.ChildByFieldName("target"); targetNode != nil {
+		stmt.Target = e.text(targetNode)
+	}
+
+	var currentValue Expression
+	parsingValue := true
+
+	for i := uint(0); i < node.ChildCount(); i++ {
+		child := node.Child(i)
+		kind := child.Kind()
+		if kind == "with" || kind == "select" || kind == "when" || kind == "," || kind == "<=" || kind == ";" {
+			continue
+		}
+		
+		if node.FieldNameForChild(uint32(i)) == "selector" || node.FieldNameForChild(uint32(i)) == "target" {
+			continue
+		}
+
+		if parsingValue {
+			currentValue = e.extractExpression(child)
+			parsingValue = false
+		} else {
+			if kind == "others" {
+				stmt.Choices = append(stmt.Choices, Choice{
+					Value:    currentValue,
+					IsOthers: true,
+				})
+			} else {
+				stmt.Choices = append(stmt.Choices, Choice{
+					Value:     currentValue,
+					Condition: e.extractExpression(child),
+				})
+			}
+			parsingValue = true
+		}
+	}
+
+	return stmt
+}
+
+func (e *Extractor) extractSynchronousProcess(node *sitter.Node) *SynchronousProcess {
+	proc := &SynchronousProcess{
+		LineNum: uint32(node.StartPosition().Row + 1),
+	}
+
+	cursor := node.Walk()
+	if cursor.GotoFirstChild() {
+		for {
+			n := cursor.Node()
+			if n.Kind() == "sequential_assignment" {
+				proc.Statements = append(proc.Statements, e.extractSequentialAssignment(n))
+			} else if n.Kind() == "sequential_if" {
+				proc.Statements = append(proc.Statements, e.extractSequentialIf(n))
+			}
+			if !cursor.GotoNextSibling() {
+				break
+			}
+		}
+	}
+
+	return proc
+}
+
+func (e *Extractor) extractSequentialAssignment(node *sitter.Node) *SequentialAssignment {
+	stmt := &SequentialAssignment{
+		LineNum: uint32(node.StartPosition().Row + 1),
+	}
+	if targetNode := node.ChildByFieldName("target"); targetNode != nil {
+		stmt.Target = e.text(targetNode)
+	}
+	if valueNode := node.ChildByFieldName("value"); valueNode != nil {
+		stmt.Value = e.extractExpression(valueNode)
+	}
+	return stmt
+}
+
+func (e *Extractor) extractSequentialIf(node *sitter.Node) *SequentialIf {
+	stmt := &SequentialIf{
+		LineNum: uint32(node.StartPosition().Row + 1),
+	}
+
+	if condNode := node.ChildByFieldName("condition"); condNode != nil {
+		stmt.Condition = e.extractExpression(condNode)
+	}
+
+	cursor := node.Walk()
+	if cursor.GotoFirstChild() {
+		for {
+			n := cursor.Node()
+			switch n.Kind() {
+			case "sequential_assignment":
+				stmt.Then = append(stmt.Then, e.extractSequentialAssignment(n))
+			case "sequential_if":
+				stmt.Then = append(stmt.Then, e.extractSequentialIf(n))
+			case "elsif_clause":
+				stmt.Elsifs = append(stmt.Elsifs, e.extractElsif(n))
+			case "else_clause":
+				stmt.Else = e.extractElse(n)
+			}
+			if !cursor.GotoNextSibling() {
+				break
+			}
+		}
+	}
+	return stmt
+}
+
+func (e *Extractor) extractElsif(node *sitter.Node) Elsif {
+	elsif := Elsif{}
+	if condNode := node.ChildByFieldName("condition"); condNode != nil {
+		elsif.Condition = e.extractExpression(condNode)
+	}
+	cursor := node.Walk()
+	if cursor.GotoFirstChild() {
+		for {
+			n := cursor.Node()
+			switch n.Kind() {
+			case "sequential_assignment":
+				elsif.Then = append(elsif.Then, e.extractSequentialAssignment(n))
+			case "sequential_if":
+				elsif.Then = append(elsif.Then, e.extractSequentialIf(n))
+			}
+			if !cursor.GotoNextSibling() {
+				break
+			}
+		}
+	}
+	return elsif
+}
+
+func (e *Extractor) extractElse(node *sitter.Node) []SequentialStatement {
+	var stmts []SequentialStatement
+	cursor := node.Walk()
+	if cursor.GotoFirstChild() {
+		for {
+			n := cursor.Node()
+			switch n.Kind() {
+			case "sequential_assignment":
+				stmts = append(stmts, e.extractSequentialAssignment(n))
+			case "sequential_if":
+				stmts = append(stmts, e.extractSequentialIf(n))
+			}
+			if !cursor.GotoNextSibling() {
+				break
+			}
+		}
+	}
+	return stmts
+}
+
+func (e *Extractor) extractGenerateStatement(node *sitter.Node) *GenerateStatement {
+	stmt := &GenerateStatement{
+		LineNum: uint32(node.StartPosition().Row + 1),
+	}
+
+	if labelNode := node.ChildByFieldName("label"); labelNode != nil {
+		stmt.Label = e.text(labelNode)
+	}
+	if iterNode := node.ChildByFieldName("iterator"); iterNode != nil {
+		stmt.Iterator = e.text(iterNode)
+	}
+	if startNode := node.ChildByFieldName("start"); startNode != nil {
+		if start, err := strconv.Atoi(e.text(startNode)); err == nil {
+			stmt.Start = start
+		}
+	}
+	if endNode := node.ChildByFieldName("end"); endNode != nil {
+		if end, err := strconv.Atoi(e.text(endNode)); err == nil {
+			stmt.End = end
+		}
+	}
+
+	cursor := node.Walk()
+	if cursor.GotoFirstChild() {
+		for {
+			n := cursor.Node()
+			if n.Kind() == "concurrent_assignment" {
+				stmt.Statements = append(stmt.Statements, e.extractConcurrentAssignment(n))
+			} else if n.Kind() == "selected_assignment" {
+				stmt.Statements = append(stmt.Statements, e.extractSelectedAssignment(n))
+			} else if n.Kind() == "synchronous_process" {
+				stmt.Statements = append(stmt.Statements, e.extractSynchronousProcess(n))
+			} else if n.Kind() == "entity_instantiation" {
+				stmt.Statements = append(stmt.Statements, e.extractEntityInstantiation(n))
+			} else if n.Kind() == "generate_statement" {
+				stmt.Statements = append(stmt.Statements, e.extractGenerateStatement(n))
+			}
+			if !cursor.GotoNextSibling() {
+				break
+			}
+		}
+	}
+
+	return stmt
+}
+
+func (e *Extractor) extractPslAssertion(node *sitter.Node) *PslAssertion {
+	stmt := &PslAssertion{
+		LineNum: uint32(node.StartPosition().Row + 1),
+	}
+
+	if propNode := node.ChildByFieldName("property"); propNode != nil {
+		stmt.Property = e.extractExpression(propNode)
+	}
+
+	return stmt
+}
+
+func (e *Extractor) extractEntityInstantiation(node *sitter.Node) *EntityInstantiation {
+	stmt := &EntityInstantiation{
+		LineNum: uint32(node.StartPosition().Row + 1),
+	}
+	if labelNode := node.ChildByFieldName("label"); labelNode != nil {
+		stmt.Label = e.text(labelNode)
+	}
+	if nameNode := node.ChildByFieldName("entity_name"); nameNode != nil {
+		stmt.EntityName = e.text(nameNode)
+	}
+	if genericMapNode := node.ChildByFieldName("generic_map"); genericMapNode != nil {
+		cursor := genericMapNode.Walk()
+		if cursor.GotoFirstChild() {
+			for {
+				n := cursor.Node()
+				if n.Kind() == "association_element" {
+					if formalNode := n.ChildByFieldName("formal"); formalNode != nil {
+						if actualNode := n.ChildByFieldName("actual"); actualNode != nil {
+							stmt.GenericMap = append(stmt.GenericMap, PortMapEntry{
+								Formal: e.text(formalNode),
+								Actual: e.extractExpression(actualNode),
+							})
+						}
+					}
+				}
+				if !cursor.GotoNextSibling() {
+					break
+				}
+			}
+		}
+	}
+	if portMapNode := node.ChildByFieldName("port_map"); portMapNode != nil {
+		cursor := portMapNode.Walk()
+		if cursor.GotoFirstChild() {
+			for {
+				n := cursor.Node()
+				if n.Kind() == "association_element" {
+					if formalNode := n.ChildByFieldName("formal"); formalNode != nil {
+						if actualNode := n.ChildByFieldName("actual"); actualNode != nil {
+							stmt.PortMap = append(stmt.PortMap, PortMapEntry{
+								Formal: e.text(formalNode),
+								Actual: e.extractExpression(actualNode),
+							})
+						}
+					}
+				}
+				if !cursor.GotoNextSibling() {
+					break
+				}
+			}
+		}
+	}
+	return stmt
+}
+
+func (e *Extractor) extractExpression(node *sitter.Node) Expression {
+	if node == nil {
+		return nil
+	}
+	kind := node.Kind()
+	switch kind {
+	case "identifier":
+		return IdentifierExpr{Name: e.text(node)}
+	case "number", "string_literal", "char_literal":
+		return LiteralExpr{Value: e.text(node)}
+	case "indexed_name":
+		return IndexedNameExpr{
+			Prefix: e.text(node.ChildByFieldName("prefix")),
+			Index:  e.extractExpression(node.ChildByFieldName("index")),
+		}
+	case "selected_name":
+		return SelectedNameExpr{
+			Prefix: e.text(node.ChildByFieldName("prefix")),
+			Suffix: e.text(node.ChildByFieldName("suffix")),
+		}
+	case "binary_expression":
+		return BinaryExpr{
+			Op:    strings.TrimSpace(e.text(node.ChildByFieldName("operator"))),
+			Left:  e.extractExpression(node.ChildByFieldName("left")),
+			Right: e.extractExpression(node.ChildByFieldName("right")),
+		}
+	case "unary_expression":
+		return UnaryExpr{
+			Op:    strings.TrimSpace(e.text(node.ChildByFieldName("operator"))),
+			Right: e.extractExpression(node.ChildByFieldName("argument")),
+		}
+	case "psl_implication":
+		return PslImplicationExpr{
+			Left:  e.extractExpression(node.ChildByFieldName("left")),
+			Right: e.extractExpression(node.ChildByFieldName("right")),
+		}
+	case "psl_eventually":
+		return PslEventuallyExpr{
+			Left:  e.extractExpression(node.ChildByFieldName("left")),
+			Right: e.extractExpression(node.ChildByFieldName("right")),
+		}
+	case "psl_stable":
+		return PslStableExpr{
+			Signal: e.extractExpression(node.ChildByFieldName("signal")),
+		}
+	}
+
+	return LiteralExpr{Value: e.text(node)}
+}
+
+
+================================================================================
+FILE: semantics.go
+================================================================================
+package main
+
+import "fmt"
+
+type SemanticChecker struct {
+	modules []*Module
+	errors  []string
+}
+
+func NewSemanticChecker(mods []*Module) *SemanticChecker {
+	return &SemanticChecker{
+		modules: mods,
+		errors:  make([]string, 0),
+	}
+}
+
+func (c *SemanticChecker) Check() []string {
+	for _, mod := range c.modules {
+		c.checkUndeclaredWires(mod)
+		c.checkInputImmutability(mod)
+		c.checkMultiDrivenWires(mod)
+	}
+	return c.errors
+}
+
+func (c *SemanticChecker) errorf(line uint32, format string, args ...interface{}) {
+	msg := fmt.Sprintf("Line %d: Semantic Error - %s", line, fmt.Sprintf(format, args...))
+	c.errors = append(c.errors, msg)
+}
+
+func (c *SemanticChecker) checkUndeclaredWires(mod *Module) {
+	var walk func(stmts []Statement)
+	walk = func(stmts []Statement) {
+		for _, stmt := range stmts {
+			switch s := stmt.(type) {
+			case *ConcurrentAssignment:
+				if _, ok := mod.Symbols[s.Target]; !ok {
+					c.errorf(s.Line(), "Undeclared wire '%s' in concurrent assignment", s.Target)
+				}
+			case *SelectedAssignment:
+				if _, ok := mod.Symbols[s.Target]; !ok {
+					c.errorf(s.Line(), "Undeclared wire '%s' in selected assignment", s.Target)
+				}
+			case *SynchronousProcess:
+				for _, sq := range s.Statements {
+					c.walkSequentialStmtForUndeclared(sq, mod)
+				}
+			case *GenerateStatement:
+				walk(s.Statements)
+			}
+		}
+	}
+	walk(mod.Statements)
+}
+
+func (c *SemanticChecker) walkSequentialStmtForUndeclared(stmt SequentialStatement, mod *Module) {
+	switch sa := stmt.(type) {
+	case *SequentialAssignment:
+		if _, ok := mod.Symbols[sa.Target]; !ok {
+			c.errorf(sa.Line(), "Undeclared wire '%s' in sequential assignment", sa.Target)
+		}
+	case *SequentialIf:
+		for _, s := range sa.Then {
+			c.walkSequentialStmtForUndeclared(s, mod)
+		}
+		for _, e := range sa.Elsifs {
+			for _, s := range e.Then {
+				c.walkSequentialStmtForUndeclared(s, mod)
+			}
+		}
+		for _, s := range sa.Else {
+			c.walkSequentialStmtForUndeclared(s, mod)
+		}
+	}
+}
+
+func (c *SemanticChecker) checkInputImmutability(mod *Module) {
+	inputs := make(map[string]bool)
+	for _, p := range mod.Ports {
+		if p.Direction == "in" {
+			inputs[p.Name] = true
+		}
+	}
+
+	var walk func(stmts []Statement)
+	walk = func(stmts []Statement) {
+		for _, stmt := range stmts {
+			switch s := stmt.(type) {
+			case *ConcurrentAssignment:
+				if inputs[s.Target] {
+					c.errorf(s.Line(), "Cannot route value into input port '%s'", s.Target)
+				}
+			case *SelectedAssignment:
+				if inputs[s.Target] {
+					c.errorf(s.Line(), "Cannot route value into input port '%s'", s.Target)
+				}
+			case *SynchronousProcess:
+				for _, sq := range s.Statements {
+					c.walkSequentialStmtForInput(sq, inputs)
+				}
+			case *GenerateStatement:
+				walk(s.Statements)
+			}
+		}
+	}
+	walk(mod.Statements)
+}
+
+func (c *SemanticChecker) walkSequentialStmtForInput(stmt SequentialStatement, inputs map[string]bool) {
+	switch sa := stmt.(type) {
+	case *SequentialAssignment:
+		if inputs[sa.Target] {
+			c.errorf(sa.Line(), "Cannot route value into input port '%s'", sa.Target)
+		}
+	case *SequentialIf:
+		for _, s := range sa.Then {
+			c.walkSequentialStmtForInput(s, inputs)
+		}
+		for _, e := range sa.Elsifs {
+			for _, s := range e.Then {
+				c.walkSequentialStmtForInput(s, inputs)
+			}
+		}
+		for _, s := range sa.Else {
+			c.walkSequentialStmtForInput(s, inputs)
+		}
+	}
+}
+
+func (c *SemanticChecker) checkMultiDrivenWires(mod *Module) {
+	driven := make(map[string]uint32)
+
+	var walk func(stmts []Statement)
+	walk = func(stmts []Statement) {
+		for _, stmt := range stmts {
+			switch s := stmt.(type) {
+			case *ConcurrentAssignment:
+				if line, ok := driven[s.Target]; ok {
+					c.errorf(s.Line(), "Wire '%s' is driven multiple times (previously driven at line %d)", s.Target, line)
+				} else {
+					driven[s.Target] = s.LineNum
+				}
+			case *SelectedAssignment:
+				if line, ok := driven[s.Target]; ok {
+					c.errorf(s.Line(), "Wire '%s' is driven multiple times (previously driven at line %d)", s.Target, line)
+				} else {
+					driven[s.Target] = s.LineNum
+				}
+			case *SynchronousProcess:
+				procDriven := make(map[string]bool)
+				c.walkSequentialStmtForDriven(s.Statements, procDriven)
+				
+				for target := range procDriven {
+					if line, ok := driven[target]; ok {
+						c.errorf(s.Line(), "Wire '%s' is driven multiple times (previously driven at line %d)", target, line)
+					} else {
+						driven[target] = s.LineNum
+					}
+				}
+			case *GenerateStatement:
+				// Note: Currently tracking multi-driven wires statically.
+				// Arrays/indexed targets will need dynamic loop evaluation in the future.
+				walk(s.Statements)
+			}
+		}
+	}
+	walk(mod.Statements)
+}
+
+func (c *SemanticChecker) walkSequentialStmtForDriven(stmts []SequentialStatement, procDriven map[string]bool) {
+	for _, stmt := range stmts {
+		switch sa := stmt.(type) {
+		case *SequentialAssignment:
+			procDriven[sa.Target] = true
+		case *SequentialIf:
+			c.walkSequentialStmtForDriven(sa.Then, procDriven)
+			for _, e := range sa.Elsifs {
+				c.walkSequentialStmtForDriven(e.Then, procDriven)
+			}
+			c.walkSequentialStmtForDriven(sa.Else, procDriven)
+		}
+	}
+}
+
+
+
+================================================================================
+FILE: mlir.go
+================================================================================
+package main
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+)
+
+// MLIREmitter handles translating populated Wires, Statements, and Modules into CIRCT HW/Comb MLIR text.
+type MLIREmitter struct {
+	builder strings.Builder
+	indent  int
+	ssaID   int
+	modules map[string]*Module
+}
+
+func NewMLIREmitter() *MLIREmitter {
+	return &MLIREmitter{
+		modules: make(map[string]*Module),
+	}
+}
+
+func (e *MLIREmitter) p(format string, args ...interface{}) {
+	for i := 0; i < e.indent; i++ {
+		e.builder.WriteString("  ")
+	}
+	e.builder.WriteString(fmt.Sprintf(format, args...))
+	e.builder.WriteString("\n")
+}
+
+func (e *MLIREmitter) String() string {
+	return e.builder.String()
+}
+
+func (e *MLIREmitter) nextSSA() string {
+	val := fmt.Sprintf("%%%d", e.ssaID)
+	e.ssaID++
+	return val
+}
+
+// typeToMLIR translates the extracted Type to its MLIR equivalent (e.g., std_logic -> i1, array -> !hw.array<size x type>)
+func typeToMLIR(t Type, mod *Module) string {
+	if !t.IsArray && !t.IsRecord && t.Width == 0 && t.Name != "std_logic" && t.Name != "unknown" {
+		t = resolveType(mod, t.Name)
+	}
+
+	if t.IsArray && t.ElementType != nil {
+		elType := typeToMLIR(*t.ElementType, mod)
+		return fmt.Sprintf("!hw.array<%dx%s>", t.ArraySize, elType)
+	}
+	if t.IsRecord {
+		var fields []string
+		for _, f := range t.Fields {
+			fields = append(fields, fmt.Sprintf("%s: %s", f.Name, typeToMLIR(f.Type, mod)))
+		}
+		return fmt.Sprintf("!hw.struct<%s>", strings.Join(fields, ", "))
+	}
+	if t.Width == 0 {
+		return "i1" // Fallback
+	}
+	return fmt.Sprintf("i%d", t.Width)
+}
+
+func resolveType(mod *Module, typeName string) Type {
+	t, ok := mod.Symbols[typeName]
+	if ok && (t.IsArray || t.IsRecord) {
+		return t
+	}
+	return t
+}
+
+func (e *MLIREmitter) emitExpression(expr Expression, mod *Module, env map[string]string, targetName string, expectedType string) (string, string) {
+	var resVal string
+	if targetName != "" {
+		resVal = fmt.Sprintf("%%%s", targetName)
+	} else {
+		resVal = e.nextSSA()
+	}
+
+	switch v := expr.(type) {
+	case IdentifierExpr:
+		t := mod.Symbols[v.Name]
+		if mapped, ok := env[v.Name]; ok {
+			return mapped, typeToMLIR(t, mod)
+		}
+		return fmt.Sprintf("%%%s", v.Name), typeToMLIR(t, mod)
+	case IndexedNameExpr:
+		prefixVal, prefixType := e.emitExpression(IdentifierExpr{Name: v.Prefix}, mod, env, "", "")
+		indexVal, _ := e.emitExpression(v.Index, mod, env, "", "i32")
+		
+		t := resolveType(mod, mod.Symbols[v.Prefix].Name)
+		var elType string
+		if t.ElementType != nil {
+			elType = typeToMLIR(*t.ElementType, mod)
+		} else {
+			elType = "i1" // Fallback
+		}
+		
+		e.p("%s = hw.array_get %s[%s] : %s, i32", resVal, prefixVal, indexVal, prefixType)
+		return resVal, elType
+	case SelectedNameExpr:
+		prefixVal, prefixType := e.emitExpression(IdentifierExpr{Name: v.Prefix}, mod, env, "", "")
+		
+		t := resolveType(mod, mod.Symbols[v.Prefix].Name)
+		var elType string
+		for _, f := range t.Fields {
+			if f.Name == v.Suffix {
+				elType = typeToMLIR(f.Type, mod)
+				break
+			}
+		}
+		if elType == "" {
+			elType = "i1" // Fallback
+		}
+		
+		e.p("%s = hw.struct_extract %s[\"%s\"] : %s", resVal, prefixVal, v.Suffix, prefixType)
+		return resVal, elType
+	case LiteralExpr:
+		t := "i1"
+		if expectedType != "" {
+			t = expectedType
+		}
+		if strings.HasPrefix(v.Value, "'") {
+			bit := strings.Trim(v.Value, "'")
+			e.p("%s = hw.constant %s : %s", resVal, bit, t)
+		} else if strings.HasPrefix(v.Value, "\"") {
+			str := strings.Trim(v.Value, "\"")
+			t = fmt.Sprintf("i%d", len(str))
+			valInt, _ := strconv.ParseInt(str, 2, 64)
+			e.p("%s = hw.constant %d : %s", resVal, valInt, t)
+		} else if strings.HasPrefix(strings.ToLower(v.Value), "x\"") {
+			str := strings.Trim(v.Value[2:], "\"")
+			t = fmt.Sprintf("i%d", len(str)*4)
+			valInt, _ := strconv.ParseInt(str, 16, 64)
+			e.p("%s = hw.constant %d : %s", resVal, valInt, t)
+		} else {
+			e.p("%s = hw.constant %s : %s", resVal, v.Value, t)
+		}
+		return resVal, t
+	case BinaryExpr:
+		// Attempt to peek left and right types
+		var inferredType string
+		if id, ok := v.Left.(IdentifierExpr); ok {
+			inferredType = typeToMLIR(mod.Symbols[id.Name], mod)
+		} else if id, ok := v.Right.(IdentifierExpr); ok {
+			inferredType = typeToMLIR(mod.Symbols[id.Name], mod)
+		}
+
+		leftVal, leftType := e.emitExpression(v.Left, mod, env, "", inferredType)
+		rightVal, rightType := e.emitExpression(v.Right, mod, env, "", inferredType)
+		
+		// Unify types
+		finalType := leftType
+		if leftType == "i1" && rightType != "i1" {
+			finalType = rightType
+		}
+
+		opMap := map[string]string{
+			"and": "comb.and",
+			"or":  "comb.or",
+			"xor": "comb.xor",
+			"+":   "comb.add",
+			"-":   "comb.sub",
+			"*":   "comb.mul",
+		}
+
+		if mlirOp, ok := opMap[v.Op]; ok {
+			e.p("%s = %s %s, %s : %s", resVal, mlirOp, leftVal, rightVal, finalType)
+			return resVal, finalType
+		} else if v.Op == "=" {
+			e.p("%s = comb.icmp eq %s, %s : %s", resVal, leftVal, rightVal, finalType)
+			return resVal, "i1"
+		} else if v.Op == "/=" {
+			e.p("%s = comb.icmp ne %s, %s : %s", resVal, leftVal, rightVal, finalType)
+			return resVal, "i1"
+		}
+		return resVal, finalType
+	case UnaryExpr:
+		if v.Op == "not" {
+			rightVal, rightType := e.emitExpression(v.Right, mod, env, "", expectedType)
+			trueVal := e.nextSSA()
+			e.p("%s = hw.constant -1 : %s", trueVal, rightType)
+			e.p("%s = comb.xor %s, %s : %s", resVal, rightVal, trueVal, rightType)
+			return resVal, rightType
+		}
+	case PslImplicationExpr:
+		leftVal, _ := e.emitExpression(v.Left, mod, env, "", "i1")
+		rightVal, _ := e.emitExpression(v.Right, mod, env, "", "i1")
+		e.p("%s = ltl.implication %s, %s : i1, i1", resVal, leftVal, rightVal)
+		return resVal, "!ltl.property"
+	case PslEventuallyExpr:
+		leftVal, _ := e.emitExpression(v.Left, mod, env, "", "i1")
+		rightVal, _ := e.emitExpression(v.Right, mod, env, "", "i1")
+		
+		eventuallyVal := e.nextSSA()
+		e.p("%s = ltl.eventually %s : i1", eventuallyVal, rightVal)
+		e.p("%s = ltl.implication %s, %s : i1, !ltl.property", resVal, leftVal, eventuallyVal)
+		return resVal, "!ltl.property"
+	case PslStableExpr:
+		// Not natively in LTL currently, mock it with i1 for demonstration
+		sigVal, _ := e.emitExpression(v.Signal, mod, env, "", "")
+		e.p("%s = comb.icmp eq %s, %s : i1", resVal, sigVal, sigVal)
+		return resVal, "i1"
+	}
+	return e.nextSSA(), "i1"
+}
+
+
+
+// EmitModule translates the Module into a hw.module definition
+func (e *MLIREmitter) emitSynchronousProcess(sp *SynchronousProcess, mod *Module, globalEnv map[string]string) {
+	// Identify all registers assigned in this process.
+	targets := make(map[string]bool)
+	var walk func(stmt SequentialStatement)
+	walk = func(stmt SequentialStatement) {
+		switch s := stmt.(type) {
+		case *SequentialAssignment:
+			targets[s.Target] = true
+		case *SequentialIf:
+			for _, st := range s.Then { walk(st) }
+			for _, el := range s.Elsifs {
+				for _, st := range el.Then { walk(st) }
+			}
+			for _, st := range s.Else { walk(st) }
+		}
+	}
+	for _, stmt := range sp.Statements { walk(stmt) }
+
+	for target := range targets {
+		localEnv := make(map[string]string)
+		for k, v := range globalEnv { localEnv[k] = v }
+		
+		currentStateVal := fmt.Sprintf("%%%s", target)
+		nextStateVal := e.buildSeqBlock(sp.Statements, target, currentStateVal, mod, localEnv)
+		
+		t := mod.Symbols[target]
+		clkVal := e.nextSSA()
+		e.p("%s = seq.to_clock %%clk", clkVal)
+		e.p("%%%s = seq.compreg %s, %s : %s", target, nextStateVal, clkVal, typeToMLIR(t, mod))
+		globalEnv[target] = fmt.Sprintf("%%%s", target)
+	}
+}
+
+func (e *MLIREmitter) buildSeqBlock(stmts []SequentialStatement, target string, currentNextState string, mod *Module, env map[string]string) string {
+	nextState := currentNextState
+	targetType := typeToMLIR(mod.Symbols[target], mod)
+	for _, stmt := range stmts {
+		switch s := stmt.(type) {
+		case *SequentialAssignment:
+			if s.Target == target {
+				val, _ := e.emitExpression(s.Value, mod, env, "", targetType)
+				nextState = val
+			}
+		case *SequentialIf:
+			condVal, _ := e.emitExpression(s.Condition, mod, env, "", "i1")
+			
+			thenState := e.buildSeqBlock(s.Then, target, nextState, mod, env)
+			elseState := e.buildSeqBlock(s.Else, target, nextState, mod, env)
+			
+			for i := len(s.Elsifs) - 1; i >= 0; i-- {
+				el := s.Elsifs[i]
+				elCondVal, _ := e.emitExpression(el.Condition, mod, env, "", "i1")
+				elThenState := e.buildSeqBlock(el.Then, target, nextState, mod, env)
+				if elThenState != elseState {
+					res := e.nextSSA()
+					e.p("%s = comb.mux %s, %s, %s : %s", res, elCondVal, elThenState, elseState, targetType)
+					elseState = res
+				}
+			}
+			
+			if thenState != elseState {
+				res := e.nextSSA()
+				e.p("%s = comb.mux %s, %s, %s : %s", res, condVal, thenState, elseState, targetType)
+				nextState = res
+			}
+		}
+	}
+	return nextState
+}
+
+func (e *MLIREmitter) emitEntityInstantiation(inst *EntityInstantiation, parentMod *Module, env map[string]string) {
+	childMod, ok := e.modules[inst.EntityName]
+	if !ok {
+		e.p("// ERROR: Could not find module %s", inst.EntityName)
+		return
+	}
+
+	var inputs []string
+	var outputs []string
+	var outSigs []string
+	var outTypes []string
+
+	var instGenerics []string
+	for _, gen := range childMod.Generics {
+		// Default value
+		val := gen.Default
+		if val == "" {
+			val = "0"
+		}
+		
+		// See if it's provided in GenericMap
+		for _, entry := range inst.GenericMap {
+			if entry.Formal == gen.Name {
+				// We expect a literal or expression. For now, assume literal or simple identifier
+				if lit, ok := entry.Actual.(LiteralExpr); ok {
+					val = lit.Value
+				}
+				break
+			}
+		}
+		instGenerics = append(instGenerics, fmt.Sprintf("%s: i32 = %s", gen.Name, val))
+	}
+	
+	genStr := ""
+	if len(instGenerics) > 0 {
+		genStr = fmt.Sprintf("<%s>", strings.Join(instGenerics, ", "))
+	}
+
+	// We need to match the formal ports to the actual arguments based on childMod definition
+	for _, port := range childMod.Ports {
+		t := typeToMLIR(port.Type, childMod)
+		var actualExpr Expression
+		for _, entry := range inst.PortMap {
+			if entry.Formal == port.Name {
+				actualExpr = entry.Actual
+				break
+			}
+		}
+
+		if port.Direction == "in" {
+			if actualExpr != nil {
+				val, _ := e.emitExpression(actualExpr, parentMod, env, "", "")
+				inputs = append(inputs, fmt.Sprintf("%s: %s: %s", port.Name, val, t))
+			} else {
+				inputs = append(inputs, fmt.Sprintf("%s: %%missing: %s", port.Name, t))
+			}
+		} else if port.Direction == "out" {
+			if actualExpr != nil {
+				// We expect actual to be an IdentifierExpr for output routing
+				if idExpr, isId := actualExpr.(IdentifierExpr); isId {
+					val := fmt.Sprintf("%%%s", idExpr.Name)
+					outputs = append(outputs, fmt.Sprintf("%s: %s", port.Name, t))
+					outSigs = append(outSigs, val)
+					outTypes = append(outTypes, t)
+					// Update the environment to reflect that this signal is driven by the instance
+					env[idExpr.Name] = val
+				}
+			} else {
+				val := e.nextSSA()
+				outputs = append(outputs, fmt.Sprintf("%s: %s", port.Name, t))
+				outSigs = append(outSigs, val)
+				outTypes = append(outTypes, t)
+			}
+		}
+	}
+
+	inStr := strings.Join(inputs, ", ")
+	outStr := strings.Join(outputs, ", ")
+	outAssigns := strings.Join(outSigs, ", ")
+
+	if len(outSigs) > 0 {
+		e.p("%s = hw.instance \"%s\" @%s%s(%s) -> (%s)", outAssigns, inst.Label, inst.EntityName, genStr, inStr, outStr)
+	} else {
+		e.p("hw.instance \"%s\" @%s%s(%s) -> ()", inst.Label, inst.EntityName, genStr, inStr)
+	}
+}
+
+// EmitModules translates multiple Modules
+func (e *MLIREmitter) EmitModules(mods []*Module) {
+	for _, mod := range mods {
+		e.modules[mod.Name] = mod
+	}
+	for _, mod := range mods {
+		e.EmitModule(mod)
+		e.p("")
+	}
+}
+
+// EmitModule translates the Module into a hw.module definition
+func (e *MLIREmitter) EmitModule(mod *Module) {
+	// Construct signature
+	var ports []string
+	var outputs []string
+	for _, p := range mod.Ports {
+		t := typeToMLIR(p.Type, mod)
+		if p.Direction == "in" {
+			ports = append(ports, fmt.Sprintf("in %%%s: %s", p.Name, t))
+		} else {
+			ports = append(ports, fmt.Sprintf("out %s: %s", p.Name, t))
+			outputs = append(outputs, p.Name) // Track just the name for output length check
+		}
+	}
+
+	sigPorts := strings.Join(ports, ", ")
+
+	var generics []string
+	for _, gen := range mod.Generics {
+		// All generics in Micro-VHDL are 32-bit integers
+		def := gen.Default
+		if def == "" {
+			def = "0"
+		}
+		generics = append(generics, fmt.Sprintf("%s: i32 = %s", gen.Name, def))
+	}
+	
+	genStr := ""
+	if len(generics) > 0 {
+		genStr = fmt.Sprintf("<%s>", strings.Join(generics, ", "))
+	}
+
+	e.p("hw.module @%s%s(%s) {", mod.Name, genStr, sigPorts)
+	e.indent++
+
+	e.p("// --- Body ---")
+
+	// Create a map to track which SSA value drives which signal/port
+	env := make(map[string]string)
+	for _, p := range mod.Ports {
+		if p.Direction == "in" {
+			env[p.Name] = fmt.Sprintf("%%%s", p.Name)
+		}
+	}
+	// Pre-populate environment with signal names to handle forward references
+	for _, sig := range mod.Signals {
+		env[sig.Name] = fmt.Sprintf("%%%s", sig.Name)
+	}
+
+	e.emitStatementList(mod.Statements, mod, env)
+
+	// Emit hw.output using the tracked drivers
+	var outVals []string
+	var outTypes []string
+	if len(outputs) > 0 {
+		for i, p := range mod.Ports {
+			if p.Direction == "out" {
+				t := typeToMLIR(p.Type, mod)
+				if valName, ok := env[p.Name]; ok {
+					outVals = append(outVals, valName)
+				} else {
+					// Fallback if undriven
+					valName := fmt.Sprintf("%%c0_%d", i)
+					e.p("%s = hw.constant 0 : %s", valName, t)
+					outVals = append(outVals, valName)
+				}
+				outTypes = append(outTypes, t)
+			}
+		}
+		e.p("hw.output %s : %s", strings.Join(outVals, ", "), strings.Join(outTypes, ", "))
+	} else {
+		e.p("hw.output")
+	}
+
+	e.indent--
+	e.p("}")
+}
+
+func (e *MLIREmitter) emitStatementList(stmts []Statement, mod *Module, env map[string]string) {
+	for _, stmt := range stmts {
+		switch s := stmt.(type) {
+		case *EntityInstantiation:
+			e.emitEntityInstantiation(s, mod, env)
+		case *ConcurrentAssignment:
+			if s.Condition != nil {
+				t := typeToMLIR(mod.Symbols[s.Target], mod)
+				val, _ := e.emitExpression(s.Value, mod, env, "", t)
+				condVal, _ := e.emitExpression(s.Condition, mod, env, "", "i1")
+				altVal, _ := e.emitExpression(s.AltValue, mod, env, "", t)
+				e.p("%%%s = comb.mux %s, %s, %s : %s", s.Target, condVal, val, altVal, t)
+				env[s.Target] = fmt.Sprintf("%%%s", s.Target)
+			} else {
+				t := typeToMLIR(mod.Symbols[s.Target], mod)
+				val, _ := e.emitExpression(s.Value, mod, env, s.Target, t)
+				env[s.Target] = val
+			}
+		case *SelectedAssignment:
+			selVal, selType := e.emitExpression(s.Selector, mod, env, "", "")
+			t := typeToMLIR(mod.Symbols[s.Target], mod)
+
+			var currentState string
+			for _, choice := range s.Choices {
+				if choice.IsOthers {
+					currentState, _ = e.emitExpression(choice.Value, mod, env, "", t)
+					break
+				}
+			}
+			if currentState == "" {
+				zeroVal := e.nextSSA()
+				e.p("%s = hw.constant 0 : %s", zeroVal, t)
+				currentState = zeroVal
+			}
+
+			for i := len(s.Choices) - 1; i >= 0; i-- {
+				choice := s.Choices[i]
+				if choice.IsOthers {
+					continue
+				}
+				condExprVal, _ := e.emitExpression(choice.Condition, mod, env, "", selType)
+				
+				cmpVal := e.nextSSA()
+				e.p("%s = comb.icmp eq %s, %s : %s", cmpVal, selVal, condExprVal, selType)
+				
+				val, _ := e.emitExpression(choice.Value, mod, env, "", t)
+				
+				resName := e.nextSSA()[1:] // drop the %
+				if i == 0 {
+					resName = s.Target
+				}
+				e.p("%%%s = comb.mux %s, %s, %s : %s", resName, cmpVal, val, currentState, t)
+				currentState = fmt.Sprintf("%%%s", resName)
+			}
+			env[s.Target] = currentState
+		case *SynchronousProcess:
+			e.emitSynchronousProcess(s, mod, env)
+		case *GenerateStatement:
+			for i := s.Start; i <= s.End; i++ {
+				// Clone env to isolate loop iterator
+				loopEnv := make(map[string]string)
+				for k, v := range env {
+					loopEnv[k] = v
+				}
+				
+				iterVal := e.nextSSA()
+				e.p("%s = hw.constant %d : i32", iterVal, i)
+				loopEnv[s.Iterator] = iterVal
+				
+				e.emitStatementList(s.Statements, mod, loopEnv)
+				
+				for k, v := range loopEnv {
+					if k != s.Iterator {
+						env[k] = v
+					}
+				}
+			}
+		case *PslAssertion:
+			propVal, propType := e.emitExpression(s.Property, mod, env, "", "")
+			if propType == "i1" || propType == "!ltl.property" || propType == "!ltl.sequence" {
+				e.p("verif.assert %s : %s", propVal, propType)
+			} else {
+				e.p("verif.assert %s : %s", propVal, propType)
+			}
+		}
+	}
+}
+
+================================================================================
+FILE: main.go
+================================================================================
+package main
+
+import (
+	"fmt"
+	"os"
+
+	sitter "github.com/tree-sitter/go-tree-sitter"
+	micro_vhdl "micro-vhdl/tree-sitter-micro-vhdl/bindings/go"
+)
+
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Println("Usage: main <file.vhd>")
+		os.Exit(1)
+	}
+	content, err := os.ReadFile(os.Args[1])
+	if err != nil {
+		fmt.Printf("Error reading file: %v\n", err)
+		os.Exit(1)
+	}
+
+	lang := sitter.NewLanguage(micro_vhdl.Language())
+	parser := sitter.NewParser()
+	if err := parser.SetLanguage(lang); err != nil {
+		fmt.Printf("Error setting language: %v\n", err)
+		os.Exit(1)
+	}
+
+	tree := parser.Parse(content, nil)
+
+	fmt.Println("AST:", tree.RootNode().ToSexp())
+
+	// Step 1: Extraction
+	extractor := NewExtractor(content)
+	modules, err := extractor.ExtractAll(tree.RootNode())
+	if err != nil {
+		fmt.Printf("Extraction error: %v\n", err)
+		os.Exit(1)
+	}
+
+	for _, module := range modules {
+		fmt.Printf("Extracted Module: %s\n", module.Name)
+		fmt.Printf("  Symbols (%d):\n", len(module.Symbols))
+		for name, typ := range module.Symbols {
+			fmt.Printf("    %s: %s (width %d)\n", name, typ.Name, typ.Width)
+		}
+	}
+
+	// Step 2: Semantic Checking
+	checker := NewSemanticChecker(modules)
+	errors := checker.Check()
+
+	if len(errors) > 0 {
+		fmt.Println("\nSemantic Checks Failed:")
+		for _, err := range errors {
+			fmt.Println("  -", err)
+		}
+		os.Exit(1)
+	}
+
+	fmt.Println("\nSemantic Checks Passed. Ready for MLIR Emission.")
+
+	// Step 3: Lowering to MLIR
+	emitter := NewMLIREmitter()
+	emitter.EmitModules(modules)
+
+	outputFile := "build.mlir"
+	err = os.WriteFile(outputFile, []byte(emitter.String()), 0644)
+	if err != nil {
+		fmt.Printf("Error writing MLIR to file: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("\nMLIR successfully generated and written to %s\n", outputFile)
+	fmt.Println("\n--- Generated MLIR ---")
+	fmt.Println(emitter.String())
+}
+
+
+================================================================================
+FILE: compile.sh
+================================================================================
+#!/bin/bash
+set -e
+if [ "$#" -ne 1 ]; then
+  echo "Usage: ./compile.sh <file.vhd>"
+  exit 1
+fi
+go run . "$1"
+../cirt-bin/bin/circt-opt build.mlir --lower-seq-to-sv | ../cirt-bin/bin/firtool --format=mlir --verilog > "${1%.*}.sv"
+echo "Successfully compiled to ${1%.*}.sv:"
+cat "${1%.*}.sv"
+
+

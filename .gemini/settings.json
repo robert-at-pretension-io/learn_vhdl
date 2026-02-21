@@ -4,5 +4,8 @@
   },
   "security": {
     "enablePermanentToolApproval": true
+  },
+  "general": {
+    "defaultApprovalMode": "auto_edit"
   }
 }
