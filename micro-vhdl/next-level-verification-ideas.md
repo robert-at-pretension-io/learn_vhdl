@@ -46,3 +46,13 @@ How do you know if you wrote *enough* PSL assertions? If your assertions pass, m
 *   **The Idea:** Prove that the verification suite itself is complete.
 *   **The Implementation:** Automate a script that injects tiny faults into the MLIR (e.g., changes a `comb.and` to a `comb.or`, or shifts an index by 1). Re-run the proofs. If *all* PSL assertions still pass despite the injected fault, the verification suite is incomplete!
 *   **The Value:** This is the formal equivalent of line-coverage in software. It provides a mathematical metric for verification quality.
+
+---
+
+## 6. Upstream CIRCT Alignment & Required Maintenance
+
+Based on a review of active Pull Requests in the `llvm/circt` repository, the Micro-VHDL verification pipeline is heavily aligned with the bleeding edge of the ecosystem, but will require proactive maintenance as dialects evolve.
+
+*   **PR #9722 (`[circt-bmc] Lower LTL delay/clock patterns for BMC`)**: This is your own active PR! It directly validates the architecture we've built. The ability for `circt-bmc` to natively lower `ltl.delay` into core combinational and sequential logic is what makes Micro-VHDL's bounded sequential assertions (like `next[N]`) possible.
+*   **PR #9392 (`[LTL] Make ltl.delay clocking explicit (add %clock and <edge> operands)`)**: This is a critical breaking change on the horizon. Currently, `mlir.go` emits `ltl.delay %val, 1, 0 : i1` without a clock, and wraps the final sequence in an `ltl.clock` block. When this PR merges, the `ltl.delay` operation signature will change, and we will need to update `mlir.go` to explicitly pass the `%clk` SSA value to every `ltl.delay` operation we emit.
+*   **PR #9379 (`[FSM] Convert FSM to SMT`)** & **PR #7717 (`RFC: [AIG] Add an AIG dialect and circt-synth`)**: These PRs show that the upstream community is actively building the infrastructure required for Idea #3 (Word-Level IC3/PDR). The push to natively lower constructs directly to the `smt` dialect or a native `aig` dialect implies that in the near future, we may be able to run unbounded proofs natively within the CIRCT ecosystem, completely bypassing the external Yosys-ABC AIGER export step.
