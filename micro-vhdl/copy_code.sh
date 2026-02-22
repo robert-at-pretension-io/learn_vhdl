@@ -30,6 +30,8 @@ print_file() {
     print_file "examples/vhd/test_liveness.vhd"
     print_file "liveness-plan.md"
     print_file "next-level-verification-ideas.md"
+    print_file "btor2vcd.py"
+    print_file "formal_mutation.py"
 ) > .paste_buffer.txt
 
 # Try to copy to clipboard if a tool is available
