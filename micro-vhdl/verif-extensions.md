@@ -6,16 +6,20 @@
 
 **Compile pipeline** (`compile.sh`):
 ```
-[1/3]  VHDL → build.mlir + build_ic3.mlir   (Go compiler, two MLIR variants)
+[1/3]  VHDL → build.mlir + build_ic3.mlir   (Go compiler, multi-file linking)
 [2a/3] BMC via Z3 (circt-bmc, bound=15)      — finds shallow bugs, concrete traces
-                                               strips verif.contract first (--strip-contracts);
-                                               skipped for contract-only designs
-[2b/3] IC3/PDR via ABC pdr (unbounded)        — proves safety or finds deep bugs
-[2c/3] Contract verification via circt-bmc    — present only when contract block exists;
-                                               pipeline: --lower-contracts → extract verif.formal
-                                               → circt-bmc (LowerTestsPass handles the rest)
+[2b/3] IC3/PDR via ABC pdr (unbounded)        — bit-level unbounded proofs
+[2c/3] Contract verification via circt-bmc    — compositional assume-guarantee
+[2d/3] Cover verification via Z3              — find reachable states
+[2e/3] Word-Level IC3 via btormc (unbounded) — ultra-fast PDR for complex datapaths
 [3/3]  MLIR → SystemVerilog (firtool)
 ```
+
+**New Capabilities**:
+- **Multi-File Linking**: Pass multiple `.vhd` files; the compiler auto-detects the top module.
+- **Hierarchical Flattening**: Full support for `entity instantiation` across all verification paths.
+- **Trace Extraction to VCD**: Automatically generates `_trace.vcd` waveforms for failing assertions.
+- **Formal Mutation Testing**: `formal_mutation.py` injects faults into logic to verify assertion strength.
 
 **PSL operators supported**:
 - `|=>` (next-cycle implication): delay register + boolean implication → `verif.assert : i1`
@@ -170,20 +174,42 @@ This enables:
 
 ---
 
+## Layer 7 — Word-Level IC3 / PDR (BTOR2) ✓ DONE
+
+Bypasses bit-blasting by exporting the design to BTOR2 format via `circt-opt --convert-hw-to-btor2`. This preserves bit-vector semantics (`add32`, `mul32`) allowing `btormc` to solve complex datapaths that would OOM bit-level tools.
+
+---
+
+## Layer 8 — Trace Extraction to VCD ✓ DONE
+
+When an assertion fails, the tool automatically parses the solver's state trace and generates a `.vcd` file using `btor2vcd.py`. This allows visual debugging of formal counterexamples in GTKWave.
+
+---
+
+## Layer 9 — Formal Mutation Testing ✓ DONE
+
+`formal_mutation.py` measures the quality of the verification suite by injecting logic faults (e.g., `AND` -> `OR`, `+` -> `-`) and ensuring the assertions catch them.
+
+---
+
 ## Priority Summary
 
 | Extension | Status | Effort | Value |
 |---|---|---|---|
-| IC3/PDR via ABC pdr | **Done** | — | Unbounded safety proofs |
-| `psl assume` | **Done** | — | BMC-constrained verification; IC3 skips when assumes present |
-| `psl never` | **Done** | — | Syntactic sugar for always (not P) |
-| `psl cover` | **Done** | — | Checked via separate circt-bmc coverage pass; emitted to SV |
-| Reset-conditional (`after_reset`) | **Done** | — | Eliminates cycle-0 false positives in IC3 |
-| `next[N]` / delay | **Done** | — | Bounded response properties |
-| `\|->` (overlapping implication) | **Done** | Low | Full SVA vocabulary |
-| Sequence concat/repeat | **Done** | Medium | Protocol verification |
-| `verif.contract` on entities | **Done** | High | Compositional, scalable verification |
-| `verif.formal` blocks | **Done** | High | Cross-module and LEC |
-| Liveness via ABC fairness | **Done** | High | Full temporal logic |
+| IC3/PDR via ABC pdr | **Done** | — | Bit-level safety |
+| `psl assume` | **Done** | — | Constrained verification |
+| `psl never` | **Done** | — | Sugar |
+| `psl cover` | **Done** | — | Scenario search |
+| Reset-conditional | **Done** | — | Clean cycle-0 |
+| `next[N]` / delay | **Done** | — | Temporal bounds |
+| `\|->` (overlapping) | **Done** | Low | Full SVA |
+| Sequence concat/repeat | **Done** | Medium | Protocols |
+| `verif.contract` | **Done** | High | Scaling |
+| `verif.formal` blocks | **Done** | High | LEC / Standalone |
+| Liveness | **Done** | High | Unbounded loops |
+| Word-Level PDR (BTOR2) | **Done** | High | Datapath scaling |
+| VCD Trace Gen | **Done** | Medium | Visual debugging |
+| Formal Mutation | **Done** | Medium | Proof coverage |
 
-**Highest remaining value**: None. All core extensions completed.
+**Highest remaining value**: None. The Micro-VHDL formal stack is complete.
+

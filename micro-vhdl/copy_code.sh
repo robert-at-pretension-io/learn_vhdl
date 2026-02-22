@@ -32,6 +32,7 @@ print_file() {
     print_file "next-level-verification-ideas.md"
     print_file "btor2vcd.py"
     print_file "formal_mutation.py"
+    print_file "README.md"
 ) > .paste_buffer.txt
 
 # Try to copy to clipboard if a tool is available

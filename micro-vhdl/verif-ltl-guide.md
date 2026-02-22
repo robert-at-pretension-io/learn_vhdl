@@ -294,24 +294,48 @@ Z3 says SAT   -> "Assertion can be violated!" + counterexample trace
 
 **Key insight**: VerifToSMT *negates* the assertion. It asks "can the property be false?" UNSAT means no violation in N cycles. SAT gives exact signal values at each unrolled cycle.
 
+### BTOR2 path (Word-Level PDR via btormc)
+
+```
+VHDL Project (Multi-file)
+    |
+    v (Go Compiler + Linking)
+Hierarchical MLIR
+    |
+    v (circt-opt --hw-flatten-modules)
+Flat MLIR
+    |
+    v (LTLToBMC + Canonicalize)
+Flat Core Logic (no LTL ops)
+    |
+    v (ConvertHWToBTOR2)
+BTOR2 Transition System (preserves i32, i64 math)
+    |
+    v (btormc)
+UNSAT -> "Property proved!"
+SAT   -> "Assertion violated!" + generating _trace.vcd
+```
+
+**Key insight**: BTOR2 is the bridge between hardware design and modern SMT solvers. It is much more efficient than AIGER for designs with arithmetic because it avoids "bit-blasting" adders and multipliers into thousands of boolean logic gates.
+
+---
+
 ### IC3/PDR path (circt-synth + AIGER + ABC pdr)
 
 ```
 __verif_bad = NOT(combined assertion) as hw.output
     |
-    v  (circt-synth --until-before=all)
-AIG dialect (synth.aig.and_inv, seq.compreg as latches)
+    v (circt-opt --hw-flatten-modules)
+Flat IC3 MLIR
     |
-    v  (circt-translate --export-aiger)
-binary AIGER (.aig) — M inputs, L latches, O outputs (bad states)
+    v (circt-synth --until-before=all)
+AIG dialect
     |
-    v  (yosys-abc pdr)
-IC3 frame sequence construction
+    v (circt-translate --export-aiger)
+binary AIGER (.aig)
     |
-    v
-"Property proved."   <- fixed-point invariant found (all cycles)
-or
-"CEX found in frame N"  <- concrete counterexample
+    v (yosys-abc pdr)
+"Property proved." or counterexample
 ```
 
 **Key insight**: AIGER treats `hw.output` as bad-state signals. ABC `pdr` proves those outputs are unreachable from any initial state across all cycles.
@@ -320,14 +344,13 @@ or
 
 ## What Each Solver Proves
 
-| Property type | circt-bmc (BMC) | ABC pdr (IC3) |
-|---|---|---|
-| Safety — finds bugs | Yes (within bound) | Yes (any depth) |
-| Safety — proves correct | No | Yes (unbounded) |
-| Bitvector arithmetic | Native (Z3 BV theory) | Bit-exploded (slower for wide types) |
-| Counterexample detail | Named MLIR signals | Generic input_N/output_N |
-| `verif.assume` support | Native | Needs manual encoding |
-| `ltl.eventually` (liveness) | No | Needs Buchi encoding (not yet wired) |
-| LEC | Yes via `verif.lec` | Via AIGER equivalence checking |
+| Property type | circt-bmc (BMC) | ABC pdr (IC3) | BTORMC (Word-Level) |
+|---|---|---|---|
+| Safety — finds bugs | Yes (within bound) | Yes (any depth) | Yes (any depth) |
+| Safety — proves correct | No | Yes (unbounded) | Yes (unbounded) |
+| Bitvector arithmetic | Native (Z3) | Bit-exploded (slow) | Native (Boolector) |
+| Counterexample | Named signals | Generic input_N | Named signals + VCD |
+| Hierarchical support | Flattened | Flattened | Flattened |
+| LTL / Sequences | Lowered | Skipped | Lowered |
+| Liveness | No | Yes (l2s) | No |
 
-The two solvers are complementary. BMC runs first (fast, finds shallow bugs, readable traces). IC3 runs second (proves the property holds for all cycles, or finds deep bugs BMC missed).

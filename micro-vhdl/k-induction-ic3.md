@@ -102,49 +102,47 @@ Both BMC and IC3/PDR are now integrated and run automatically in sequence.
 ### Pipeline
 
 ```
-VHDL → Go compiler → build.mlir + build_ic3.mlir
-                           |               |
-                     circt-bmc (Z3)   circt-synth
-                     BMC, 15 cycles   → AIG dialect
-                           |               |
-                    "Assertion can    circt-translate
-                    be violated!"    --export-aiger
-                    or "Bound        → binary .aig
-                    reached"               |
-                                     yosys-abc pdr
-                                           |
-                                    "Property proved"
-                                    or counterexample
+VHDL Files → Go compiler → Linking/Detection → build.mlir + build_ic3.mlir
+                               |                      |
+                        circt-bmc (Z3)          circt-opt (Flattening)
+                        BMC, 15 cycles                |
+                               |                ---------------------
+                        "Assertion can          |                   |
+                        be violated!"     circt-translate     circt-opt (BTOR2)
+                        + VCD Trace       → AIGER (.aig)      → BTOR2 (.btor2)
+                               |                |                   |
+                                          yosys-abc pdr       btormc (Word-Level)
+                                                |                   |
+                                         "Property proved"   "Property proved"
+                                         or counterexample   or counterexample
 ```
 
 ### Two MLIR Variants
 
-The Go compiler emits two MLIR files from the same VHDL:
+The Go compiler emits two MLIR files from the same VHDL project:
 
 **BMC MLIR** (`foo.mlir`):
-- `verif.assert %combined : i1` — circt-bmc consumes this directly
-- `seq.initial` blocks — pins registers to zero at cycle 0 for deterministic BMC
-- Used by both circt-bmc and firtool (SV output)
+- Hierarchical `hw.instance` nodes
+- `verif.assert %combined : i1`
+- `seq.initial` blocks — pins registers to zero for deterministic BMC
+- Used by `circt-bmc`, `btormc` (via BTOR2 export), and `firtool`
 
 **IC3 MLIR** (`foo_ic3.mlir`):
-- `out __verif_bad: i1` — negated conjunction as hw.output port
-- No `seq.initial` — PDR must explore from all possible initial states, not just zero
-- No `verif.assert` — only hw.output; circt-synth can lower this to AIG cleanly
+- `out __verif_bad: i1` port for bit-level PDR
+- Sub-modules marked `private` to enable automated flattening
+- No `seq.initial` — PDR must explore from all possible initial states
 - Used only for the AIGER/ABC path
 
 ### Key Design Decisions
 
-**Why no `seq.initial` in IC3 MLIR**: `circt-synth` cannot lower `seq.initial` to AIG (it is not a comb or seq register op). More importantly, pinning initial register state to zero would cause IC3 to miss bugs only reachable from other starting states. PDR by design explores from all initial states.
+**Word-Level verification (BTOR2)**: Bit-level engines (AIGER) struggle with wide datapaths (e.g. 32-bit adders) because they see thousands of individual gates. BTOR2 preserves the "Word" semantics (`add i32`), allowing SMT-based solvers like `btormc` to solve complex math instantly.
 
-**Why a separate MLIR file**: `verif.assert` cannot pass through `circt-synth`'s AIG lowering pipeline. Emitting a clean IC3 MLIR without `verif.assert` avoids needing a stripping pass.
+**Automated Hierarchical Flattening**: `compile.sh` automatically runs `--hw-flatten-modules` and `--symbol-dce`. This collapses the entire VHDL project into a single top-level module, ensuring that sub-module logic is fully visible to the formal engines without needing a manual elaboration step.
 
-**Why `__verif_bad = NOT(conjunction)`**: The AIGER model checking convention is that hw.outputs represent "bad state" signals. ABC's `pdr` command proves these outputs are unreachable. The negation converts "property holds" (which the assertion checks) to "property violated" (which PDR checks for reachability).
-
-**Why binary AIGER only**: `yosys-abc read_aiger` rejects ASCII `.aag` files when symbol names contain bracket characters (e.g., `a[0]`). The binary `.aig` format is used throughout.
+**Trace Extraction**: Failing properties in the BTOR2 path automatically generate a `_trace.vcd` file via `btor2vcd.py`, enabling visual debugging.
 
 ### Limitations
 
-- IC3 counterexamples come back as generic `input_0`/`output_0` names, not the original VHDL signal names
-- Liveness properties (`psl eventually!`) are still stubbed as `hw.constant true`
-- Hierarchical designs are not yet flattened before AIGER export
-- LTL properties (`ltl.delay` / `ltl.clock`) are BMC-only; IC3/PDR skips them in the AIGER path
+- IC3 (ABC) counterexamples still come back as generic `input_0`/`output_0` names (use BTOR2 for named signals)
+- LTL properties (`ltl.delay` / `ltl.clock`) are flattened to core logic for the BTOR2 path
+
