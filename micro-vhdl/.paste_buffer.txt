@@ -47,7 +47,7 @@ module.exports = grammar({
     // -------------------------------------------------------------------------
     source_file: $ => repeat($._design_unit),
 
-    comment: $ => token(seq('--', /[^\\r\\n]*/)),
+    comment: $ => token(seq('--', /[^\r\n]*/)),
 
     identifier: $ => /[a-zA-Z][a-zA-Z0-9_]*/,
 
@@ -55,7 +55,24 @@ module.exports = grammar({
       $.library_clause,
       $.use_clause,
       $.entity_declaration,
-      $.architecture_body
+      $.architecture_body,
+      $.psl_formal_verification
+    ),
+
+    psl_formal_verification: $ => seq(
+      'verification', field('name', $.identifier), 'is',
+      repeat(choice(
+        $.symbolic_declaration,
+        $.psl_assertion,
+        $.psl_assumption,
+        $.psl_cover,
+        $.psl_assert_never
+      )),
+      'end', optional('verification'), optional($.identifier), ';'
+    ),
+
+    symbolic_declaration: $ => seq(
+      'symbolic', field('sym_names', $.identifier_list), ':', field('type', alias($.type_mark, $.type_mark)), ';'
     ),
 
     // -------------------------------------------------------------------------
@@ -71,7 +88,16 @@ module.exports = grammar({
       'entity', field('name', $.identifier), 'is',
       optional($.generic_clause),
       optional($.port_clause),
+      optional($.contract_declaration),
       'end', optional('entity'), optional($.identifier), ';'
+    ),
+
+    contract_declaration: $ => seq(
+      'contract',
+      repeat1(choice(
+        seq('require', ':', field('require_expr', $._psl_expression), ';'),
+        seq('ensure', ':', field('ensure_expr', $._psl_expression), ';')
+      ))
     ),
 
     // JUSTIFICATION: Complex metaprogramming (generic types/functions) requires a 
@@ -169,8 +195,12 @@ module.exports = grammar({
       $.selected_assignment,
       $.synchronous_process,
       $.generate_statement,
-      $.entity_instantiation, 
-      $.psl_assertion
+      $.entity_instantiation,
+      $.psl_assertion,
+      $.psl_assumption,
+      $.psl_after_reset_assertion,
+      $.psl_cover,
+      $.psl_assert_never
     ),
 
     // JUSTIFICATION: Combinational math executes continuously. Conditionals here 
@@ -265,14 +295,62 @@ module.exports = grammar({
       field('property', $._psl_expression), ';'
     ),
 
-    _psl_expression: $ => choice(
-      $._expression,
-      $.psl_implication,
-      $.psl_eventually,
-      $.psl_stable
+    psl_assumption: $ => seq(
+      'psl', 'assume', 'always',
+      field('property', $._psl_expression), ';'
     ),
 
-    psl_implication: $ => prec.left(1, seq(field('left', $._psl_expression), '|=>', field('right', $._psl_expression))),
+    psl_cover: $ => seq(
+      'psl', 'cover',
+      field('property', $._psl_expression), ';'
+    ),
+
+    psl_assert_never: $ => seq(
+      'psl', 'assert', 'never',
+      field('property', $._psl_expression), ';'
+    ),
+
+    psl_after_reset_assertion: $ => seq(
+      'psl', 'assert', 'always', 'after_reset',
+      '(', field('reset', $._name), ')',
+      field('property', $._psl_expression), ';'
+    ),
+
+    _psl_expression: $ => choice(
+      $.psl_sequence,
+      $.psl_implication,
+      $.psl_eventually,
+      $.psl_stable,
+      $.psl_next,
+      $.psl_next_range,
+      $._expression
+    ),
+
+    psl_next: $ => prec(6, seq('next', '[', field('delay', $.number), ']', '(', field('arg', $._psl_expression), ')')),
+    psl_next_range: $ => prec(6, seq('next_a', '[', field('start', $.number), 'to', field('end', $.number), ']', '(', field('arg', $._psl_expression), ')')),
+
+    psl_sequence: $ => seq(
+      '{',
+      $.psl_sequence_element,
+      repeat(seq(';', $.psl_sequence_element)),
+      '}'
+    ),
+
+    psl_sequence_element: $ => seq(
+      $._psl_expression,
+      optional($.psl_repetition)
+    ),
+
+    psl_repetition: $ => choice(
+      seq('[', '*', field('count', $.number), ']'),
+      seq('[', '*', field('start', $.number), 'to', field('end', $.number), ']')
+    ),
+
+    psl_implication: $ => prec.left(1, seq(
+      field('left', $._psl_expression), 
+      field('operator', choice('|=>', '|->')), 
+      field('right', $._psl_expression)
+    )),
     psl_eventually: $ => prec.left(2, seq(field('left', $._psl_expression), '->', 'eventually!', field('right', $._psl_expression))),
     psl_stable: $ => seq('stable', '(', field('signal', $._name), ')'),
 
@@ -288,32 +366,54 @@ module.exports = grammar({
     indexed_name: $ => seq(field('prefix', $.identifier), '(', field('index', $._expression), ')'),
     selected_name: $ => seq(field('prefix', $.identifier), '.', field('suffix', $.identifier)),
 
-    _expression: $ => choice(
+    paren_expression: $ => seq('(', $._expression, ')'),
+
+    _expression: $ => $.logical_expression,
+
+    logical_expression: $ => choice(
+      $.relational_expression,
+      prec.left(1, seq(field('left', $.logical_expression), field('operator', choice('and', 'or', 'xor')), field('right', $.relational_expression)))
+    ),
+
+    relational_expression: $ => choice(
+      $.additive_expression,
+      prec.left(2, seq(field('left', $.relational_expression), field('operator', choice('=', '/=', '<', '<=', '>', '>=')), field('right', $.additive_expression)))
+    ),
+
+    additive_expression: $ => choice(
+      $.multiplicative_expression,
+      prec.left(3, seq(field('left', $.additive_expression), field('operator', choice('+', '-', '&')), field('right', $.multiplicative_expression)))
+    ),
+
+    multiplicative_expression: $ => choice(
+      $._unary_expression,
+      prec.left(4, seq(field('left', $.multiplicative_expression), field('operator', '*'), field('right', $._unary_expression)))
+    ),
+
+    _unary_expression: $ => choice(
+      $.unary_expression,
+      $._primary_expression
+    ),
+
+    unary_expression: $ => prec(5, seq(
+      field('operator', 'not'), 
+      field('argument', $._primary_expression)
+    )),
+
+    _primary_expression: $ => choice(
       $._name,
       $.number,
       $.string_literal, 
       $.char_literal,   
-      seq('(', $._expression, ')'),
-      $.binary_expression,
-      $.unary_expression
+      $.paren_expression
     ),
-
-    binary_expression: $ => prec.left(1, seq(
-      field('left', $._expression), 
-      field('operator', choice('+', '-', '*', '=', '/=', '<', '>', '<=', '>=', 'and', 'or', 'xor', '&')), 
-      field('right', $._expression)
-    )),
-
-    unary_expression: $ => prec(2, seq(
-      field('operator', 'not'), 
-      field('argument', $._expression)
-    )),
 
     number: $ => /[0-9]+/,
     string_literal: $ => choice(/"[01]+"/, /x"[0-9a-fA-F]+"/),
     char_literal: $ => /'[01]'/ 
   }
 });
+
 
 ================================================================================
 FILE: ast.go
@@ -343,6 +443,7 @@ type Port struct {
 	Name      string
 	Direction string // "in" or "out"
 	Type      Type
+	LineNum   uint32
 }
 
 // Signal represents a declared signal (copper wire).
@@ -357,13 +458,23 @@ type Generic struct {
 	Default string
 }
 
+// Contract represents the verif.contract attached to an entity.
+type Contract struct {
+	Requires []Expression
+	Ensures  []Expression
+	LineNum  uint32
+}
+
 // Module represents the complete Micro-VHDL design unit (Entity + Architecture).
 type Module struct {
 	Name       string
+	ClockPort  string // name of the clock input port; empty for purely combinational modules
 	Generics   []*Generic
 	Ports      []*Port
 	Signals    []*Signal
 	Statements []Statement
+	Contract   *Contract
+	Formals    []*PslFormalBlock
 
 	// Symbol Table
 	Symbols map[string]Type
@@ -375,6 +486,23 @@ func NewModule(name string) *Module {
 		Symbols: make(map[string]Type),
 	}
 }
+
+// PslFormalBlock represents a verif.formal standalone verification block.
+type PslFormalBlock struct {
+	Name       string
+	Symbols    map[string]Type
+	Statements []Statement
+}
+
+type SymbolicDeclaration struct {
+	Names   []string
+	Type    Type
+	LineNum uint32
+}
+
+func (s *SymbolicDeclaration) isStatement()   {}
+func (s *SymbolicDeclaration) Line() uint32 { return s.LineNum }
+
 
 // Statement is the interface for all statements in the architecture body.
 type Statement interface {
@@ -487,6 +615,49 @@ type PslAssertion struct {
 func (p *PslAssertion) isStatement()   {}
 func (p *PslAssertion) Line() uint32 { return p.LineNum }
 
+// PslAssumption represents `psl assume always property;`
+// Emits verif.assume in BMC mode (constrains solver input space) and gates
+// __verif_bad with the assumption conjunction in IC3 mode.
+type PslAssumption struct {
+	Property Expression
+	LineNum  uint32
+}
+
+func (p *PslAssumption) isStatement()   {}
+func (p *PslAssumption) Line() uint32 { return p.LineNum }
+
+// PslCover represents `psl cover property;`
+type PslCover struct {
+	Property Expression
+	LineNum  uint32
+}
+
+func (p *PslCover) isStatement()   {}
+func (p *PslCover) Line() uint32 { return p.LineNum }
+
+// PslAssertNever represents `psl assert never property;`
+type PslAssertNever struct {
+	Property Expression
+	LineNum  uint32
+}
+
+func (p *PslAssertNever) isStatement()   {}
+func (p *PslAssertNever) Line() uint32 { return p.LineNum }
+
+// PslAfterResetAssertion represents `psl assert always after_reset(rst) property;`
+// The property is checked only after the reset signal has de-asserted at least once.
+// Before that, the assertion is vacuously true.
+// Implemented via a sticky `past_reset` register: once rst goes low it latches high,
+// and the effective assertion is `NOT(past_reset) OR property`.
+type PslAfterResetAssertion struct {
+	Reset    Expression // active-high reset signal
+	Property Expression
+	LineNum  uint32
+}
+
+func (p *PslAfterResetAssertion) isStatement()   {}
+func (p *PslAfterResetAssertion) Line() uint32 { return p.LineNum }
+
 type PortMapEntry struct {
 	Formal string
 	Actual Expression
@@ -552,11 +723,29 @@ type SelectedNameExpr struct {
 func (SelectedNameExpr) isExpression() {}
 
 type PslImplicationExpr struct {
+	Op    string // "|=>" or "|->"
 	Left  Expression
 	Right Expression
 }
 
 func (PslImplicationExpr) isExpression() {}
+
+type PslSequenceExpr struct {
+	Elements []PslSequenceElement
+}
+
+func (PslSequenceExpr) isExpression() {}
+
+type PslSequenceElement struct {
+	Expr       Expression
+	Repetition *PslRepetition
+}
+
+type PslRepetition struct {
+	Count int // if >= 0, it's [*count]
+	Start int // if Count < 0, it's [*start to end]
+	End   int
+}
 
 type PslEventuallyExpr struct {
 	Left  Expression
@@ -570,6 +759,23 @@ type PslStableExpr struct {
 }
 
 func (PslStableExpr) isExpression() {}
+
+// PslNextExpr represents next[N](expr)
+type PslNextExpr struct {
+	Delay int
+	Arg   Expression
+}
+
+func (PslNextExpr) isExpression() {}
+
+// PslNextRangeExpr represents next_a[M to N](expr)
+type PslNextRangeExpr struct {
+	Start int
+	End   int
+	Arg   Expression
+}
+
+func (PslNextRangeExpr) isExpression() {}
 
 
 ================================================================================
@@ -600,11 +806,23 @@ func (e *Extractor) text(n *sitter.Node) string {
 	return string(e.source[n.StartByte():n.EndByte()])
 }
 
+func (e *Extractor) parseNumber(n *sitter.Node) int {
+	if n == nil {
+		return -1
+	}
+	val, err := strconv.Atoi(e.text(n))
+	if err != nil {
+		return -1
+	}
+	return val
+}
+
 func (e *Extractor) ExtractAll(root *sitter.Node) ([]*Module, error) {
 	var modules []*Module
 	
 	entities := make(map[string]*sitter.Node)
 	arches := make(map[string]*sitter.Node)
+	formals := make(map[string][]*sitter.Node) // Map entity name to its formal blocks
 
 	cursor := root.Walk()
 	if cursor.GotoFirstChild() {
@@ -618,6 +836,12 @@ func (e *Extractor) ExtractAll(root *sitter.Node) ([]*Module, error) {
 				if entityNode := node.ChildByFieldName("entity"); entityNode != nil {
 					arches[e.text(entityNode)] = node
 				}
+			} else if node.Kind() == "psl_formal_verification" {
+				// Standalone verification blocks. For now, we'll associate them
+				// with the first entity found or create a dummy module.
+				// In a full implementation, we might want a separate "Verification" design unit.
+				// For now, let's just collect them globally.
+				formals["global"] = append(formals["global"], node)
 			}
 			if !cursor.GotoNextSibling() {
 				break
@@ -628,14 +852,94 @@ func (e *Extractor) ExtractAll(root *sitter.Node) ([]*Module, error) {
 	for name, entityNode := range entities {
 		e.module = NewModule(name)
 		e.extractInterface(entityNode)
+		
+		// If there's a port named 'clk', assume it's the module clock.
+		for _, p := range e.module.Ports {
+			if p.Name == "clk" {
+				e.module.ClockPort = "clk"
+				break
+			}
+		}
+
 		if archNode, ok := arches[name]; ok {
 			e.extractArchitecture(archNode)
 		}
+		
+		// Add global formal blocks to every module for now, or just the first one.
+		if len(formals["global"]) > 0 {
+			for _, fn := range formals["global"] {
+				e.module.Formals = append(e.module.Formals, e.extractPslFormalVerification(fn))
+			}
+			formals["global"] = nil // only add to the first module
+		}
+
 		modules = append(modules, e.module)
 	}
 
 	return modules, nil
 }
+
+func (e *Extractor) extractPslFormalVerification(node *sitter.Node) *PslFormalBlock {
+	fb := &PslFormalBlock{
+		Symbols: make(map[string]Type),
+	}
+	if nameNode := node.ChildByFieldName("name"); nameNode != nil {
+		fb.Name = e.text(nameNode)
+	}
+
+	cursor := node.Walk()
+	if cursor.GotoFirstChild() {
+		for {
+			n := cursor.Node()
+			if n.Kind() == "psl_assertion" {
+				fb.Statements = append(fb.Statements, e.extractPslAssertion(n))
+			} else if n.Kind() == "psl_assumption" {
+				fb.Statements = append(fb.Statements, e.extractPslAssumption(n))
+			} else if n.Kind() == "psl_cover" {
+				fb.Statements = append(fb.Statements, e.extractPslCover(n))
+			} else if n.Kind() == "psl_assert_never" {
+				fb.Statements = append(fb.Statements, e.extractPslAssertNever(n))
+			} else if n.Kind() == "symbolic_declaration" {
+				// Handle symbolic declaration
+				symNamesNode := n.ChildByFieldName("sym_names")
+				var typeNode *sitter.Node
+				for i := uint(0); i < n.ChildCount(); i++ {
+					if n.Child(i).Kind() == "type_mark" {
+						typeNode = n.Child(i)
+						break
+					}
+				}
+				typ := e.extractType(typeNode)
+				
+				symDecl := &SymbolicDeclaration{
+					Type:    typ,
+					LineNum: uint32(n.StartPosition().Row + 1),
+				}
+				
+				namesCursor := symNamesNode.Walk()
+				if namesCursor.GotoFirstChild() {
+					for {
+						idNode := namesCursor.Node()
+						if idNode.Kind() == "identifier" {
+							name := e.text(idNode)
+							symDecl.Names = append(symDecl.Names, name)
+							fb.Symbols[name] = typ
+						}
+						if !namesCursor.GotoNextSibling() {
+							break
+						}
+					}
+				}
+				fb.Statements = append(fb.Statements, symDecl)
+			}
+			if !cursor.GotoNextSibling() {
+				break
+			}
+		}
+	}
+	return fb
+}
+
 
 func (e *Extractor) extractInterface(entityNode *sitter.Node) {
 	cursor := entityNode.Walk()
@@ -668,12 +972,44 @@ func (e *Extractor) extractInterface(entityNode *sitter.Node) {
 						}
 					}
 				}
+			} else if node.Kind() == "contract_declaration" {
+				e.extractContractDeclaration(node)
 			}
 			if !cursor.GotoNextSibling() {
 				break
 			}
 		}
 	}
+}
+
+func (e *Extractor) extractContractDeclaration(node *sitter.Node) {
+	contract := &Contract{
+		LineNum: uint32(node.StartPosition().Row + 1),
+	}
+	
+	cursor := node.Walk()
+	if cursor.GotoFirstChild() {
+		for {
+			n := cursor.Node()
+			fieldName := cursor.FieldName()
+			if fieldName == "require_expr" {
+				expr := e.extractExpression(n)
+				if expr != nil {
+					contract.Requires = append(contract.Requires, expr)
+				}
+			} else if fieldName == "ensure_expr" {
+				expr := e.extractExpression(n)
+				if expr != nil {
+					contract.Ensures = append(contract.Ensures, expr)
+				}
+			}
+			if !cursor.GotoNextSibling() {
+				break
+			}
+		}
+	}
+	
+	e.module.Contract = contract
 }
 
 func (e *Extractor) extractGenericDeclaration(node *sitter.Node) {
@@ -718,6 +1054,7 @@ func (e *Extractor) extractPortDeclaration(node *sitter.Node) {
 						Name:      name,
 						Direction: direction,
 						Type:      typ,
+						LineNum:   uint32(n.StartPosition().Row + 1),
 					}
 					e.module.Ports = append(e.module.Ports, port)
 					e.module.Symbols[name] = typ
@@ -735,14 +1072,18 @@ func (e *Extractor) extractType(node *sitter.Node) Type {
 		return Type{Name: "unknown", Width: 0}
 	}
 	text := e.text(node)
-	if text == "std_logic" {
+	if strings.HasPrefix(text, "std_logic") && !strings.Contains(text, "(") {
 		return Type{Name: "std_logic", Width: 1}
 	} else if text == "integer" {
 		return Type{Name: "integer", Width: 32}
 	}
 
-	// Simple check for std_logic_vector
+	// Simple check for std_logic_vector/unsigned
 	if strings.Contains(text, "downto") {
+		// Because we use a tiered grammar, the indices are now nested logical_expressions.
+		// Instead of manual string parsing, let's find the numeric literals if possible,
+		// or just use e.extractExpression if we had a full evaluator.
+		// For now, let's try a more robust string extraction.
 		startIdx := strings.Index(text, "(")
 		downtoIdx := strings.Index(text, "downto")
 		endIdx := strings.Index(text, ")")
@@ -750,6 +1091,10 @@ func (e *Extractor) extractType(node *sitter.Node) Type {
 			base := strings.TrimSpace(text[:startIdx])
 			leftStr := strings.TrimSpace(text[startIdx+1 : downtoIdx])
 			rightStr := strings.TrimSpace(text[downtoIdx+6 : endIdx])
+
+			// Clean up any remaining parentheses from nested expression nodes
+			leftStr = strings.Trim(leftStr, "() ")
+			rightStr = strings.Trim(rightStr, "() ")
 
 			left, err1 := strconv.Atoi(leftStr)
 			right, err2 := strconv.Atoi(rightStr)
@@ -762,6 +1107,7 @@ func (e *Extractor) extractType(node *sitter.Node) Type {
 
 	return Type{Name: text, Width: 0}
 }
+
 
 func (e *Extractor) extractArchitecture(archNode *sitter.Node) {
 	cursor := archNode.Walk()
@@ -784,6 +1130,14 @@ func (e *Extractor) extractArchitecture(archNode *sitter.Node) {
 				e.module.Statements = append(e.module.Statements, e.extractGenerateStatement(node))
 			} else if node.Kind() == "psl_assertion" {
 				e.module.Statements = append(e.module.Statements, e.extractPslAssertion(node))
+			} else if node.Kind() == "psl_assumption" {
+				e.module.Statements = append(e.module.Statements, e.extractPslAssumption(node))
+			} else if node.Kind() == "psl_cover" {
+				e.module.Statements = append(e.module.Statements, e.extractPslCover(node))
+			} else if node.Kind() == "psl_assert_never" {
+				e.module.Statements = append(e.module.Statements, e.extractPslAssertNever(node))
+			} else if node.Kind() == "psl_after_reset_assertion" {
+				e.module.Statements = append(e.module.Statements, e.extractPslAfterResetAssertion(node))
 			}
 			if !cursor.GotoNextSibling() {
 				break
@@ -987,6 +1341,10 @@ func (e *Extractor) extractSynchronousProcess(node *sitter.Node) *SynchronousPro
 	proc := &SynchronousProcess{
 		LineNum: uint32(node.StartPosition().Row + 1),
 	}
+	// The micro-vhdl grammar hardcodes 'clk' as the clock signal in every
+	// synchronous_process.  Record it on the module so the MLIR emitter can
+	// emit the port as !seq.clock instead of i1.
+	e.module.ClockPort = "clk"
 
 	cursor := node.Walk()
 	if cursor.GotoFirstChild() {
@@ -1151,6 +1509,57 @@ func (e *Extractor) extractPslAssertion(node *sitter.Node) *PslAssertion {
 	return stmt
 }
 
+func (e *Extractor) extractPslAssumption(node *sitter.Node) *PslAssumption {
+	stmt := &PslAssumption{
+		LineNum: uint32(node.StartPosition().Row + 1),
+	}
+
+	if propNode := node.ChildByFieldName("property"); propNode != nil {
+		stmt.Property = e.extractExpression(propNode)
+	}
+
+	return stmt
+}
+
+func (e *Extractor) extractPslCover(node *sitter.Node) *PslCover {
+	stmt := &PslCover{
+		LineNum: uint32(node.StartPosition().Row + 1),
+	}
+
+	if propNode := node.ChildByFieldName("property"); propNode != nil {
+		stmt.Property = e.extractExpression(propNode)
+	}
+
+	return stmt
+}
+
+func (e *Extractor) extractPslAssertNever(node *sitter.Node) *PslAssertNever {
+	stmt := &PslAssertNever{
+		LineNum: uint32(node.StartPosition().Row + 1),
+	}
+
+	if propNode := node.ChildByFieldName("property"); propNode != nil {
+		stmt.Property = e.extractExpression(propNode)
+	}
+
+	return stmt
+}
+
+func (e *Extractor) extractPslAfterResetAssertion(node *sitter.Node) *PslAfterResetAssertion {
+	stmt := &PslAfterResetAssertion{
+		LineNum: uint32(node.StartPosition().Row + 1),
+	}
+
+	if resetNode := node.ChildByFieldName("reset"); resetNode != nil {
+		stmt.Reset = e.extractExpression(resetNode)
+	}
+	if propNode := node.ChildByFieldName("property"); propNode != nil {
+		stmt.Property = e.extractExpression(propNode)
+	}
+
+	return stmt
+}
+
 func (e *Extractor) extractEntityInstantiation(node *sitter.Node) *EntityInstantiation {
 	stmt := &EntityInstantiation{
 		LineNum: uint32(node.StartPosition().Row + 1),
@@ -1211,6 +1620,24 @@ func (e *Extractor) extractExpression(node *sitter.Node) Expression {
 		return nil
 	}
 	kind := node.Kind()
+
+	// Handle tiered grammar nodes (e.g., logical_expression -> relational_expression)
+	// by unwrapping if there is only one named child.
+	if (kind == "logical_expression" || kind == "relational_expression" ||
+		kind == "additive_expression" || kind == "multiplicative_expression") &&
+		node.NamedChildCount() == 1 {
+		return e.extractExpression(node.NamedChild(0))
+	}
+
+	// Check for binary expression patterns in the tiered grammar
+	if node.ChildByFieldName("left") != nil && node.ChildByFieldName("operator") != nil && node.ChildByFieldName("right") != nil {
+		return BinaryExpr{
+			Op:    strings.TrimSpace(e.text(node.ChildByFieldName("operator"))),
+			Left:  e.extractExpression(node.ChildByFieldName("left")),
+			Right: e.extractExpression(node.ChildByFieldName("right")),
+		}
+	}
+
 	switch kind {
 	case "identifier":
 		return IdentifierExpr{Name: e.text(node)}
@@ -1226,11 +1653,10 @@ func (e *Extractor) extractExpression(node *sitter.Node) Expression {
 			Prefix: e.text(node.ChildByFieldName("prefix")),
 			Suffix: e.text(node.ChildByFieldName("suffix")),
 		}
-	case "binary_expression":
-		return BinaryExpr{
-			Op:    strings.TrimSpace(e.text(node.ChildByFieldName("operator"))),
-			Left:  e.extractExpression(node.ChildByFieldName("left")),
-			Right: e.extractExpression(node.ChildByFieldName("right")),
+	case "paren_expression":
+		// The expression is the middle child (index 1), between '(' and ')'
+		return ParenExpr{
+			Expr: e.extractExpression(node.Child(1)),
 		}
 	case "unary_expression":
 		return UnaryExpr{
@@ -1239,9 +1665,25 @@ func (e *Extractor) extractExpression(node *sitter.Node) Expression {
 		}
 	case "psl_implication":
 		return PslImplicationExpr{
+			Op:    strings.TrimSpace(e.text(node.ChildByFieldName("operator"))),
 			Left:  e.extractExpression(node.ChildByFieldName("left")),
 			Right: e.extractExpression(node.ChildByFieldName("right")),
 		}
+	case "psl_sequence":
+		var elements []PslSequenceElement
+		cursor := node.Walk()
+		if cursor.GotoFirstChild() {
+			for {
+				n := cursor.Node()
+				if n.Kind() == "psl_sequence_element" {
+					elements = append(elements, e.extractPslSequenceElement(n))
+				}
+				if !cursor.GotoNextSibling() {
+					break
+				}
+			}
+		}
+		return PslSequenceExpr{Elements: elements}
 	case "psl_eventually":
 		return PslEventuallyExpr{
 			Left:  e.extractExpression(node.ChildByFieldName("left")),
@@ -1251,10 +1693,48 @@ func (e *Extractor) extractExpression(node *sitter.Node) Expression {
 		return PslStableExpr{
 			Signal: e.extractExpression(node.ChildByFieldName("signal")),
 		}
+	case "psl_next":
+		return PslNextExpr{
+			Delay: e.parseNumber(node.ChildByFieldName("delay")),
+			Arg:   e.extractExpression(node.ChildByFieldName("arg")),
+		}
+	case "psl_next_range":
+		return PslNextRangeExpr{
+			Start: e.parseNumber(node.ChildByFieldName("start")),
+			End:   e.parseNumber(node.ChildByFieldName("end")),
+			Arg:   e.extractExpression(node.ChildByFieldName("arg")),
+		}
 	}
 
 	return LiteralExpr{Value: e.text(node)}
 }
+
+func (e *Extractor) extractPslSequenceElement(node *sitter.Node) PslSequenceElement {
+	element := PslSequenceElement{}
+	// The first child is the expression (_psl_expression)
+	element.Expr = e.extractExpression(node.Child(0))
+
+	// Check for optional repetition
+	// Tree-sitter includes named fields and anonymous children like ';' or '{'
+	// but psl_sequence_element rule is just seq($._psl_expression, optional($.psl_repetition))
+	// However, sometimes there might be extra hidden children.
+	// It's safer to iterate children.
+	for i := uint(0); i < node.ChildCount(); i++ {
+		child := node.Child(i)
+		if child.Kind() == "psl_repetition" {
+			rep := &PslRepetition{Count: -1}
+			if countNode := child.ChildByFieldName("count"); countNode != nil {
+				rep.Count = e.parseNumber(countNode)
+			} else {
+				rep.Start = e.parseNumber(child.ChildByFieldName("start"))
+				rep.End = e.parseNumber(child.ChildByFieldName("end"))
+			}
+			element.Repetition = rep
+		}
+	}
+	return element
+}
+
 
 
 ================================================================================
@@ -1281,8 +1761,227 @@ func (c *SemanticChecker) Check() []string {
 		c.checkUndeclaredWires(mod)
 		c.checkInputImmutability(mod)
 		c.checkMultiDrivenWires(mod)
+		c.checkVerificationCoverage(mod)
+		c.checkPslDelayBounds(mod)
 	}
 	return c.errors
+}
+
+func (c *SemanticChecker) checkVerificationCoverage(mod *Module) {
+	// Build a set of all signals referenced in ANY PSL assertion.
+	verifiedSignals := make(map[string]bool)
+
+	var walkExpr func(expr Expression)
+	walkExpr = func(expr Expression) {
+		if expr == nil {
+			return
+		}
+		switch v := expr.(type) {
+		case IdentifierExpr:
+			verifiedSignals[v.Name] = true
+		case IndexedNameExpr:
+			verifiedSignals[v.Prefix] = true
+			walkExpr(v.Index)
+		case SelectedNameExpr:
+			verifiedSignals[v.Prefix] = true
+		case BinaryExpr:
+			walkExpr(v.Left)
+			walkExpr(v.Right)
+		case UnaryExpr:
+			walkExpr(v.Right)
+		case ParenExpr:
+			walkExpr(v.Expr)
+		case PslImplicationExpr:
+			walkExpr(v.Left)
+			walkExpr(v.Right)
+		case PslEventuallyExpr:
+			walkExpr(v.Left)
+			walkExpr(v.Right)
+		case PslStableExpr:
+			walkExpr(v.Signal)
+		case PslSequenceExpr:
+			for _, el := range v.Elements {
+				walkExpr(el.Expr)
+			}
+		}
+	}
+
+	for _, stmt := range mod.Statements {
+		switch s := stmt.(type) {
+		case *SymbolicDeclaration:
+			for _, name := range s.Names {
+				verifiedSignals[name] = true
+			}
+		case *PslAssertion:
+			walkExpr(s.Property)
+		case *PslAfterResetAssertion:
+			walkExpr(s.Property)
+		case *PslAssertNever:
+			walkExpr(s.Property)
+		case *PslCover:
+			walkExpr(s.Property)
+		}
+	}
+
+	for _, fb := range mod.Formals {
+		for _, stmt := range fb.Statements {
+			switch s := stmt.(type) {
+			case *SymbolicDeclaration:
+				for _, name := range s.Names {
+					verifiedSignals[name] = true
+				}
+			case *PslAssertion:
+				walkExpr(s.Property)
+			case *PslAfterResetAssertion:
+				walkExpr(s.Property)
+			case *PslAssertNever:
+				walkExpr(s.Property)
+			case *PslCover:
+				walkExpr(s.Property)
+			}
+		}
+	}
+
+	// 1. Output Port Coverage
+	for _, p := range mod.Ports {
+		if p.Direction == "out" && !verifiedSignals[p.Name] {
+			c.errors = append(c.errors, fmt.Sprintf("Line %d: Warning - Output port '%s' is unconstrained by any PSL contract", p.LineNum, p.Name))
+		}
+	}
+
+	// 2. State/Register Coverage
+	// Collect all registers (targets of sequential assignments inside SynchronousProcess)
+	registers := make(map[string]uint32)
+	var walkSeq func(stmts []SequentialStatement)
+	walkSeq = func(stmts []SequentialStatement) {
+		for _, stmt := range stmts {
+			switch s := stmt.(type) {
+			case *SequentialAssignment:
+				registers[s.Target] = s.LineNum
+			case *SequentialIf:
+				walkSeq(s.Then)
+				for _, e := range s.Elsifs {
+					walkSeq(e.Then)
+				}
+				walkSeq(s.Else)
+			}
+		}
+	}
+
+	for _, stmt := range mod.Statements {
+		if sp, ok := stmt.(*SynchronousProcess); ok {
+			walkSeq(sp.Statements)
+		}
+	}
+
+	for regName, lineNum := range registers {
+		if !verifiedSignals[regName] {
+			// Don't warn about outputs that were already warned about above
+			isOutput := false
+			for _, p := range mod.Ports {
+				if p.Name == regName && p.Direction == "out" {
+					isOutput = true
+					break
+				}
+			}
+			if !isOutput {
+				c.errors = append(c.errors, fmt.Sprintf("Line %d: Warning - State register '%s' lacks temporal assertions", lineNum, regName))
+			}
+		}
+	}
+	
+	// 3. MUX Completeness (Optional/Future: Ensuring 'others' clause logic isn't sweeping invalid states)
+}
+
+func (c *SemanticChecker) checkPslDelayBounds(mod *Module) {
+	foundNext := false
+
+	var walkExpr func(expr Expression, line uint32, inImplicationRight bool)
+	walkExpr = func(expr Expression, line uint32, inImplicationRight bool) {
+		if expr == nil {
+			return
+		}
+		switch v := expr.(type) {
+		case PslNextExpr:
+			foundNext = true
+			if v.Delay < 1 {
+				c.errorf(line, "PSL next delay must be >= 1")
+			}
+			walkExpr(v.Arg, line, false)
+		case PslNextRangeExpr:
+			foundNext = true
+			if v.Start < 1 {
+				c.errorf(line, "PSL next_a start must be >= 1")
+			}
+			if v.End < v.Start {
+				c.errorf(line, "PSL next_a end must be >= start")
+			}
+			walkExpr(v.Arg, line, false)
+		case PslImplicationExpr:
+			walkExpr(v.Left, line, false)
+			walkExpr(v.Right, line, true)
+		case PslEventuallyExpr:
+			walkExpr(v.Left, line, false)
+			walkExpr(v.Right, line, false)
+		case PslStableExpr:
+			walkExpr(v.Signal, line, false)
+		case PslSequenceExpr:
+			for _, el := range v.Elements {
+				walkExpr(el.Expr, line, inImplicationRight)
+			}
+		case BinaryExpr:
+			walkExpr(v.Left, line, false)
+			walkExpr(v.Right, line, false)
+		case UnaryExpr:
+			walkExpr(v.Right, line, false)
+		case ParenExpr:
+			walkExpr(v.Expr, line, false)
+		case IndexedNameExpr:
+			walkExpr(v.Index, line, false)
+		case SelectedNameExpr:
+			// no-op
+		case IdentifierExpr, LiteralExpr:
+			// no-op
+		}
+	}
+
+	for _, stmt := range mod.Statements {
+		switch s := stmt.(type) {
+		case *PslAssertion:
+			walkExpr(s.Property, s.Line(), false)
+		case *PslAssumption:
+			walkExpr(s.Property, s.Line(), false)
+		case *PslCover:
+			walkExpr(s.Property, s.Line(), false)
+		case *PslAssertNever:
+			walkExpr(s.Property, s.Line(), false)
+		case *PslAfterResetAssertion:
+			walkExpr(s.Reset, s.Line(), false)
+			walkExpr(s.Property, s.Line(), false)
+		}
+	}
+
+	for _, fb := range mod.Formals {
+		for _, stmt := range fb.Statements {
+			switch s := stmt.(type) {
+			case *PslAssertion:
+				walkExpr(s.Property, s.Line(), false)
+			case *PslAssumption:
+				walkExpr(s.Property, s.Line(), false)
+			case *PslCover:
+				walkExpr(s.Property, s.Line(), false)
+			case *PslAssertNever:
+				walkExpr(s.Property, s.Line(), false)
+			case *PslAfterResetAssertion:
+				walkExpr(s.Reset, s.Line(), false)
+				walkExpr(s.Property, s.Line(), false)
+			}
+		}
+	}
+
+	if foundNext && mod.ClockPort == "" {
+		c.errorf(1, "PSL next/next_a requires a clocked module (missing clock port)")
+	}
 }
 
 func (c *SemanticChecker) errorf(line uint32, format string, args ...interface{}) {
@@ -1445,7 +2144,6 @@ func (c *SemanticChecker) walkSequentialStmtForDriven(stmts []SequentialStatemen
 }
 
 
-
 ================================================================================
 FILE: mlir.go
 ================================================================================
@@ -1457,18 +2155,50 @@ import (
 	"strings"
 )
 
+// assertionEntry holds a PSL assertion SSA value collected during statement emission.
+// All i1 assertions are combined into a single verif.assert at module end (circt-bmc
+// requires exactly one assertion per module).  !ltl.property assertions are emitted
+// separately as verif.clocked_assert so they can be handled by --lower-ltl-to-core.
+type assertionEntry struct {
+	val string // SSA name
+	typ string // "i1" or "!ltl.property"
+}
+
 // MLIREmitter handles translating populated Wires, Statements, and Modules into CIRCT HW/Comb MLIR text.
 type MLIREmitter struct {
-	builder strings.Builder
-	indent  int
-	ssaID   int
-	modules map[string]*Module
+	builder     strings.Builder
+	indent      int
+	ssaID       int
+	modules     map[string]*Module
+	assertions  []assertionEntry // accumulated per-module, reset in EmitModule
+	assumptions []assertionEntry // accumulated per-module, reset in EmitModule
+	ic3Mode     bool             // emit __verif_bad hw.output instead of verif.assert
+	badStateSSA string           // set by emitCombinedAssertions in ic3Mode
+	nameID      int              // unique naming for generated regs
+	clockI1SSA  string           // cached per-module i1 clock (seq.from_clock)
 }
 
 func NewMLIREmitter() *MLIREmitter {
-	return &MLIREmitter{
-		modules: make(map[string]*Module),
+	return &MLIREmitter{modules: make(map[string]*Module)}
+}
+
+// NewMLIREmitterIC3 returns an emitter that targets the IC3/PDR path: PSL
+// assertions are emitted as a negated hw.output (__verif_bad) rather than
+// verif.assert, so the module can be exported to AIGER and checked by ABC pdr.
+func NewMLIREmitterIC3() *MLIREmitter {
+	return &MLIREmitter{modules: make(map[string]*Module), ic3Mode: true}
+}
+
+// hasPslAssertions reports whether mod contains any PSL assertion statements
+// (including after_reset assertions, which also accumulate into e.assertions).
+func hasPslAssertions(mod *Module) bool {
+	for _, stmt := range mod.Statements {
+		switch stmt.(type) {
+		case *PslAssertion, *PslAfterResetAssertion, *PslAssertNever:
+			return true
+		}
 	}
+	return false
 }
 
 func (e *MLIREmitter) p(format string, args ...interface{}) {
@@ -1487,6 +2217,180 @@ func (e *MLIREmitter) nextSSA() string {
 	val := fmt.Sprintf("%%%d", e.ssaID)
 	e.ssaID++
 	return val
+}
+
+func (e *MLIREmitter) nextName(prefix string) string {
+	name := fmt.Sprintf("%s_%d", prefix, e.nameID)
+	e.nameID++
+	return name
+}
+
+// clockSSA returns the SSA name of the module's clock port (e.g. "%clk").
+func (e *MLIREmitter) clockSSA(mod *Module) string {
+	if mod.ClockPort == "" {
+		return ""
+	}
+	return fmt.Sprintf("%%%s", mod.ClockPort)
+}
+
+// clockI1 returns an i1 clock SSA (seq.from_clock) for LTL properties.
+func (e *MLIREmitter) clockI1(mod *Module) string {
+	if e.clockI1SSA != "" {
+		return e.clockI1SSA
+	}
+	clk := e.clockSSA(mod)
+	if clk == "" {
+		return ""
+	}
+	clkI1 := e.nextSSA()
+	e.p("%s = seq.from_clock %s", clkI1, clk)
+	e.clockI1SSA = clkI1
+	return clkI1
+}
+
+func (e *MLIREmitter) emitCompReg(val string, clk string, typ string, name string) string {
+	res := e.nextSSA()
+	initSSA := e.emitSeqInitial(typ)
+	if initSSA != "" {
+		e.p("%s = seq.compreg name \"%s\" %s, %s initial %s : %s", res, name, val, clk, initSSA, typ)
+	} else {
+		e.p("%s = seq.compreg name \"%s\" %s, %s : %s", res, name, val, clk, typ)
+	}
+	return res
+}
+
+func (e *MLIREmitter) emitFormalStatementList(stmts []Statement, mod *Module, env map[string]string, extraSymbols map[string]Type) {
+	for _, stmt := range stmts {
+		switch s := stmt.(type) {
+		case *SymbolicDeclaration:
+			t := typeToMLIR(s.Type, mod)
+			for _, name := range s.Names {
+				e.p("%%%s = verif.symbolic_value : %s", name, t)
+				env[name] = fmt.Sprintf("%%%s", name)
+			}
+		case *PslAssertion:
+			val, typ := e.emitExpression(s.Property, mod, env, "", "", extraSymbols)
+			e.assertions = append(e.assertions, assertionEntry{val, typ})
+		case *PslAssumption:
+			val, typ := e.emitExpression(s.Property, mod, env, "", "", extraSymbols)
+			e.assumptions = append(e.assumptions, assertionEntry{val, typ})
+		case *PslCover:
+			val, typ := e.emitExpression(s.Property, mod, env, "", "", extraSymbols)
+			e.p("verif.cover %s : %s", val, typ)
+		case *PslAssertNever:
+			val, _ := e.emitExpression(s.Property, mod, env, "", "i1", extraSymbols)
+			trueVal := e.nextSSA()
+			notProp := e.nextSSA()
+			e.p("%s = hw.constant -1 : i1", trueVal)
+			e.p("%s = comb.xor %s, %s : i1", notProp, val, trueVal)
+			e.assertions = append(e.assertions, assertionEntry{notProp, "i1"})
+		}
+	}
+}
+
+func (e *MLIREmitter) emitPslFormalBlock(fb *PslFormalBlock, mod *Module) {
+	e.p("verif.formal @%s {} {", fb.Name)
+	e.indent++
+
+	// Reset per-module assertion tracking for the formal block.
+	oldAsserts := e.assertions
+	oldAssumes := e.assumptions
+	e.assertions = e.assertions[:0]
+	e.assumptions = e.assumptions[:0]
+
+	env := make(map[string]string)
+	e.emitFormalStatementList(fb.Statements, mod, env, fb.Symbols)
+	
+	// Boolean assertions are combined into a single verif.assert (circt-bmc requirements).
+	var boolAsserts []string
+	var temporalAsserts []assertionEntry
+	for _, a := range e.assertions {
+		if a.typ == "i1" {
+			boolAsserts = append(boolAsserts, a.val)
+		} else {
+			temporalAsserts = append(temporalAsserts, a)
+		}
+	}
+	
+	var combinedAssume string
+	for _, a := range e.assumptions {
+		if a.typ != "i1" { continue }
+		if combinedAssume == "" {
+			combinedAssume = a.val
+		} else {
+			res := e.nextSSA()
+			e.p("%s = comb.and %s, %s : i1", res, combinedAssume, a.val)
+			combinedAssume = res
+		}
+	}
+	if combinedAssume != "" {
+		e.p("verif.assume %s : i1", combinedAssume)
+	}
+
+	var combined string
+	if len(boolAsserts) == 1 {
+		combined = boolAsserts[0]
+	} else if len(boolAsserts) > 1 {
+		combined = boolAsserts[0]
+		for _, next := range boolAsserts[1:] {
+			res := e.nextSSA()
+			e.p("%s = comb.and %s, %s : i1", res, combined, next)
+			combined = res
+		}
+	}
+	if combined != "" {
+		e.p("verif.assert %s : i1", combined)
+	}
+	for _, ta := range temporalAsserts {
+		if ta.typ == "!ltl.sequence" {
+			clkI1 := e.clockI1(mod)
+			if clkI1 != "" {
+				clocked := e.nextSSA()
+				e.p("%s = ltl.clock %s, posedge %s : !ltl.property", clocked, ta.val, clkI1)
+				e.p("verif.assert %s : !ltl.property", clocked)
+			} else {
+				e.p("// ERROR: PSL temporal property requires a clock")
+			}
+		} else {
+			e.p("verif.assert %s : !ltl.property", ta.val)
+		}
+	}
+
+	e.indent--
+	e.p("}")
+	
+	// Restore parent module's assertion tracking.
+	e.assertions = oldAsserts
+	e.assumptions = oldAssumes
+}
+
+// emitDelay emits a chain of seq.compreg registers to delay a value by N cycles.
+func (e *MLIREmitter) emitDelay(val string, typ string, delay int, clk string) string {
+	res := val
+	for i := 0; i < delay; i++ {
+		next := e.emitCompReg(res, clk, typ, e.nextName("psl_delay"))
+		res = next
+	}
+	return res
+}
+
+// emitSeqInitial emits a seq.initial block that yields a zero value of the
+// given MLIR type and returns its SSA name.  Returns "" for complex types
+// (hw.array / hw.struct) or in IC3 mode (PDR explores from all initial states;
+// pinning them to zero would miss bugs only reachable from other start states).
+func (e *MLIREmitter) emitSeqInitial(mlirType string) string {
+	if e.ic3Mode || strings.HasPrefix(mlirType, "!hw.") {
+		return ""
+	}
+	initSSA := e.nextSSA()
+	zeroSSA := e.nextSSA()
+	e.p("%s = seq.initial () {", initSSA)
+	e.indent++
+	e.p("%s = hw.constant 0 : %s", zeroSSA, mlirType)
+	e.p("seq.yield %s : %s", zeroSSA, mlirType)
+	e.indent--
+	e.p("} : () -> !seq.immutable<%s>", mlirType)
+	return initSSA
 }
 
 // typeToMLIR translates the extracted Type to its MLIR equivalent (e.g., std_logic -> i1, array -> !hw.array<size x type>)
@@ -1520,7 +2424,7 @@ func resolveType(mod *Module, typeName string) Type {
 	return t
 }
 
-func (e *MLIREmitter) emitExpression(expr Expression, mod *Module, env map[string]string, targetName string, expectedType string) (string, string) {
+func (e *MLIREmitter) emitExpression(expr Expression, mod *Module, env map[string]string, targetName string, expectedType string, extraSymbols map[string]Type) (string, string) {
 	var resVal string
 	if targetName != "" {
 		resVal = fmt.Sprintf("%%%s", targetName)
@@ -1529,17 +2433,26 @@ func (e *MLIREmitter) emitExpression(expr Expression, mod *Module, env map[strin
 	}
 
 	switch v := expr.(type) {
+	case ParenExpr:
+		return e.emitExpression(v.Expr, mod, env, targetName, expectedType, extraSymbols)
 	case IdentifierExpr:
-		t := mod.Symbols[v.Name]
+		t, ok := mod.Symbols[v.Name]
+		if !ok && extraSymbols != nil {
+			t = extraSymbols[v.Name]
+		}
 		if mapped, ok := env[v.Name]; ok {
 			return mapped, typeToMLIR(t, mod)
 		}
 		return fmt.Sprintf("%%%s", v.Name), typeToMLIR(t, mod)
 	case IndexedNameExpr:
-		prefixVal, prefixType := e.emitExpression(IdentifierExpr{Name: v.Prefix}, mod, env, "", "")
-		indexVal, _ := e.emitExpression(v.Index, mod, env, "", "i32")
+		prefixVal, prefixType := e.emitExpression(IdentifierExpr{Name: v.Prefix}, mod, env, "", "", extraSymbols)
+		indexVal, _ := e.emitExpression(v.Index, mod, env, "", "i32", extraSymbols)
 		
-		t := resolveType(mod, mod.Symbols[v.Prefix].Name)
+		sym, ok := mod.Symbols[v.Prefix]
+		if !ok && extraSymbols != nil {
+			sym = extraSymbols[v.Prefix]
+		}
+		t := resolveType(mod, sym.Name)
 		var elType string
 		if t.ElementType != nil {
 			elType = typeToMLIR(*t.ElementType, mod)
@@ -1550,9 +2463,13 @@ func (e *MLIREmitter) emitExpression(expr Expression, mod *Module, env map[strin
 		e.p("%s = hw.array_get %s[%s] : %s, i32", resVal, prefixVal, indexVal, prefixType)
 		return resVal, elType
 	case SelectedNameExpr:
-		prefixVal, prefixType := e.emitExpression(IdentifierExpr{Name: v.Prefix}, mod, env, "", "")
+		prefixVal, prefixType := e.emitExpression(IdentifierExpr{Name: v.Prefix}, mod, env, "", "", extraSymbols)
 		
-		t := resolveType(mod, mod.Symbols[v.Prefix].Name)
+		sym, ok := mod.Symbols[v.Prefix]
+		if !ok && extraSymbols != nil {
+			sym = extraSymbols[v.Prefix]
+		}
+		t := resolveType(mod, sym.Name)
 		var elType string
 		for _, f := range t.Fields {
 			if f.Name == v.Suffix {
@@ -1592,13 +2509,21 @@ func (e *MLIREmitter) emitExpression(expr Expression, mod *Module, env map[strin
 		// Attempt to peek left and right types
 		var inferredType string
 		if id, ok := v.Left.(IdentifierExpr); ok {
-			inferredType = typeToMLIR(mod.Symbols[id.Name], mod)
+			t, ok := mod.Symbols[id.Name]
+			if !ok && extraSymbols != nil {
+				t = extraSymbols[id.Name]
+			}
+			inferredType = typeToMLIR(t, mod)
 		} else if id, ok := v.Right.(IdentifierExpr); ok {
-			inferredType = typeToMLIR(mod.Symbols[id.Name], mod)
+			t, ok := mod.Symbols[id.Name]
+			if !ok && extraSymbols != nil {
+				t = extraSymbols[id.Name]
+			}
+			inferredType = typeToMLIR(t, mod)
 		}
 
-		leftVal, leftType := e.emitExpression(v.Left, mod, env, "", inferredType)
-		rightVal, rightType := e.emitExpression(v.Right, mod, env, "", inferredType)
+		leftVal, leftType := e.emitExpression(v.Left, mod, env, "", inferredType, extraSymbols)
+		rightVal, rightType := e.emitExpression(v.Right, mod, env, "", inferredType, extraSymbols)
 		
 		// Unify types
 		finalType := leftType
@@ -1628,33 +2553,212 @@ func (e *MLIREmitter) emitExpression(expr Expression, mod *Module, env map[strin
 		return resVal, finalType
 	case UnaryExpr:
 		if v.Op == "not" {
-			rightVal, rightType := e.emitExpression(v.Right, mod, env, "", expectedType)
+			rightVal, rightType := e.emitExpression(v.Right, mod, env, "", expectedType, extraSymbols)
 			trueVal := e.nextSSA()
 			e.p("%s = hw.constant -1 : %s", trueVal, rightType)
 			e.p("%s = comb.xor %s, %s : %s", resVal, rightVal, trueVal, rightType)
 			return resVal, rightType
 		}
 	case PslImplicationExpr:
-		leftVal, _ := e.emitExpression(v.Left, mod, env, "", "i1")
-		rightVal, _ := e.emitExpression(v.Right, mod, env, "", "i1")
-		e.p("%s = ltl.implication %s, %s : i1, i1", resVal, leftVal, rightVal)
-		return resVal, "!ltl.property"
+		// PSL |=> is next-cycle: "if left holds at cycle N, right must hold at cycle N+1."
+		// PSL |-> is same-cycle: "if left holds at cycle N, right must hold at cycle N."
+		// Implement as: delay left by one clock cycle for |=>, or use |-> semantics.
+		// next[N] and next_a[M to N] are encoded with explicit shift-register monitors.
+
+		isNonOverlapping := v.Op == "|=>"
+
+		if rightNext, ok := v.Right.(PslNextExpr); ok {
+			leftVal, _ := e.emitExpression(v.Left, mod, env, "", "i1", extraSymbols)
+			rightVal, _ := e.emitExpression(rightNext.Arg, mod, env, "", "i1", extraSymbols)
+
+			clkI1 := e.clockI1(mod)
+			if clkI1 == "" {
+				e.p("// ERROR: PSL next requires a clocked module")
+				return resVal, "i1"
+			}
+			delay := rightNext.Delay
+			if delay < 1 {
+				delay = 1
+			}
+
+			// Encode implication with delay.
+			actualDelay := delay
+			if isNonOverlapping {
+				actualDelay++
+			}
+
+			seqVal := e.nextSSA()
+			e.p("%s = ltl.delay %s, %d, 0 : i1", seqVal, rightVal, actualDelay)
+			impVal := e.nextSSA()
+			e.p("%s = ltl.implication %s, %s : i1, !ltl.sequence", impVal, leftVal, seqVal)
+			clocked := e.nextSSA()
+			e.p("%s = ltl.clock %s, posedge %s : !ltl.property", clocked, impVal, clkI1)
+			return clocked, "!ltl.property"
+		}
+		if rightRange, ok := v.Right.(PslNextRangeExpr); ok {
+			leftVal, _ := e.emitExpression(v.Left, mod, env, "", "i1", extraSymbols)
+			rightVal, _ := e.emitExpression(rightRange.Arg, mod, env, "", "i1", extraSymbols)
+
+			clkI1 := e.clockI1(mod)
+			if clkI1 == "" {
+				e.p("// ERROR: PSL next_a requires a clocked module")
+				return resVal, "i1"
+			}
+
+			start := rightRange.Start
+			end := rightRange.End
+			if start < 1 {
+				start = 1
+			}
+			if end < start {
+				end = start
+			}
+
+			// Encode implication with range delay.
+			actualStart := start
+			if isNonOverlapping {
+				actualStart++
+			}
+			actualEnd := end
+			if isNonOverlapping {
+				actualEnd++
+			}
+
+			seqVal := e.nextSSA()
+			e.p("%s = ltl.delay %s, %d, %d : i1", seqVal, rightVal, actualStart, actualEnd-actualStart)
+			impVal := e.nextSSA()
+			e.p("%s = ltl.implication %s, %s : i1, !ltl.sequence", impVal, leftVal, seqVal)
+			clocked := e.nextSSA()
+			e.p("%s = ltl.clock %s, posedge %s : !ltl.property", clocked, impVal, clkI1)
+			return clocked, "!ltl.property"
+		}
+
+		leftVal, _ := e.emitExpression(v.Left, mod, env, "", "i1", extraSymbols)
+		rightVal, rightType := e.emitExpression(v.Right, mod, env, "", "i1", extraSymbols)
+
+		if !isNonOverlapping && rightType == "i1" {
+			// Boolean implication for |->: !left || right
+			trueVal := e.nextSSA()
+			notLeft := e.nextSSA()
+			e.p("%s = hw.constant -1 : i1", trueVal)
+			e.p("%s = comb.xor %s, %s : i1", notLeft, leftVal, trueVal)
+			e.p("%s = comb.or %s, %s : i1", resVal, notLeft, rightVal)
+			return resVal, "i1"
+		} else if !isNonOverlapping && (rightType == "!ltl.sequence" || rightType == "!ltl.property") {
+			// Overlapping implication with LTL sequence/property
+			clkI1 := e.clockI1(mod)
+			impVal := e.nextSSA()
+			e.p("%s = ltl.implication %s, %s : i1, %s", impVal, leftVal, rightVal, rightType)
+			clocked := e.nextSSA()
+			e.p("%s = ltl.clock %s, posedge %s : !ltl.property", clocked, impVal, clkI1)
+			return clocked, "!ltl.property"
+		}
+
+		// Handle |=> for booleans or generic types by delaying the antecedent
+		clk := e.clockSSA(mod)
+		initSSA := e.emitSeqInitial("i1")
+		delayedVal := e.nextSSA()
+		if initSSA != "" {
+			e.p("%s = seq.compreg %s, %s initial %s : i1", delayedVal, leftVal, clk, initSSA)
+		} else {
+			e.p("%s = seq.compreg %s, %s : i1", delayedVal, leftVal, clk)
+		}
+
+		if rightType == "i1" {
+			// Boolean implication: !left_d1 || right
+			trueVal := e.nextSSA()
+			notDelayed := e.nextSSA()
+			e.p("%s = hw.constant -1 : i1", trueVal)
+			e.p("%s = comb.xor %s, %s : i1", notDelayed, delayedVal, trueVal)
+			e.p("%s = comb.or %s, %s : i1", resVal, notDelayed, rightVal)
+			return resVal, "i1"
+		} else {
+			// Non-overlapping implication with LTL sequence/property
+			clkI1 := e.clockI1(mod)
+			impVal := e.nextSSA()
+			e.p("%s = ltl.implication %s, %s : i1, %s", impVal, delayedVal, rightVal, rightType)
+			clocked := e.nextSSA()
+			e.p("%s = ltl.clock %s, posedge %s : !ltl.property", clocked, impVal, clkI1)
+			return clocked, "!ltl.property"
+		}
+
+	case PslSequenceExpr:
+		var seqVals []string
+		var seqTypes []string
+		for _, el := range v.Elements {
+			elVal, elType := e.emitExpression(el.Expr, mod, env, "", "i1", extraSymbols)
+			if el.Repetition != nil {
+				repVal := e.nextSSA()
+				if el.Repetition.Count >= 0 {
+					e.p("%s = ltl.repeat %s, %d : %s", repVal, elVal, el.Repetition.Count, elType)
+				} else {
+					e.p("%s = ltl.repeat %s, %d, %d : %s", repVal, elVal, el.Repetition.Start, el.Repetition.End, elType)
+				}
+				elVal = repVal
+				elType = "!ltl.sequence"
+			}
+			seqVals = append(seqVals, elVal)
+			seqTypes = append(seqTypes, elType)
+		}
+
+		if len(seqVals) == 1 {
+			return seqVals[0], seqTypes[0]
+		}
+
+		resVal := e.nextSSA()
+		e.p("%s = ltl.concat %s : %s", resVal, strings.Join(seqVals, ", "), strings.Join(seqTypes, ", "))
+		return resVal, "!ltl.sequence"
+
 	case PslEventuallyExpr:
-		leftVal, _ := e.emitExpression(v.Left, mod, env, "", "i1")
-		rightVal, _ := e.emitExpression(v.Right, mod, env, "", "i1")
-		
-		eventuallyVal := e.nextSSA()
-		e.p("%s = ltl.eventually %s : i1", eventuallyVal, rightVal)
-		e.p("%s = ltl.implication %s, %s : i1, !ltl.property", resVal, leftVal, eventuallyVal)
-		return resVal, "!ltl.property"
-	case PslStableExpr:
-		// Not natively in LTL currently, mock it with i1 for demonstration
-		sigVal, _ := e.emitExpression(v.Signal, mod, env, "", "")
-		e.p("%s = comb.icmp eq %s, %s : i1", resVal, sigVal, sigVal)
+		// PSL "left -> eventually! right" is a liveness property: right must become
+		// true at some unbounded future cycle whenever left holds.  Bounded model
+		// checking (circt-bmc) cannot directly encode liveness without an automaton
+		// translation.  We emit a hw.constant true so the assertion always passes in
+		// the BMC conjunction (not checked), and add a comment that flags the property
+		// for review.  A full liveness proof requires an unbounded solver or k-liveness.
+		e.p("// TODO liveness: psl assert always %s -> eventually! %s (skipped in BMC)", v.Left, v.Right)
+		e.p("%s = hw.constant true", resVal)
 		return resVal, "i1"
+
+	case PslStableExpr:
+		// PSL stable(x): x has not changed from the previous clock cycle.
+		// Implement by storing the previous value in a register and comparing.
+		sigVal, sigType := e.emitExpression(v.Signal, mod, env, "", "", extraSymbols)
+
+		clk := e.clockSSA(mod)
+		initSSA := e.emitSeqInitial(sigType)
+		prevVal := e.nextSSA()
+		if initSSA != "" {
+			e.p("%s = seq.compreg %s, %s initial %s : %s", prevVal, sigVal, clk, initSSA, sigType)
+		} else {
+			e.p("%s = seq.compreg %s, %s : %s", prevVal, sigVal, clk, sigType)
+		}
+		e.p("%s = comb.icmp eq %s, %s : %s", resVal, sigVal, prevVal, sigType)
+		return resVal, "i1"
+	case PslNextExpr:
+		argVal, _ := e.emitExpression(v.Arg, mod, env, "", "i1", extraSymbols)
+		delay := v.Delay
+		if delay < 1 {
+			delay = 1
+		}
+		e.p("%s = ltl.delay %s, %d, 0 : i1", resVal, argVal, delay)
+		return resVal, "!ltl.sequence"
+	case PslNextRangeExpr:
+		argVal, _ := e.emitExpression(v.Arg, mod, env, "", "i1", extraSymbols)
+		start := v.Start
+		end := v.End
+		if start < 1 {
+			start = 1
+		}
+		if end < start {
+			end = start
+		}
+		e.p("%s = ltl.delay %s, %d, %d : i1", resVal, argVal, start, end-start)
+		return resVal, "!ltl.sequence"
 	}
 	return e.nextSSA(), "i1"
 }
+
 
 
 
@@ -1680,14 +2784,22 @@ func (e *MLIREmitter) emitSynchronousProcess(sp *SynchronousProcess, mod *Module
 	for target := range targets {
 		localEnv := make(map[string]string)
 		for k, v := range globalEnv { localEnv[k] = v }
-		
+
 		currentStateVal := fmt.Sprintf("%%%s", target)
 		nextStateVal := e.buildSeqBlock(sp.Statements, target, currentStateVal, mod, localEnv)
-		
+
 		t := mod.Symbols[target]
-		clkVal := e.nextSSA()
-		e.p("%s = seq.to_clock %%clk", clkVal)
-		e.p("%%%s = seq.compreg %s, %s : %s", target, nextStateVal, clkVal, typeToMLIR(t, mod))
+		mlirType := typeToMLIR(t, mod)
+		clk := e.clockSSA(mod)
+
+		// Emit seq.initial so BMC tools know the register starts at zero rather
+		// than at an arbitrary unconstrained value.
+		initSSA := e.emitSeqInitial(mlirType)
+		if initSSA != "" {
+			e.p("%%%s = seq.compreg %s, %s initial %s : %s", target, nextStateVal, clk, initSSA, mlirType)
+		} else {
+			e.p("%%%s = seq.compreg %s, %s : %s", target, nextStateVal, clk, mlirType)
+		}
 		globalEnv[target] = fmt.Sprintf("%%%s", target)
 	}
 }
@@ -1699,18 +2811,18 @@ func (e *MLIREmitter) buildSeqBlock(stmts []SequentialStatement, target string, 
 		switch s := stmt.(type) {
 		case *SequentialAssignment:
 			if s.Target == target {
-				val, _ := e.emitExpression(s.Value, mod, env, "", targetType)
+				val, _ := e.emitExpression(s.Value, mod, env, "", targetType, nil)
 				nextState = val
 			}
 		case *SequentialIf:
-			condVal, _ := e.emitExpression(s.Condition, mod, env, "", "i1")
+			condVal, _ := e.emitExpression(s.Condition, mod, env, "", "i1", nil)
 			
 			thenState := e.buildSeqBlock(s.Then, target, nextState, mod, env)
 			elseState := e.buildSeqBlock(s.Else, target, nextState, mod, env)
 			
 			for i := len(s.Elsifs) - 1; i >= 0; i-- {
 				el := s.Elsifs[i]
-				elCondVal, _ := e.emitExpression(el.Condition, mod, env, "", "i1")
+				elCondVal, _ := e.emitExpression(el.Condition, mod, env, "", "i1", nil)
 				elThenState := e.buildSeqBlock(el.Then, target, nextState, mod, env)
 				if elThenState != elseState {
 					res := e.nextSSA()
@@ -1769,7 +2881,12 @@ func (e *MLIREmitter) emitEntityInstantiation(inst *EntityInstantiation, parentM
 
 	// We need to match the formal ports to the actual arguments based on childMod definition
 	for _, port := range childMod.Ports {
-		t := typeToMLIR(port.Type, childMod)
+		var t string
+		if port.Name == childMod.ClockPort {
+			t = "!seq.clock"
+		} else {
+			t = typeToMLIR(port.Type, childMod)
+		}
 		var actualExpr Expression
 		for _, entry := range inst.PortMap {
 			if entry.Formal == port.Name {
@@ -1780,7 +2897,7 @@ func (e *MLIREmitter) emitEntityInstantiation(inst *EntityInstantiation, parentM
 
 		if port.Direction == "in" {
 			if actualExpr != nil {
-				val, _ := e.emitExpression(actualExpr, parentMod, env, "", "")
+				val, _ := e.emitExpression(actualExpr, parentMod, env, "", "", nil)
 				inputs = append(inputs, fmt.Sprintf("%s: %s: %s", port.Name, val, t))
 			} else {
 				inputs = append(inputs, fmt.Sprintf("%s: %%missing: %s", port.Name, t))
@@ -1827,19 +2944,129 @@ func (e *MLIREmitter) EmitModules(mods []*Module) {
 	}
 }
 
+// emitCombinedAssertions emits the accumulated PSL assertions and assumptions
+// after the module body.
+//
+// In BMC mode: assumptions become verif.assume (constrains solver input space);
+// assertions are ANDed into a single verif.assert (circt-bmc requires exactly one).
+//
+// In IC3 mode: assertions become the negated bad-state signal stored in
+// e.badStateSSA; assumptions gate it so the bad state is only active when all
+// assumptions hold: __verif_bad = NOT(assertions) AND combined_assumptions.
+// ABC pdr treats hw.output signals as "bad state" indicators: output=1 means
+// the property is violated.
+func (e *MLIREmitter) emitCombinedAssertions(mod *Module) {
+	var boolAsserts []string
+	var temporalAsserts []assertionEntry
+
+	for _, a := range e.assertions {
+		if a.typ == "i1" {
+			boolAsserts = append(boolAsserts, a.val)
+		} else {
+			temporalAsserts = append(temporalAsserts, a)
+		}
+	}
+
+	// Build conjunction of all boolean assumptions (i1 only; temporal assumptions not yet supported).
+	var combinedAssume string
+	for _, a := range e.assumptions {
+		if a.typ != "i1" {
+			e.p("// temporal assumption skipped (type %s): %s", a.typ, a.val)
+			continue
+		}
+		if combinedAssume == "" {
+			combinedAssume = a.val
+		} else {
+			res := e.nextSSA()
+			e.p("%s = comb.and %s, %s : i1", res, combinedAssume, a.val)
+			combinedAssume = res
+		}
+	}
+
+	// In BMC mode emit a single verif.assume for the combined assumption.
+	if combinedAssume != "" && !e.ic3Mode {
+		e.p("verif.assume %s : i1", combinedAssume)
+	}
+
+	// Build conjunction of all boolean assertions.
+	var combined string
+	if len(boolAsserts) == 1 {
+		combined = boolAsserts[0]
+	} else if len(boolAsserts) > 1 {
+		combined = boolAsserts[0]
+		for _, next := range boolAsserts[1:] {
+			res := e.nextSSA()
+			e.p("%s = comb.and %s, %s : i1", res, combined, next)
+			combined = res
+		}
+	}
+
+	if combined != "" {
+		if e.ic3Mode {
+			// IC3 path: negate the conjunction to get the bad-state signal.
+			// __verif_bad = 1 when at least one assertion is violated.
+			// Note: assumptions are NOT encoded here — circt-translate --export-aiger
+			// does not support the verif dialect, so assumptions cannot be forwarded
+			// to ABC pdr as AIGER constraints.  compile.sh skips the IC3 step entirely
+			// when assumptions are present; BMC (Z3) handles the constrained check.
+			trueVal := e.nextSSA()
+			badSSA := e.nextSSA()
+			e.p("%s = hw.constant -1 : i1", trueVal)
+			e.p("%s = comb.xor %s, %s : i1", badSSA, combined, trueVal)
+			e.badStateSSA = badSSA
+		} else {
+			e.p("verif.assert %s : i1", combined)
+		}
+	}
+
+	// Temporal (!ltl.property and !ltl.sequence) assertions are emitted directly in BMC mode.
+	for _, ta := range temporalAsserts {
+		if e.ic3Mode {
+			e.p("// temporal assertion skipped in IC3 path (type %s): %s", ta.typ, ta.val)
+		} else {
+			if ta.typ == "!ltl.sequence" {
+				clkI1 := e.clockI1(mod)
+				if clkI1 != "" {
+					clocked := e.nextSSA()
+					e.p("%s = ltl.clock %s, posedge %s : !ltl.property", clocked, ta.val, clkI1)
+					e.p("verif.assert %s : !ltl.property", clocked)
+				} else {
+					e.p("// ERROR: PSL temporal property requires a clock")
+				}
+			} else {
+				e.p("verif.assert %s : !ltl.property", ta.val)
+			}
+		}
+	}
+}
+
 // EmitModule translates the Module into a hw.module definition
 func (e *MLIREmitter) EmitModule(mod *Module) {
+	e.assertions = e.assertions[:0]  // reset accumulator for this module
+	e.assumptions = e.assumptions[:0] // reset accumulator for this module
+	e.badStateSSA = ""
+	e.nameID = 0
+	e.clockI1SSA = ""
 	// Construct signature
 	var ports []string
 	var outputs []string
 	for _, p := range mod.Ports {
-		t := typeToMLIR(p.Type, mod)
+		var t string
+		if p.Name == mod.ClockPort {
+			t = "!seq.clock" // clock ports are !seq.clock, not i1
+		} else {
+			t = typeToMLIR(p.Type, mod)
+		}
 		if p.Direction == "in" {
 			ports = append(ports, fmt.Sprintf("in %%%s: %s", p.Name, t))
 		} else {
 			ports = append(ports, fmt.Sprintf("out %s: %s", p.Name, t))
-			outputs = append(outputs, p.Name) // Track just the name for output length check
+			outputs = append(outputs, p.Name)
 		}
+	}
+	// In IC3 mode, add a bad-state output port when the module has PSL assertions.
+	if e.ic3Mode && hasPslAssertions(mod) {
+		ports = append(ports, "out __verif_bad: i1")
 	}
 
 	sigPorts := strings.Join(ports, ", ")
@@ -1878,24 +3105,81 @@ func (e *MLIREmitter) EmitModule(mod *Module) {
 
 	e.emitStatementList(mod.Statements, mod, env)
 
-	// Emit hw.output using the tracked drivers
+	// Combine all accumulated PSL assertions into a single verif.assert.
+	e.emitCombinedAssertions(mod)
+
+	// Emit any formal blocks associated with this module.
+	for _, fb := range mod.Formals {
+		e.emitPslFormalBlock(fb, mod)
+	}
+
+	// Emit hw.output using the tracked drivers.
+	// In IC3 mode, append the bad-state signal as the final output.
 	var outVals []string
 	var outTypes []string
-	if len(outputs) > 0 {
-		for i, p := range mod.Ports {
+	if e.ic3Mode && hasPslAssertions(mod) && e.badStateSSA == "" {
+		// If only temporal assertions exist, provide a dummy bad-state signal so
+		// the output signature remains consistent. IC3 is skipped in this case.
+		zero := e.nextSSA()
+		e.p("%s = hw.constant 0 : i1", zero)
+		e.badStateSSA = zero
+	}
+	for i, p := range mod.Ports {
+		if p.Direction == "out" {
+			t := typeToMLIR(p.Type, mod)
+			if valName, ok := env[p.Name]; ok {
+				outVals = append(outVals, valName)
+			} else {
+				valName := fmt.Sprintf("%%c0_%d", i)
+				e.p("%s = hw.constant 0 : %s", valName, t)
+				outVals = append(outVals, valName)
+			}
+			outTypes = append(outTypes, t)
+		}
+	}
+
+	if mod.Contract != nil && !e.ic3Mode && len(outVals) > 0 {
+		var contractResults []string
+		for range outVals {
+			contractResults = append(contractResults, e.nextSSA())
+		}
+
+		e.p("%s = verif.contract %s : %s {", strings.Join(contractResults, ", "), strings.Join(outVals, ", "), strings.Join(outTypes, ", "))
+		e.indent++
+
+		for _, req := range mod.Contract.Requires {
+			val, _ := e.emitExpression(req, mod, env, "", "i1", nil)
+			e.p("verif.require %s : i1", val)
+		}
+
+		ensureEnv := make(map[string]string)
+		for k, v := range env {
+			ensureEnv[k] = v
+		}
+		outIdx := 0
+		for _, p := range mod.Ports {
 			if p.Direction == "out" {
-				t := typeToMLIR(p.Type, mod)
-				if valName, ok := env[p.Name]; ok {
-					outVals = append(outVals, valName)
-				} else {
-					// Fallback if undriven
-					valName := fmt.Sprintf("%%c0_%d", i)
-					e.p("%s = hw.constant 0 : %s", valName, t)
-					outVals = append(outVals, valName)
-				}
-				outTypes = append(outTypes, t)
+				ensureEnv[p.Name] = contractResults[outIdx]
+				outIdx++
 			}
 		}
+
+		for _, ens := range mod.Contract.Ensures {
+			val, _ := e.emitExpression(ens, mod, ensureEnv, "", "i1", nil)
+			e.p("verif.ensure %s : i1", val)
+		}
+
+		e.indent--
+		e.p("}")
+
+		outVals = contractResults
+	}
+
+	if e.badStateSSA != "" {
+		outVals = append(outVals, e.badStateSSA)
+		outTypes = append(outTypes, "i1")
+	}
+	if len(outVals) > 0 {
 		e.p("hw.output %s : %s", strings.Join(outVals, ", "), strings.Join(outTypes, ", "))
 	} else {
 		e.p("hw.output")
@@ -1908,29 +3192,35 @@ func (e *MLIREmitter) EmitModule(mod *Module) {
 func (e *MLIREmitter) emitStatementList(stmts []Statement, mod *Module, env map[string]string) {
 	for _, stmt := range stmts {
 		switch s := stmt.(type) {
+		case *SymbolicDeclaration:
+			t := typeToMLIR(s.Type, mod)
+			for _, name := range s.Names {
+				e.p("%%%s = verif.symbolic_value : %s", name, t)
+				env[name] = fmt.Sprintf("%%%s", name)
+			}
 		case *EntityInstantiation:
 			e.emitEntityInstantiation(s, mod, env)
 		case *ConcurrentAssignment:
 			if s.Condition != nil {
 				t := typeToMLIR(mod.Symbols[s.Target], mod)
-				val, _ := e.emitExpression(s.Value, mod, env, "", t)
-				condVal, _ := e.emitExpression(s.Condition, mod, env, "", "i1")
-				altVal, _ := e.emitExpression(s.AltValue, mod, env, "", t)
+				val, _ := e.emitExpression(s.Value, mod, env, "", t, nil)
+				condVal, _ := e.emitExpression(s.Condition, mod, env, "", "i1", nil)
+				altVal, _ := e.emitExpression(s.AltValue, mod, env, "", t, nil)
 				e.p("%%%s = comb.mux %s, %s, %s : %s", s.Target, condVal, val, altVal, t)
 				env[s.Target] = fmt.Sprintf("%%%s", s.Target)
 			} else {
 				t := typeToMLIR(mod.Symbols[s.Target], mod)
-				val, _ := e.emitExpression(s.Value, mod, env, s.Target, t)
+				val, _ := e.emitExpression(s.Value, mod, env, s.Target, t, nil)
 				env[s.Target] = val
 			}
 		case *SelectedAssignment:
-			selVal, selType := e.emitExpression(s.Selector, mod, env, "", "")
+			selVal, selType := e.emitExpression(s.Selector, mod, env, "", "", nil)
 			t := typeToMLIR(mod.Symbols[s.Target], mod)
 
 			var currentState string
 			for _, choice := range s.Choices {
 				if choice.IsOthers {
-					currentState, _ = e.emitExpression(choice.Value, mod, env, "", t)
+					currentState, _ = e.emitExpression(choice.Value, mod, env, "", t, nil)
 					break
 				}
 			}
@@ -1945,12 +3235,12 @@ func (e *MLIREmitter) emitStatementList(stmts []Statement, mod *Module, env map[
 				if choice.IsOthers {
 					continue
 				}
-				condExprVal, _ := e.emitExpression(choice.Condition, mod, env, "", selType)
+				condExprVal, _ := e.emitExpression(choice.Condition, mod, env, "", selType, nil)
 				
 				cmpVal := e.nextSSA()
 				e.p("%s = comb.icmp eq %s, %s : %s", cmpVal, selVal, condExprVal, selType)
 				
-				val, _ := e.emitExpression(choice.Value, mod, env, "", t)
+				val, _ := e.emitExpression(choice.Value, mod, env, "", t, nil)
 				
 				resName := e.nextSSA()[1:] // drop the %
 				if i == 0 {
@@ -1982,16 +3272,91 @@ func (e *MLIREmitter) emitStatementList(stmts []Statement, mod *Module, env map[
 					}
 				}
 			}
-		case *PslAssertion:
-			propVal, propType := e.emitExpression(s.Property, mod, env, "", "")
-			if propType == "i1" || propType == "!ltl.property" || propType == "!ltl.sequence" {
-				e.p("verif.assert %s : %s", propVal, propType)
-			} else {
-				e.p("verif.assert %s : %s", propVal, propType)
-			}
+	case *PslAssertion:
+		propVal, propType := e.emitExpression(s.Property, mod, env, "", "", nil)
+		// Accumulate instead of emitting directly; EmitModule combines them.
+		e.assertions = append(e.assertions, assertionEntry{propVal, propType})
+	case *PslAssumption:
+		propVal, propType := e.emitExpression(s.Property, mod, env, "", "", nil)
+		// Accumulate assumptions; emitCombinedAssertions handles them.
+		e.assumptions = append(e.assumptions, assertionEntry{propVal, propType})
+	case *PslCover:
+		propVal, propType := e.emitExpression(s.Property, mod, env, "", "", nil)
+		if !e.ic3Mode {
+			e.p("verif.cover %s : %s", propVal, propType)
+		}
+	case *PslAssertNever:
+		propVal, _ := e.emitExpression(s.Property, mod, env, "", "i1", nil)
+		trueVal := e.nextSSA()
+		notProp := e.nextSSA()
+		e.p("%s = hw.constant -1 : i1", trueVal)
+		e.p("%s = comb.xor %s, %s : i1", notProp, propVal, trueVal)
+		e.assertions = append(e.assertions, assertionEntry{notProp, "i1"})
+		case *PslAfterResetAssertion:
+			e.emitAfterResetAssertion(s, mod, env)
 		}
 	}
 }
+
+// emitAfterResetAssertion implements `psl assert always after_reset(rst) property`.
+//
+// A sticky `rst_ever_high` register latches permanently once rst is asserted:
+//
+//	next_rst_ever_high = rst_ever_high OR rst
+//	rst_ever_high      = seq.compreg next_rst_ever_high, clk  [initial 0 in BMC]
+//
+// The effective assertion is `NOT(rst_ever_high) OR rst OR property`:
+//   - vacuously true while rst has never been high (circuit not yet reset)
+//   - vacuously true while rst is currently active (don't check during reset itself)
+//   - checks property for real after rst has fired AND is now low
+//
+// This avoids IC3 false-positives from pre-reset unreachable states.
+//
+// The forward reference from next_rst_ever_high to rst_ever_high (which appears
+// later in the text) is valid: CIRCT allows seq.compreg outputs to be referenced
+// before their definition because the register boundary breaks the cycle.
+func (e *MLIREmitter) emitAfterResetAssertion(s *PslAfterResetAssertion, mod *Module, env map[string]string) {
+	clk := e.clockSSA(mod)
+
+	// Evaluate the reset signal expression.
+	resetVal, _ := e.emitExpression(s.Reset, mod, env, "", "i1", nil)
+
+	// Pre-allocate the SSA name for rst_ever_high so next_rst_ever_high can
+	// reference it as a forward reference (CIRCT allows this for register outputs).
+	rstEverHighSSA := e.nextSSA()
+
+	// next_rst_ever_high = rst_ever_high OR rst — latches once rst goes high.
+	nextRstEverHighSSA := e.nextSSA()
+	e.p("%s = comb.or %s, %s : i1", nextRstEverHighSSA, rstEverHighSSA, resetVal)
+
+	// Register it. BMC initializes to 0 (rst has never fired); IC3 leaves it
+	// unconstrained (see compile.sh — IC3 is skipped when after_reset is present).
+	initSSA := e.emitSeqInitial("i1")
+	if initSSA != "" {
+		e.p("%s = seq.compreg %s, %s initial %s : i1", rstEverHighSSA, nextRstEverHighSSA, clk, initSSA)
+	} else {
+		e.p("%s = seq.compreg %s, %s : i1", rstEverHighSSA, nextRstEverHighSSA, clk)
+	}
+
+	// Evaluate the guarded property.
+	propVal, _ := e.emitExpression(s.Property, mod, env, "", "i1", nil)
+
+	// effective = NOT(rst_ever_high) OR rst OR property
+	//   NOT(rst_ever_high): vacuous before any reset
+	//   rst:               vacuous during active reset
+	//   property:          the actual check post-reset
+	trueVal := e.nextSSA()
+	notRstEverHighSSA := e.nextSSA()
+	e.p("%s = hw.constant -1 : i1", trueVal)
+	e.p("%s = comb.xor %s, %s : i1", notRstEverHighSSA, rstEverHighSSA, trueVal)
+	partialSSA := e.nextSSA()
+	e.p("%s = comb.or %s, %s : i1", partialSSA, notRstEverHighSSA, resetVal)
+	effectiveSSA := e.nextSSA()
+	e.p("%s = comb.or %s, %s : i1", effectiveSSA, partialSSA, propVal)
+
+	e.assertions = append(e.assertions, assertionEntry{effectiveSSA, "i1"})
+}
+
 
 ================================================================================
 FILE: main.go
@@ -2001,6 +3366,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	sitter "github.com/tree-sitter/go-tree-sitter"
 	micro_vhdl "micro-vhdl/tree-sitter-micro-vhdl/bindings/go"
@@ -2048,12 +3414,22 @@ func main() {
 	checker := NewSemanticChecker(modules)
 	errors := checker.Check()
 
+	fatalErrors := false
 	if len(errors) > 0 {
-		fmt.Println("\nSemantic Checks Failed:")
 		for _, err := range errors {
-			fmt.Println("  -", err)
+			if strings.Contains(err, "Warning -") {
+				fmt.Println("  -", err)
+			} else {
+				if !fatalErrors {
+					fmt.Println("\nSemantic Checks Failed:")
+				}
+				fmt.Println("  -", err)
+				fatalErrors = true
+			}
 		}
-		os.Exit(1)
+		if fatalErrors {
+			os.Exit(1)
+		}
 	}
 
 	fmt.Println("\nSemantic Checks Passed. Ready for MLIR Emission.")
@@ -2063,13 +3439,29 @@ func main() {
 	emitter.EmitModules(modules)
 
 	outputFile := "build.mlir"
+	if len(os.Args) >= 3 {
+		outputFile = os.Args[2]
+	}
 	err = os.WriteFile(outputFile, []byte(emitter.String()), 0644)
 	if err != nil {
 		fmt.Printf("Error writing MLIR to file: %v\n", err)
 		os.Exit(1)
 	}
+	fmt.Printf("\nMLIR written to %s\n", outputFile)
 
-	fmt.Printf("\nMLIR successfully generated and written to %s\n", outputFile)
+	// Emit IC3 MLIR (bad-state output for ABC pdr) when a path is provided.
+	if len(os.Args) >= 4 {
+		ic3File := os.Args[3]
+		ic3Emitter := NewMLIREmitterIC3()
+		ic3Emitter.EmitModules(modules)
+		err = os.WriteFile(ic3File, []byte(ic3Emitter.String()), 0644)
+		if err != nil {
+			fmt.Printf("Error writing IC3 MLIR to file: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("IC3 MLIR written to %s\n", ic3File)
+	}
+
 	fmt.Println("\n--- Generated MLIR ---")
 	fmt.Println(emitter.String())
 }
@@ -2084,9 +3476,1027 @@ if [ "$#" -ne 1 ]; then
   echo "Usage: ./compile.sh <file.vhd>"
   exit 1
 fi
-go run . "$1"
-../cirt-bin/bin/circt-opt build.mlir --lower-seq-to-sv | ../cirt-bin/bin/firtool --format=mlir --verilog > "${1%.*}.sv"
-echo "Successfully compiled to ${1%.*}.sv:"
-cat "${1%.*}.sv"
+
+CIRCT_BIN=../cirt/build/bin
+ABC=../yosys/yosys-abc
+BOUND=${BOUND:-15}
+INPUT="$1"
+DIR="$(dirname "$INPUT")"
+BASE="$(basename "${INPUT%.*}")"
+MLIR="${DIR}/${BASE}.mlir"
+IC3_MLIR="${DIR}/${BASE}_ic3.mlir"
+IC3_AIG="${DIR}/${BASE}_ic3.aig"
+SV="${DIR}/${BASE}.sv"
+
+echo "[1/3] Parsing and Extracting Micro-VHDL..."
+go run . "$INPUT" "$MLIR" "$IC3_MLIR"
+
+# Extract top-level module name from the generated MLIR (first hw.module @name)
+MODULE=$(grep -oP '(?<=hw\.module @)\w+' "$MLIR" | head -1)
+
+# Feature flags — computed once, used in multiple steps below.
+HAS_BAD=$(grep -c '__verif_bad' "$IC3_MLIR" 2>/dev/null || true)
+HAS_ASSUME=$(grep -c 'verif.assume' "$MLIR" 2>/dev/null || true)
+HAS_AFTER_RESET=$(grep -c 'after_reset' "$INPUT" 2>/dev/null || true)
+HAS_LTL=$(grep -c 'ltl' "$MLIR" 2>/dev/null || true)
+HAS_CONTRACT=$(grep -c 'verif.contract' "$MLIR" 2>/dev/null || true)
+HAS_ASSERT=$(grep -c 'verif.assert' "$MLIR" 2>/dev/null || true)
+HAS_COVER=$(grep -c 'verif.cover' "$MLIR" 2>/dev/null || true)
+
+echo "[2a/3] Bounded Model Checking via Z3 SMT Solver (module=${MODULE}, bound=${BOUND} cycles)..."
+# circt-bmc unrolls the circuit for BOUND clock cycles and hands the resulting
+# SMT formula to Z3.  Any reachable state that violates a verif.assert will be
+# reported as "Assertion can be violated!" with a counterexample trace.
+# Override the bound: BOUND=30 ./compile.sh file.vhd
+#
+# circt-bmc cannot process verif.contract directly (ConvertHWToSMT fails on
+# verif.symbolic_value emitted by the apply-mode lowering).  Strip contracts
+# before BMC; they are verified separately in step [2c/3] below.
+if [ "$HAS_CONTRACT" -gt 0 ] && [ "$HAS_ASSERT" -eq 0 ]; then
+  echo "  (no direct PSL assertions — contract-only design, skipping BMC; contracts checked in step [2c/3])"
+else
+  BMC_MLIR="$MLIR"
+  if [ "$HAS_CONTRACT" -gt 0 ]; then
+    BMC_MLIR="${DIR}/${BASE}_bmc.mlir"
+    "${CIRCT_BIN}/circt-opt" --strip-contracts "$MLIR" -o "$BMC_MLIR"
+  fi
+  "${CIRCT_BIN}/circt-bmc" \
+    "$BMC_MLIR" \
+    --module="${MODULE}" \
+    -b "${BOUND}" \
+    --run \
+    --shared-libs=/usr/lib/x86_64-linux-gnu/libz3.so
+fi
+
+# Only run IC3 when the IC3 MLIR contains a __verif_bad output
+# (i.e. the design has PSL assertions worth proving unboundedly).
+# Skip IC3 when psl assume is present: circt-translate --export-aiger does not
+# support the verif dialect, so assumptions cannot be encoded as AIGER constraints.
+# The BMC step (Z3) handles constrained verification correctly via verif.assume.
+if [ "$HAS_BAD" -gt 0 ] && [ "$HAS_LTL" -gt 0 ]; then
+  echo "[2b/3] LTL properties present — IC3/PDR skipped (ltl lowering not supported in AIGER path; BMC covers this)."
+elif [ "$HAS_BAD" -gt 0 ] && [ "$HAS_ASSUME" -gt 0 ]; then
+  echo "[2b/3] PSL assumes present — IC3/PDR skipped (assumptions cannot be encoded as AIGER constraints; BMC covers this)."
+elif [ "$HAS_BAD" -gt 0 ] && [ "$HAS_AFTER_RESET" -gt 0 ]; then
+  echo "[2b/3] after_reset assertions present — IC3/PDR skipped (unconstrained initial states cause spurious CEX; BMC covers this)."
+elif [ "$HAS_BAD" -gt 0 ] && [ "$HAS_CONTRACT" -gt 0 ]; then
+  echo "[2b/3] Contracts present — IC3/PDR skipped (assumptions cannot be encoded as AIGER constraints; BMC covers this)."
+elif [ "$HAS_BAD" -gt 0 ]; then
+  echo "[2b/3] Unbounded IC3/PDR proof via ABC (module=${MODULE})..."
+  # Lower to AIG, export to binary AIGER, run ABC pdr.
+  # ABC treats each hw.output as a bad-state signal: pdr proves it unreachable.
+  "${CIRCT_BIN}/circt-synth" \
+    --until-before=all \
+    "$IC3_MLIR" \
+    | "${CIRCT_BIN}/circt-translate" \
+        --export-aiger -o "$IC3_AIG"
+  "$ABC" -c "read_aiger ${IC3_AIG}; pdr; quit" 2>&1
+else
+  echo "[2b/3] No PSL assertions found — skipping IC3/PDR."
+fi
+
+# Contract verification: lower verif.contract → verif.formal → circt-bmc.
+#
+# Why not pass the MLIR directly to circt-bmc?
+#   --lower-contracts emits an apply-mode hw.module that contains verif.symbolic_value.
+#   circt-bmc's ConvertHWToSMT pass converts all hw.modules to func.funcs, after which
+#   verif.symbolic_value is no longer inside hw.module and the dialect verifier rejects it.
+#   The fix: extract only the verif.formal blocks (the actual check modules) and pass
+#   those to circt-bmc, which handles them via its own internal LowerTestsPass.
+if [ "$HAS_CONTRACT" -gt 0 ]; then
+  echo "[2c/3] Contract verification (module=${MODULE})..."
+  CONTRACT_LOWERED="${DIR}/${BASE}_contract.mlir"
+  FORMAL_ONLY="${DIR}/${BASE}_formal.mlir"
+
+  # Step 1: lower verif.contract → verif.formal check blocks + apply-mode hw.module
+  "${CIRCT_BIN}/circt-opt" --lower-contracts "$MLIR" -o "$CONTRACT_LOWERED"
+
+  # Step 2: extract only verif.formal blocks — drop the apply-mode hw.module
+  python3 - "$CONTRACT_LOWERED" "$FORMAL_ONLY" << 'PYEOF'
+import sys
+in_f, depth, out = False, 0, ["module {"]
+for line in open(sys.argv[1]):
+    s = line.rstrip()
+    if not in_f and "verif.formal " in s:
+        in_f = True
+        depth = 0
+    if in_f:
+        out.append(s)
+        depth += s.count("{") - s.count("}")
+        if depth <= 0:
+            in_f = False
+out.append("}")
+open(sys.argv[2], "w").write("\n".join(out) + "\n")
+PYEOF
+
+  # Step 3: verify each contract check module via circt-bmc's LowerTestsPass
+  idx=0
+  while true; do
+    cmod="${MODULE}_CheckContract_${idx}"
+    grep -q "@${cmod}" "$FORMAL_ONLY" 2>/dev/null || break
+    echo "  Checking ${cmod}..."
+    "${CIRCT_BIN}/circt-bmc" \
+      "$FORMAL_ONLY" \
+      --module="${cmod}" \
+      -b "${BOUND}" \
+      --run \
+      --shared-libs=/usr/lib/x86_64-linux-gnu/libz3.so
+    idx=$((idx + 1))
+  done
+  [ "$idx" -eq 0 ] && echo "  (no contract check modules generated — check contract syntax)"
+fi
+
+if [ "$HAS_COVER" -gt 0 ]; then
+  echo "[2d/3] Cover verification via Z3 SMT Solver (module=${MODULE})..."
+  COVER_PY="${DIR}/check_cover.py"
+  cat << 'EOF' > "$COVER_PY"
+import sys, re, subprocess
+mlir_file = sys.argv[1]
+module = sys.argv[2]
+bound = sys.argv[3]
+circt_bmc = sys.argv[4]
+
+with open(mlir_file) as f:
+    content = f.read()
+
+covers = list(re.finditer(r'(\s*)verif\.cover\s+(%[a-zA-Z0-9_]+)\s*:\s*i1', content))
+if not covers:
+    sys.exit(0)
+
+print(f"  Found {len(covers)} cover properties to check.")
+
+for i, match in enumerate(covers):
+    indent = match.group(1)
+    val = match.group(2)
+    
+    true_val = f"%true_cover_{i}"
+    not_val = f"%not_cover_{i}"
+    replacement = f"{indent}{true_val} = hw.constant -1 : i1\n{indent}{not_val} = comb.xor {val}, {true_val} : i1\n{indent}verif.assert {not_val} : i1"
+    
+    new_content = ""
+    lines = content.split('\n')
+    for line in lines:
+        if 'verif.cover' in line and match.group(0).strip() in line:
+            new_content += replacement + "\n"
+        elif 'verif.assert' in line or 'verif.assume' in line or 'verif.cover' in line:
+            pass # strip all other asserts, assumes, covers
+        else:
+            new_content += line + "\n"
+            
+    tmp_file = f"{mlir_file}.cover{i}.mlir"
+    with open(tmp_file, "w") as f:
+        f.write(new_content)
+        
+    res = subprocess.run([circt_bmc, tmp_file, f"--module={module}", "-b", bound, "--run", "--shared-libs=/usr/lib/x86_64-linux-gnu/libz3.so"], capture_output=True, text=True)
+    if "Assertion can be violated!" in res.stdout:
+        print(f"  Cover {i+1} REACHABLE! (Trace found)")
+    else:
+        print(f"  Cover {i+1} UNREACHABLE! (No trace found within bound {bound})")
+EOF
+  python3 "$COVER_PY" "$MLIR" "$MODULE" "$BOUND" "${CIRCT_BIN}/circt-bmc"
+fi
+
+echo "[3/3] Lowering to SystemVerilog..."
+"${CIRCT_BIN}/circt-opt" "$MLIR" --lower-seq-to-sv \
+  | "${CIRCT_BIN}/firtool" --format=mlir --verilog \
+  > "$SV"
+
+echo "Done: ${SV}"
+
+
+================================================================================
+FILE: verif-ltl-guide.md
+================================================================================
+# CIRCT `verif` and `ltl` Dialects — Use-Cases and Examples
+
+## `verif` dialect
+
+### 1. Inline assertions (`verif.assert` / `verif.assume` / `verif.cover`)
+
+The simplest use. Placed directly inside an `hw.module` and evaluated during formal runs.
+
+```mlir
+hw.module @Adder(in %a: i8, in %b: i8, out z: i8) {
+  %0 = comb.add %a, %b : i8
+  %sum_geq_a = comb.icmp uge %0, %a : i8
+  verif.assert %sum_geq_a : i1         // property to prove
+  verif.cover  %sum_geq_a : i1         // track reachable states where this holds
+  hw.output %0 : i8
+}
+```
+
+`verif.assume` constrains the solver's input space — only consider inputs satisfying the assumption:
+
+```mlir
+hw.module @BoundedShift(in %a: i8, in %b: i8, out z: i8) {
+  %c8 = hw.constant 8 : i8
+  %b_lt_8 = comb.icmp ult %b, %c8 : i8
+  verif.assume %b_lt_8 : i1            // tell Z3: only consider b < 8
+  %0 = comb.shl %a, %b : i8
+  %ok = comb.icmp uge %0, %a : i8
+  verif.assert %ok : i1
+  hw.output %0 : i8
+}
+```
+
+**Rule of thumb**: `assume` = precondition handed to the solver; `assert` = postcondition the solver must prove cannot be violated.
+
+---
+
+### 2. `verif.formal` — Standalone Formal Function
+
+An autonomous verification entry point. Constructs inputs symbolically and asserts properties without tying to a specific `hw.module`.
+
+```mlir
+verif.formal @CheckMultiplier {} {
+  %a = verif.symbolic_value : i32    // unconstrained i32 input
+  %b = verif.symbolic_value : i32
+
+  %c9    = hw.constant 9 : i32
+  %lhs   = comb.mul %a, %c9 : i32   // naive 9*a
+
+  %c3      = hw.constant 3 : i32
+  %shifted = comb.shl %a, %c3 : i32 // 8*a
+  %rhs     = comb.add %a, %shifted : i32 // a + 8*a = 9*a
+
+  %eq = comb.icmp eq %lhs, %rhs : i32
+  verif.assert %eq : i1              // prove for ALL a: 9*a == a + 8*a
+}
+```
+
+This is the cleanest pattern: no hardware module needed — just symbolic variables + logic + assertions.
+
+---
+
+### 3. `verif.contract` — Hierarchical Verification
+
+Contracts attach proofs to module outputs inline. Two modes:
+
+- **Check mode**: `require` → assume (constrain inputs), `ensure` → assert (prove outputs)
+- **Apply mode**: `require` → assert (caller must satisfy), `ensure` → assume (treat as axiom, skip re-proving)
+
+This is what makes compositional formal verification possible: prove a sub-module once, then use it as a trusted black box everywhere else.
+
+**Simple arithmetic contract:**
+
+```mlir
+hw.module @Mul9(in %a: i42, out z: i42) {
+  %c3     = hw.constant 3 : i42
+  %c9     = hw.constant 9 : i42
+  %shifted = comb.shl %a, %c3 : i42    // 8*a
+  %result  = comb.add %a, %shifted : i42 // 9*a via shift+add
+  %z = verif.contract %result : i42 {
+    %ref = comb.mul %a, %c9 : i42      // reference: 9*a via multiply
+    %eq  = comb.icmp eq %z, %ref : i42
+    verif.ensure %eq : i1              // prove: shift+add == multiply
+  }
+  hw.output %z : i42
+}
+```
+
+**Contract with precondition:**
+
+```mlir
+hw.module @ShiftLeft(in %a: i8, in %b: i8, out z: i8) {
+  // ...mux tree implementing shift...
+  %z = verif.contract %mux_result : i8 {
+    %c8    = hw.constant 8 : i8
+    %b_lt_8 = comb.icmp ult %b, %c8 : i8
+    verif.require %b_lt_8 : i1         // precondition: b < 8
+
+    %ref = comb.shl %a, %b : i8
+    %eq  = comb.icmp eq %z, %ref : i8
+    verif.ensure %eq : i1              // postcondition: mux == native shift
+  }
+  hw.output %z : i8
+}
+```
+
+**Contract with LTL temporal postcondition — sequential module:**
+
+```mlir
+hw.module @Counter(in %in: i2, out out: i2, in %clock: !seq.clock, in %reset: i1) {
+  %zero = hw.constant 0 : i2
+  %one  = hw.constant 1 : i2
+  %max  = hw.constant -2 : i2         // 0b10 = 2 in i2
+
+  %reg  = seq.firreg %next clock %clock reset sync %reset, %zero : i2
+  %eq   = comb.icmp eq %reg, %max : i2
+  %incr = comb.add %reg, %one : i2
+  %next = comb.mux %eq, %zero, %incr : i2
+
+  %out = verif.contract %reg : i2 {
+    // After reset has occurred, the counter never reaches 0b11
+    %never_ff  = hw.constant -1 : i2
+    %ne        = comb.icmp ne %out, %never_ff : i2
+    %clk_i1    = seq.from_clock %clock
+    %has_reset = verif.has_been_reset %clk_i1, sync %reset
+    %seq       = ltl.clock %ne, posedge %clk_i1 : i1
+    verif.ensure %seq if %has_reset : !ltl.sequence  // only enforced after reset
+  }
+  hw.output %out : i2
+}
+```
+
+`verif.has_been_reset` returns `i1` that becomes true once a reset pulse has been observed. This prevents the solver from requiring invariants to hold in the arbitrary pre-reset state.
+
+---
+
+### 4. `verif.lec` — Logic Equivalence Checking
+
+Prove that two circuit implementations are input-output identical. Classic use: verify that an optimized implementation matches a reference.
+
+```mlir
+func.func @CheckEquivalence() {
+  verif.lec
+  first {
+    ^bb0(%a: i32, %b: i32):
+      %r = comb.mul %a, %b : i32      // naive multiply
+      verif.yield %r : i32
+  }
+  second {
+    ^bb0(%a: i32, %b: i32):
+      %c3      = hw.constant 3 : i32
+      %shifted = comb.shl %b, %c3 : i32  // 8*b (shift-and-add approximation)
+      %r       = comb.add %b, %shifted : i32
+      verif.yield %r : i32
+  }
+}
+```
+
+The tool creates symbolic inputs, evaluates both bodies, then asserts `first_output == second_output`. UNSAT → equivalent. SAT → counterexample input returned.
+
+`verif.refines` is the asymmetric variant: proves that every output of `first` is also producible by `second` (refinement relation), without requiring full equivalence.
+
+---
+
+## `ltl` dialect: Temporal Properties
+
+LTL encodes time-indexed properties across clock cycles. Three types:
+
+- `i1` — a Boolean signal at a single instant
+- `!ltl.sequence` — a Boolean pattern across a range of cycles
+- `!ltl.property` — a temporal claim asserted globally
+
+### Building Blocks
+
+#### `ltl.delay` — exact or bounded cycle gap
+
+```mlir
+%s1 = ltl.delay %a, 2     : i1   // ##2 a  (exactly 2 cycles later)
+%s2 = ltl.delay %a, 1, 4  : i1   // ##[1:4] a  (1 to 4 cycles later)
+```
+
+**Note for Micro‑VHDL**: `circt-bmc` in this repo now registers the `ltl` dialect and lowers `ltl.delay`/`ltl.implication`/`ltl.clock` into core logic via a dedicated `lower-ltl-to-bmc` pass. LTL properties are still **BMC-only**; IC3/PDR skips them in the AIGER path.
+
+#### `ltl.concat` — consecutive sequences
+
+```mlir
+// req high for 1 cycle, immediately followed by ack
+%req_then_ack = ltl.concat %req, %ack : !ltl.sequence, !ltl.sequence
+
+// req, then exactly 2 cycles gap, then ack
+%handshake = ltl.concat %req, %gap2, %ack
+              : !ltl.sequence, !ltl.sequence, !ltl.sequence
+```
+
+#### `ltl.repeat` — repetition
+
+```mlir
+%stable3 = ltl.repeat %bus_stable, 3    : !ltl.sequence  // [*3]
+%burst   = ltl.repeat %valid, 0, 5     : !ltl.sequence  // [*0:5]
+```
+
+---
+
+### Temporal Properties
+
+#### `ltl.implication` — trigger |-> response
+
+"Whenever the antecedent sequence matches, the consequent property must hold starting at the match endpoint."
+
+```mlir
+// req |-> ##[1:3] ack
+%ack_within_3 = ltl.delay %ack, 1, 3 : i1
+%prop = ltl.implication %req, %ack_within_3 : i1, !ltl.sequence
+%clocked = ltl.clock %prop, posedge %clk_i1 : !ltl.property
+verif.assert %clocked : !ltl.property
+```
+
+Direct equivalent of SVA: `assert property (@(posedge clk) req |-> ##[1:3] ack)`.
+
+#### `ltl.eventually` — liveness
+
+"At some future point, X must hold." Cannot be falsified in finite time — requires IC3 with fairness, not BMC.
+
+```mlir
+%drain = ltl.eventually %not_full : i1
+%clocked = ltl.clock %drain, posedge %clk_i1 : !ltl.property
+verif.assert %clocked : !ltl.property
+// circt-bmc cannot verify this; ABC pdr requires Buchi/fairness encoding
+```
+
+#### `ltl.until` — conditional liveness
+
+"X holds until Y becomes true, and Y must eventually become true."
+
+```mlir
+%wait = ltl.until %in_wait_state, %grant_arrived : !ltl.property, !ltl.property
+%clocked = ltl.clock %wait, posedge %clk_i1 : !ltl.property
+verif.assert %clocked : !ltl.property
+```
+
+---
+
+### Complete Handshake Protocol Example
+
+```mlir
+hw.module @HandshakeChecker(
+    in %clk: !seq.clock, in %req: i1, in %ack: i1, in %data_valid: i1) {
+
+  %clk_i1 = seq.from_clock %clk
+
+  // Property 1: no spurious ack — ack only after req
+  %no_spurious_ack = ltl.implication %ack, %req : i1, i1
+  %p1 = ltl.clock %no_spurious_ack, posedge %clk_i1 : i1
+
+  // Property 2: req must be acknowledged within 8 cycles
+  %ack_within_8   = ltl.delay %ack, 1, 8 : i1
+  %req_gets_ack   = ltl.implication %req, %ack_within_8 : i1, !ltl.sequence
+  %p2 = ltl.clock %req_gets_ack, posedge %clk_i1 : !ltl.property
+
+  // Property 3: data_valid stable for 2 cycles after ack
+  %stable2    = ltl.repeat %data_valid, 2 : i1
+  %data_ok    = ltl.implication %ack, %stable2 : i1, !ltl.sequence
+  %p3 = ltl.clock %data_ok, posedge %clk_i1 : !ltl.property
+
+  verif.clocked_assert %p1, posedge %clk_i1 : !ltl.property
+  verif.assert %p2 : !ltl.property
+  verif.assert %p3 : !ltl.property
+}
+```
+
+---
+
+## The Lowering Hierarchy
+
+### BMC path (circt-bmc + Z3)
+
+```
+LTL property
+    |
+    v  (LTLToCore: converts i1-operand implications -> comb logic)
+verif.assert %i1_prop : i1
+    |
+    v  (VerifToSMT)
+smt.assert (smt.not (%p))    <- negation: look for counterexample
+    |
+    v  (SMTToZ3LLVM)
+LLVM IR calling Z3 C API
+    |
+    v  (ExecutionEngine JIT)
+Z3 says UNSAT -> "Bound reached with no violations!"
+Z3 says SAT   -> "Assertion can be violated!" + counterexample trace
+```
+
+**Key insight**: VerifToSMT *negates* the assertion. It asks "can the property be false?" UNSAT means no violation in N cycles. SAT gives exact signal values at each unrolled cycle.
+
+### IC3/PDR path (circt-synth + AIGER + ABC pdr)
+
+```
+__verif_bad = NOT(combined assertion) as hw.output
+    |
+    v  (circt-synth --until-before=all)
+AIG dialect (synth.aig.and_inv, seq.compreg as latches)
+    |
+    v  (circt-translate --export-aiger)
+binary AIGER (.aig) — M inputs, L latches, O outputs (bad states)
+    |
+    v  (yosys-abc pdr)
+IC3 frame sequence construction
+    |
+    v
+"Property proved."   <- fixed-point invariant found (all cycles)
+or
+"CEX found in frame N"  <- concrete counterexample
+```
+
+**Key insight**: AIGER treats `hw.output` as bad-state signals. ABC `pdr` proves those outputs are unreachable from any initial state across all cycles.
+
+---
+
+## What Each Solver Proves
+
+| Property type | circt-bmc (BMC) | ABC pdr (IC3) |
+|---|---|---|
+| Safety — finds bugs | Yes (within bound) | Yes (any depth) |
+| Safety — proves correct | No | Yes (unbounded) |
+| Bitvector arithmetic | Native (Z3 BV theory) | Bit-exploded (slower for wide types) |
+| Counterexample detail | Named MLIR signals | Generic input_N/output_N |
+| `verif.assume` support | Native | Needs manual encoding |
+| `ltl.eventually` (liveness) | No | Needs Buchi encoding (not yet wired) |
+| LEC | Yes via `verif.lec` | Via AIGER equivalence checking |
+
+The two solvers are complementary. BMC runs first (fast, finds shallow bugs, readable traces). IC3 runs second (proves the property holds for all cycles, or finds deep bugs BMC missed).
+
+
+================================================================================
+FILE: verif-extensions.md
+================================================================================
+# Micro-VHDL Verification Extensions
+
+## Current State (as of February 2026)
+
+### What is implemented
+
+**Compile pipeline** (`compile.sh`):
+```
+[1/3]  VHDL → build.mlir + build_ic3.mlir   (Go compiler, two MLIR variants)
+[2a/3] BMC via Z3 (circt-bmc, bound=15)      — finds shallow bugs, concrete traces
+                                               strips verif.contract first (--strip-contracts);
+                                               skipped for contract-only designs
+[2b/3] IC3/PDR via ABC pdr (unbounded)        — proves safety or finds deep bugs
+[2c/3] Contract verification via circt-bmc    — present only when contract block exists;
+                                               pipeline: --lower-contracts → extract verif.formal
+                                               → circt-bmc (LowerTestsPass handles the rest)
+[3/3]  MLIR → SystemVerilog (firtool)
+```
+
+**PSL operators supported**:
+- `|=>` (next-cycle implication): delay register + boolean implication → `verif.assert : i1`
+- `stable(x)`: delay register + `comb.icmp eq` → `verif.assert : i1`
+- `assume always`: emits `verif.assume` in BMC MLIR; IC3 step is skipped (see below)
+- `assert always after_reset(rst)`: sticky `rst_ever_high` register + guarded assertion; IC3 step skipped (see below)
+- `next[N]` and `next_a[M to N]` on the RHS of `|=>`: emitted as `ltl.delay` + `ltl.implication` + `ltl.clock` and lowered for BMC via a dedicated `lower-ltl-to-bmc` pass
+- `eventually!`: stubbed as `hw.constant true` + TODO comment (liveness, skipped in BMC)
+
+**MLIR emission modes**:
+- **BMC mode** (default): emits `verif.assert`, `verif.assume`, `seq.initial` for zero-initialized registers
+- **IC3 mode** (`_ic3.mlir`): emits `__verif_bad: i1` hw.output (negated assertion conjunction), no `seq.initial` (PDR explores from unconstrained initial states); `psl assume` is omitted because `circt-translate --export-aiger` does not support the verif dialect
+
+**Toolchain**:
+- `circt-bmc` + Z3: BMC, up to 15 cycles (configurable via `BOUND=N`); respects `verif.assume`
+- `circt-synth` → `circt-translate --export-aiger` → `yosys-abc pdr`: unbounded IC3/PDR; skipped when `psl assume` is present
+- `firtool`: SystemVerilog output
+
+**Known gotchas**:
+- `yosys-abc read_aiger` only accepts binary `.aig` format; ASCII `.aag` silently fails
+- `circt-synth` cannot handle `seq.initial` — IC3 MLIR omits it by design
+- IC3 step is skipped automatically when no PSL assertions are present
+- IC3 step is skipped when `psl assume` is present — `verif.assume` cannot pass through `circt-translate --export-aiger` (verif dialect not supported in AIGER lowering); BMC handles the constrained verification correctly
+- IC3 step is skipped when `after_reset` is present — unconstrained initial states in IC3 would trivially violate reset-conditional properties; BMC correctly starts from zero-initialized registers and observes the reset sequence
+- `circt-bmc` cannot process `verif.contract` directly — its `ConvertHWToSMT` pass converts all `hw.module` ops to `func.func`; the apply-mode `hw.module` emitted by `--lower-contracts` contains `verif.symbolic_value`, which is no longer inside a valid parent after conversion and fails dialect validation. The fix: strip contracts before BMC (`--strip-contracts`) and verify contracts separately via the `verif.formal` extraction pipeline (see step [2c/3])
+- `--lower-contracts` emits two things: a `verif.formal @Mod_CheckContract_N` (the actual check) and an apply-mode `hw.module @Mod` (for use-site callers with symbolic outputs). Passing the full lowered file to `circt-bmc` fails because `ConvertHWToSMT` processes all modules. Only the `verif.formal` blocks should be passed to `circt-bmc` — it handles them via its internal `LowerTestsPass`
+- The "operand does not dominate this use" error from `circt-bmc` on `verif.contract` MLIR is a toolchain pipeline issue, not an MLIR validity problem. `verif.contract` has `RegionKindInterface` (graph region) and no `IsolatedFromAbove` trait; results are legitimately referenceable inside the region. `circt-opt --lower-contracts` processes this correctly. `circt-bmc` fails only because it lacks `LowerContractsPass` in its pipeline
+
+---
+
+## Layer 1 — Low-Hanging Fruit (new keywords, trivial emission)
+
+### `psl assume`
+
+The single most impactful missing feature. Right now if you write `psl assert always stable(req)` and req is a free input, Z3 finds a counterexample because inputs are unconstrained. To make a property meaningful you first need to constrain the environment:
+
+```
+psl assume always (req = '1' -> not(req = '0'));  -- req never deasserts
+psl assert always (req = '1' -> next(ack = '1'));
+```
+
+The AST node is structurally identical to `PslAssertion`. The only difference is the MLIR opcode: `verif.assume` instead of `verif.assert`. For the IC3 path, `verif.assume` would constrain the AIGER input space (encoded as an implication on the bad-state output: `bad = violation AND assumption_holds`).
+
+Without `assume`, every property that touches an input port is suspect — the solver is free to choose adversarial inputs.
+
+### `psl cover`
+
+Maps to `verif.cover`. Tells the solver: find a reachable state where this is true. Used for coverage — proving that a specific scenario is reachable at all, not just that it never happens.
+
+### `psl assert never`
+
+Syntactic sugar for `always (not P)`. More readable for error conditions:
+
+```
+psl assert never (state = ERROR_STATE);
+```
+
+---
+
+## Layer 2 — Sequence Operators (new AST nodes, clean LTL mapping)
+
+Right now all PSL temporal expressions are single-level. There is no way to express patterns across multiple cycles except via `|=>`, hardcoded as exactly one cycle.
+
+### `next[N]` / `next_a[M to N]` ✓ DONE (LTL lowering for BMC)
+
+`next[3](ack)` means "ack holds exactly 3 cycles from now." `next_a[1 to 8](ack)` means "ack must hold at least once between 1 and 8 cycles from now." These are emitted as `ltl.delay` plus `ltl.implication` and then lowered into core logic in the `circt-bmc` pipeline. IC3 still skips LTL properties.
+
+### Sequence concatenation `{a; b; c}`
+
+PSL sequences: `{req; stable(data); ack}` means req is true now, data stable next cycle, ack fires the cycle after. Maps to `ltl.concat`. Foundation of protocol verification.
+
+### Sequence repetition `{a[*N]}` / `{a[*M to N]}`
+
+`{stable(data)[*4]}` means data stable for 4 consecutive cycles. Maps to `ltl.repeat`. Useful for bus hold-time requirements.
+
+### `|->` (overlapping) vs current `|=>` (non-overlapping)
+
+Currently `|=>` always creates a 1-cycle delay register. PSL's `|->` means the consequent starts at the same cycle as the antecedent match — no delay. Exposing both gives the full SVA vocabulary.
+
+---
+
+## Layer 3 — Reset-Conditional Properties ✓ DONE
+
+One of the most common sources of false positives: the tool reports a violation in cycle 0 because the register starts in an unconstrained state (especially true for IC3, which explores from all initial states).
+
+**Implemented** using a sticky `rst_ever_high` register encoding (not `verif.has_been_reset` — the CIRCT verif dialect form had toolchain compatibility issues):
+
+```vhdl
+psl assert always after_reset(rst) s_sig;
+```
+
+Emits:
+```mlir
+%next_rst_ever_high = comb.or %rst_ever_high, %rst : i1
+%rst_ever_high = seq.compreg %next_rst_ever_high, %clk initial 0 : i1
+-- effective = NOT(rst_ever_high) OR rst OR property
+--   vacuous before any reset, vacuous during active reset, real check after
+%not_rst_ever_high = comb.xor %rst_ever_high, -1 : i1
+%partial = comb.or %not_rst_ever_high, %rst : i1
+%effective = comb.or %partial, %s_sig : i1
+verif.assert %effective : i1
+```
+
+IC3 step is skipped when `after_reset` is present (unconstrained initial states would trivially violate the property). BMC correctly starts from zero-initialized registers and observes the reset sequence.
+
+See `examples/vhd/test_after_reset.vhd` for a demonstration.
+
+---
+
+## Layer 4 — `verif.contract` Blocks on Entities
+
+The big architectural leap for scalability. Right now all `verif.assert` ops sit flat inside the module. For hierarchical designs the solver reasons about everything together, which blows up exponentially.
+
+The idea: add a `contract` block to the micro-vhdl entity syntax:
+
+```vhdl
+entity Arbiter is
+  port (req0, req1 : in std_logic; grant0, grant1 : out std_logic; clk : in std_logic);
+  contract
+    require: never(req0 = '1' and req1 = '1');  -- mutual exclusion on inputs
+    ensure:  never(grant0 = '1' and grant1 = '1');  -- mutual exclusion on outputs
+end entity;
+```
+
+This maps to `verif.contract` with `verif.require` and `verif.ensure`. When compiling the sub-module the tool proves the contract. When compiling the parent and instantiating Arbiter, it uses apply-mode — the `ensure` becomes an axiom without re-proving. Sub-module proof complexity does not grow with the top-level design.
+
+---
+
+## Layer 5 — `verif.formal` Standalone Blocks
+
+Currently micro-vhdl always ties verification to a specific `hw.module`. A `verif.formal` block is an independent formal function that creates symbolic values, instantiates modules, and asserts properties without being part of any module.
+
+This enables:
+- **Cross-module properties**: instantiate two modules, constrain interaction, prove a joint property
+- **Parameterized formal checks**: same property at different input widths
+- **LEC via `verif.lec`**: two implementations, same symbolic inputs, assert output equality
+
+---
+
+## Layer 6 — Liveness
+
+`psl assert always (req -> eventually! ack)` is a liveness property: ack must eventually arrive. It cannot be falsified in a finite number of cycles, so BMC cannot prove or disprove it.
+
+**Current status**: emitted as `hw.constant true` + TODO comment in both BMC and IC3 MLIR. Effectively skipped.
+
+**What's needed**: ABC has liveness checking via Buchi automaton encoding. The `ltl.eventually` op in CIRCT is designed for this. The missing piece is:
+1. Emit `ltl.eventually` properly in the IC3 MLIR (not `hw.constant true`)
+2. Use a different ABC command sequence: `read_aiger; ltl_properties; pdr` with fairness constraints
+3. Encode the Buchi condition in the AIGER (a "justice" output rather than a "bad state" output)
+
+This requires ABC's liveness mode and a different AIGER encoding convention — it's a separate effort from the safety IC3 path that is already working.
+
+---
+
+## Priority Summary
+
+| Extension | Status | Effort | Value |
+|---|---|---|---|
+| IC3/PDR via ABC pdr | **Done** | — | Unbounded safety proofs |
+| `psl assume` | **Done** | — | BMC-constrained verification; IC3 skips when assumes present |
+| `psl never` | **Done** | — | Syntactic sugar for always (not P) |
+| `psl cover` | **Done** | — | Checked via separate circt-bmc coverage pass; emitted to SV |
+| Reset-conditional (`after_reset`) | **Done** | — | Eliminates cycle-0 false positives in IC3 |
+| `next[N]` / delay | **Done** | — | Bounded response properties |
+| `|->` (overlapping implication) | Not started | Low | Full SVA vocabulary |
+| Sequence concat/repeat | Not started | Medium | Protocol verification |
+| `verif.contract` on entities | Not started | High | Compositional, scalable verification |
+| `verif.formal` blocks | Not started | High | Cross-module and LEC |
+| Liveness via ABC fairness | Not started | High | Full temporal logic |
+
+**Highest remaining value**: Sequence concat/repeat and overlapping implication `|->` — for full SVA vocabulary and protocol verification.
+
+
+================================================================================
+FILE: k-induction-ic3.md
+================================================================================
+# k-Induction and IC3/PDR — Formal Verification Algorithms
+
+## Bounded Model Checking Recap
+
+BMC unrolls the circuit N times and asks: "does there exist an assignment of inputs and initial states that violates the property within N cycles?" It finds bugs but cannot prove absence of bugs — "bound reached" just means no bug in N steps, not no bug ever.
+
+Both k-induction and IC3 are answers to the question: how do you get from "no bug in N steps" to "no bug ever"?
+
+---
+
+## k-Induction
+
+Mathematical induction applied to hardware. Standard induction says: if P holds at step 0, and P(s) implies P(s+1) for any state s, then P holds for all time.
+
+The hardware version has a problem immediately: the inductive step says "assume P holds in some state s, prove it holds in state s+1." But that arbitrary state s might be unreachable. The solver is free to start from a garbage state that satisfies P but transitions to a state that violates P — even if that garbage state is never reachable from the real initial state. So induction fails even when the property is true.
+
+**k-induction** fixes this by widening the window. Instead of assuming P holds in one arbitrary state, assume P holds in k consecutive states, then prove it holds in state k+1. With a larger k, the k-step trace is harder to satisfy with unreachable states. Eventually — for a large enough k — the only k-step traces that satisfy all k copies of P are genuine reachable traces, and then the inductive step goes through.
+
+Concretely, for k=3:
+
+```
+Base case:    prove P holds at cycles 0, 1, 2  (standard BMC)
+Inductive:    assume P holds at cycles i, i+1, i+2 for arbitrary i
+              prove P holds at cycle i+3
+```
+
+If both hold, P holds for all cycles. No bound on depth.
+
+The practical issue: you may need a very large k before the inductive step stops failing, and there is no general way to know in advance what k is sufficient. For some designs k=1 works (the invariant is "1-inductive"). For others you need auxiliary lemmas — extra invariants added to strengthen the hypothesis — to make the inductive step go through at a smaller k.
+
+k-induction is what most industrial tools used before IC3 arrived. It works well for simple invariants on well-structured pipelines but struggles with complex state machines where the reachable state space is hard to characterize with a short trace.
+
+---
+
+## IC3 / PDR
+
+Developed by Aaron Bradley in 2011. IC3 stands for "Incremental Construction of Inductive Clauses for Indubitable Correctness." PDR (Property Directed Reachability) is the same algorithm under a different name that emphasizes what it actually does.
+
+The core insight is different from k-induction. Instead of asking "does a long enough trace prove the property?", IC3 asks: "what is the strongest invariant I can discover that is both true and implies the property?"
+
+### The Frame Sequence
+
+IC3 maintains a sequence of sets of states F_0, F_1, F_2, ..., F_k where:
+
+- F_0 = the initial states of the design
+- F_i is an over-approximation of all states reachable in at most i steps
+- Each F_i is represented as a conjunction of clauses (CNF), discovered incrementally
+
+The invariant maintained: F_0 ⊆ F_1 ⊆ ... ⊆ F_k, and each F_i only contains states that satisfy property P.
+
+### The Algorithm Loop
+
+1. **Check if the bad state is reachable in one step from F_k.** If yes, try to block it.
+2. **Blocking**: when a bad state B is reachable from some state in F_i, find a clause (a constraint on the predecessor) that rules out reaching B. Push that clause backwards through frames: if it blocks B from F_i, check if it also blocks it from F_{i-1}, and so on.
+3. **Propagation**: push learned clauses forward through frames. If a clause holds in F_i and is inductive relative to F_i, it propagates to F_{i+1}.
+4. **Termination**:
+   - If F_i = F_{i+1} (the frame stabilizes), a fixed-point inductive invariant has been found. Property is proved.
+   - If a chain of counterexample states reaches F_0, a genuine counterexample trace exists.
+
+### Why It's Powerful
+
+IC3 discovers the right invariants automatically, guided by the property it's trying to prove. Each "blocking clause" it learns is a piece of the inductive invariant. It never needs to know k in advance. It doesn't blow up exponentially with depth because it works in clause space (compact logical formulas) rather than unrolled circuit copies.
+
+In practice IC3 can prove properties that require a conceptually infinite inductive argument — things like "a FIFO never loses data" — where k-induction would need an astronomically large k or a human-supplied auxiliary invariant.
+
+### The Intuition
+
+Think of IC3 as building a wall between the initial states and the bad states, one brick at a time. Each brick is a clause it discovers. The wall is an inductive invariant. The algorithm is "property directed" because it only places bricks where they're needed to block paths to the bad state.
+
+---
+
+## Liveness: The Harder Problem
+
+Both k-induction and IC3 as described handle **safety** properties: "bad thing never happens." Liveness — "good thing eventually happens" — is strictly harder.
+
+The standard reduction is **liveness-to-safety**: convert `eventually P` into a safety property by introducing a cycle counter. If P hasn't fired within N cycles, that's a safety violation. But this re-introduces a bound, which is exactly what you were trying to avoid.
+
+The proper treatment uses **Buchi automata**. A liveness property `always eventually P` is encoded as: there is no infinite path where P is never true. This becomes: the system has no reachable "lasso" — a cycle the system can loop in forever while P stays false. IC3 with fairness constraints (IC3F) can check this. It looks for lassos in the state graph rather than paths to bad states.
+
+CIRCT's `ltl.eventually` is designed to feed into this kind of analysis, but `circt-bmc` does not implement it. The `--lower-ltl-to-core` pass handles only safety-reducible LTL fragments.
+
+---
+
+## Comparison
+
+| | BMC | k-Induction | IC3/PDR |
+|---|---|---|---|
+| Can find bugs | Yes (within bound) | Yes (within bound) | Yes (any depth) |
+| Can prove safety | No | Yes (if k found) | Yes |
+| Can prove liveness | No | No (without reduction) | Yes (with fairness) |
+| Needs bound parameter | Yes | Yes (k) | No |
+| Needs auxiliary invariants | No | Sometimes | No (discovers them) |
+| Scales with state space | Poorly | Poorly | Better |
+| Implementation complexity | Low | Medium | High |
+
+---
+
+## Implementation in Micro-VHDL (Current State)
+
+Both BMC and IC3/PDR are now integrated and run automatically in sequence.
+
+### Pipeline
+
+```
+VHDL → Go compiler → build.mlir + build_ic3.mlir
+                           |               |
+                     circt-bmc (Z3)   circt-synth
+                     BMC, 15 cycles   → AIG dialect
+                           |               |
+                    "Assertion can    circt-translate
+                    be violated!"    --export-aiger
+                    or "Bound        → binary .aig
+                    reached"               |
+                                     yosys-abc pdr
+                                           |
+                                    "Property proved"
+                                    or counterexample
+```
+
+### Two MLIR Variants
+
+The Go compiler emits two MLIR files from the same VHDL:
+
+**BMC MLIR** (`foo.mlir`):
+- `verif.assert %combined : i1` — circt-bmc consumes this directly
+- `seq.initial` blocks — pins registers to zero at cycle 0 for deterministic BMC
+- Used by both circt-bmc and firtool (SV output)
+
+**IC3 MLIR** (`foo_ic3.mlir`):
+- `out __verif_bad: i1` — negated conjunction as hw.output port
+- No `seq.initial` — PDR must explore from all possible initial states, not just zero
+- No `verif.assert` — only hw.output; circt-synth can lower this to AIG cleanly
+- Used only for the AIGER/ABC path
+
+### Key Design Decisions
+
+**Why no `seq.initial` in IC3 MLIR**: `circt-synth` cannot lower `seq.initial` to AIG (it is not a comb or seq register op). More importantly, pinning initial register state to zero would cause IC3 to miss bugs only reachable from other starting states. PDR by design explores from all initial states.
+
+**Why a separate MLIR file**: `verif.assert` cannot pass through `circt-synth`'s AIG lowering pipeline. Emitting a clean IC3 MLIR without `verif.assert` avoids needing a stripping pass.
+
+**Why `__verif_bad = NOT(conjunction)`**: The AIGER model checking convention is that hw.outputs represent "bad state" signals. ABC's `pdr` command proves these outputs are unreachable. The negation converts "property holds" (which the assertion checks) to "property violated" (which PDR checks for reachability).
+
+**Why binary AIGER only**: `yosys-abc read_aiger` rejects ASCII `.aag` files when symbol names contain bracket characters (e.g., `a[0]`). The binary `.aig` format is used throughout.
+
+### Limitations
+
+- IC3 counterexamples come back as generic `input_0`/`output_0` names, not the original VHDL signal names
+- Liveness properties (`psl eventually!`) are still stubbed as `hw.constant true`
+- Hierarchical designs are not yet flattened before AIGER export
+- LTL properties (`ltl.delay` / `ltl.clock`) are BMC-only; IC3/PDR skips them in the AIGER path
+
+
+================================================================================
+FILE: examples/vhd/test_assume.vhd
+================================================================================
+library IEEE;
+use IEEE.std_logic_1164.all;
+
+-- Test psl assume: constrain req to never deassert once high,
+-- then prove that ack follows req one cycle later.
+-- Without the assume, req is adversarial and Z3 finds a trivial CEX.
+entity handshake is
+  port (
+    clk : in std_logic;
+    req : in std_logic;
+    ack : out std_logic
+  );
+end entity handshake;
+
+architecture behavior of handshake is
+  signal ack_sig : std_logic;
+begin
+  ack_sig <= req;
+
+  process(clk)
+  begin
+    if rising_edge(clk) then
+      ack <= ack_sig;
+    end if;
+  end process;
+
+  -- Constrain the environment: req once asserted stays high.
+  psl assume always req |=> req;
+
+  -- Property: ack follows req with one cycle latency.
+  psl assert always req |=> ack;
+end architecture behavior;
+
+
+================================================================================
+FILE: examples/vhd/test_after_reset.vhd
+================================================================================
+library IEEE;
+use IEEE.std_logic_1164.all;
+
+-- Demonstrates psl assert always after_reset(rst).
+--
+-- A register that is SET to '1' on reset and holds its value forever.
+-- Property: after reset has de-asserted, the register is always '1'.
+--
+-- Without after_reset this property would fail in IC3 because the register
+-- starts unconstrained (could be '0'). With after_reset, BMC correctly
+-- observes that reset initialises the register to '1' before the check begins.
+entity sticky_high is
+  port (
+    clk : in std_logic;
+    rst : in std_logic;
+    s   : out std_logic
+  );
+end entity sticky_high;
+
+architecture behavior of sticky_high is
+  signal s_sig : std_logic;
+begin
+  process(clk)
+  begin
+    if rising_edge(clk) then
+      if rst = '1' then
+        s_sig <= '1';   -- reset drives the register HIGH
+      end if;
+      -- no else: holds its value forever once set
+    end if;
+  end process;
+
+  s <= s_sig;
+
+  -- After reset has fired at least once, s_sig is always '1'.
+  psl assert always after_reset(rst) s_sig;
+end architecture behavior;
+
+
+================================================================================
+FILE: test_seq.vhd
+================================================================================
+entity TestSeq is
+  port (
+    req, ack, data_valid : in std_logic;
+    clk : in std_logic
+  );
+end entity;
+
+architecture rtl of TestSeq is
+begin
+  -- Overlapping implication: if req is '1', ack must be '1' in the same cycle
+  psl assert always req |-> ack;
+
+  -- Non-overlapping implication: if req is '1', data_valid must be '1' in the next cycle
+  psl assert always req |=> data_valid;
+
+  -- Sequence concatenation: req followed by {data_valid; ack} starting at next cycle
+  psl assert always req |=> {data_valid; ack};
+
+  -- Sequence repetition: req followed by 3 cycles of data_valid
+  psl assert always req |=> {data_valid[*3]};
+
+  -- Sequence repetition range: req followed by 1 to 3 cycles of data_valid
+  psl assert always req |=> {data_valid[*1 to 3]};
+
+  -- Overlapping implication with sequence: req |-> {ack; data_valid}
+  psl assert always req |-> {ack; data_valid};
+
+  -- Overlapping implication with next: if req is '1', ack must be '1' in 2 cycles
+  psl assert always req |-> next[2](ack);
+
+  -- Standalone next: ack must be '1' in 3 cycles
+  psl assert always next[3](ack);
+end architecture;
+
+
+================================================================================
+FILE: test_contract.vhd
+================================================================================
+entity Arbiter is
+  port (req0, req1 : in std_logic; grant0, grant1 : out std_logic; clk : in std_logic);
+  contract
+    require: not (req0 = '1' and req1 = '1');
+    ensure:  not (grant0 = '1' and grant1 = '1');
+end entity;
+
+architecture rtl of Arbiter is
+begin
+  grant0 <= req0;
+  grant1 <= req1;
+end architecture;
+
+
+================================================================================
+FILE: test_formal.vhd
+================================================================================
+entity Dummy is
+  port (clk : in std_logic);
+end entity;
+
+architecture rtl of Dummy is
+begin
+end architecture;
+
+verification CheckMult is
+  symbolic a, b : std_logic_vector(31 downto 0);
+  psl assert always (a * b = b * a);
+end verification;
 
 

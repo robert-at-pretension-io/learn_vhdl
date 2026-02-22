@@ -24,6 +24,9 @@ print_file() {
     print_file "k-induction-ic3.md"
     print_file "examples/vhd/test_assume.vhd"
     print_file "examples/vhd/test_after_reset.vhd"
+    print_file "test_seq.vhd"
+    print_file "test_contract.vhd"
+    print_file "test_formal.vhd"
 ) > .paste_buffer.txt
 
 # Try to copy to clipboard if a tool is available

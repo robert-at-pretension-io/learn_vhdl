@@ -52,7 +52,24 @@ module.exports = grammar({
       $.library_clause,
       $.use_clause,
       $.entity_declaration,
-      $.architecture_body
+      $.architecture_body,
+      $.psl_formal_verification
+    ),
+
+    psl_formal_verification: $ => seq(
+      'verification', field('name', $.identifier), 'is',
+      repeat(choice(
+        $.symbolic_declaration,
+        $.psl_assertion,
+        $.psl_assumption,
+        $.psl_cover,
+        $.psl_assert_never
+      )),
+      'end', optional('verification'), optional($.identifier), ';'
+    ),
+
+    symbolic_declaration: $ => seq(
+      'symbolic', field('sym_names', $.identifier_list), ':', field('type', alias($.type_mark, $.type_mark)), ';'
     ),
 
     // -------------------------------------------------------------------------
@@ -297,6 +314,7 @@ module.exports = grammar({
     ),
 
     _psl_expression: $ => choice(
+      $.psl_sequence,
       $.psl_implication,
       $.psl_eventually,
       $.psl_stable,
@@ -305,11 +323,33 @@ module.exports = grammar({
       $._expression
     ),
 
-    psl_implication: $ => prec.left(1, seq(field('left', $._psl_expression), '|=>', field('right', $._psl_expression))),
+    psl_next: $ => prec(6, seq('next', '[', field('delay', $.number), ']', '(', field('arg', $._psl_expression), ')')),
+    psl_next_range: $ => prec(6, seq('next_a', '[', field('start', $.number), 'to', field('end', $.number), ']', '(', field('arg', $._psl_expression), ')')),
+
+    psl_sequence: $ => seq(
+      '{',
+      $.psl_sequence_element,
+      repeat(seq(';', $.psl_sequence_element)),
+      '}'
+    ),
+
+    psl_sequence_element: $ => seq(
+      $._psl_expression,
+      optional($.psl_repetition)
+    ),
+
+    psl_repetition: $ => choice(
+      seq('[', '*', field('count', $.number), ']'),
+      seq('[', '*', field('start', $.number), 'to', field('end', $.number), ']')
+    ),
+
+    psl_implication: $ => prec.left(1, seq(
+      field('left', $._psl_expression), 
+      field('operator', choice('|=>', '|->')), 
+      field('right', $._psl_expression)
+    )),
     psl_eventually: $ => prec.left(2, seq(field('left', $._psl_expression), '->', 'eventually!', field('right', $._psl_expression))),
     psl_stable: $ => seq('stable', '(', field('signal', $._name), ')'),
-    psl_next: $ => seq('next', '[', field('delay', $.number), ']', '(', field('arg', $._psl_expression), ')'),
-    psl_next_range: $ => seq('next_a', '[', field('start', $.number), 'to', field('end', $.number), ']', '(', field('arg', $._psl_expression), ')'),
 
     // -------------------------------------------------------------------------
     // EXPRESSIONS & NAMES
@@ -325,26 +365,45 @@ module.exports = grammar({
 
     paren_expression: $ => seq('(', $._expression, ')'),
 
-    _expression: $ => choice(
+    _expression: $ => $.logical_expression,
+
+    logical_expression: $ => choice(
+      $.relational_expression,
+      prec.left(1, seq(field('left', $.logical_expression), field('operator', choice('and', 'or', 'xor')), field('right', $.relational_expression)))
+    ),
+
+    relational_expression: $ => choice(
+      $.additive_expression,
+      prec.left(2, seq(field('left', $.relational_expression), field('operator', choice('=', '/=', '<', '<=', '>', '>=')), field('right', $.additive_expression)))
+    ),
+
+    additive_expression: $ => choice(
+      $.multiplicative_expression,
+      prec.left(3, seq(field('left', $.additive_expression), field('operator', choice('+', '-', '&')), field('right', $.multiplicative_expression)))
+    ),
+
+    multiplicative_expression: $ => choice(
+      $._unary_expression,
+      prec.left(4, seq(field('left', $.multiplicative_expression), field('operator', '*'), field('right', $._unary_expression)))
+    ),
+
+    _unary_expression: $ => choice(
+      $.unary_expression,
+      $._primary_expression
+    ),
+
+    unary_expression: $ => prec(5, seq(
+      field('operator', 'not'), 
+      field('argument', $._primary_expression)
+    )),
+
+    _primary_expression: $ => choice(
       $._name,
       $.number,
       $.string_literal, 
       $.char_literal,   
-      $.paren_expression,
-      $.binary_expression,
-      $.unary_expression
+      $.paren_expression
     ),
-
-    binary_expression: $ => prec.left(1, seq(
-      field('left', $._expression), 
-      field('operator', choice('+', '-', '*', '=', '/=', '<', '>', '<=', '>=', 'and', 'or', 'xor', '&')), 
-      field('right', $._expression)
-    )),
-
-    unary_expression: $ => prec(2, seq(
-      field('operator', 'not'), 
-      field('argument', $._expression)
-    )),
 
     number: $ => /[0-9]+/,
     string_literal: $ => choice(/"[01]+"/, /x"[0-9a-fA-F]+"/),

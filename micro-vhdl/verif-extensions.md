@@ -81,19 +81,19 @@ Right now all PSL temporal expressions are single-level. There is no way to expr
 
 ### `next[N]` / `next_a[M to N]` ✓ DONE (LTL lowering for BMC)
 
-`next[3](ack)` means "ack holds exactly 3 cycles from now." `next_a[1 to 8](ack)` means "ack must hold at least once between 1 and 8 cycles from now." These are emitted as `ltl.delay` plus `ltl.implication` and then lowered into core logic in the `circt-bmc` pipeline. IC3 still skips LTL properties.
+`next[3](ack)` means "ack holds exactly 3 cycles from now." `next_a[1 to 8](ack)` means "ack must hold at least once between 1 and 8 cycles from now." These are emitted as `ltl.delay` plus `ltl.implication` and then lowered into core logic in the `circt-bmc` pipeline. IC3 still skips LTL properties. (Note: Standalone `next[N]` sequences are now properly wrapped in an `ltl.clock` block when emitted so they evaluate correctly).
 
-### Sequence concatenation `{a; b; c}`
+### Sequence concatenation `{a; b; c}` ✓ DONE
 
 PSL sequences: `{req; stable(data); ack}` means req is true now, data stable next cycle, ack fires the cycle after. Maps to `ltl.concat`. Foundation of protocol verification.
 
-### Sequence repetition `{a[*N]}` / `{a[*M to N]}`
+### Sequence repetition `{a[*N]}` / `{a[*M to N]}` ✓ DONE
 
 `{stable(data)[*4]}` means data stable for 4 consecutive cycles. Maps to `ltl.repeat`. Useful for bus hold-time requirements.
 
-### `|->` (overlapping) vs current `|=>` (non-overlapping)
+### `|->` (overlapping) vs current `|=>` (non-overlapping) ✓ DONE
 
-Currently `|=>` always creates a 1-cycle delay register. PSL's `|->` means the consequent starts at the same cycle as the antecedent match — no delay. Exposing both gives the full SVA vocabulary.
+Currently `|=>` always creates a 1-cycle delay register. PSL's `|->` means the consequent starts at the same cycle as the antecedent match — no delay. Exposing both gives the full SVA vocabulary. Implemented by bypassing the 1-cycle delay or mapping directly to `ltl.implication` depending on the operand type.
 
 ---
 
@@ -125,7 +125,7 @@ See `examples/vhd/test_after_reset.vhd` for a demonstration.
 
 ---
 
-## Layer 4 — `verif.contract` Blocks on Entities
+## Layer 4 — `verif.contract` Blocks on Entities ✓ DONE
 
 The big architectural leap for scalability. Right now all `verif.assert` ops sit flat inside the module. For hierarchical designs the solver reasons about everything together, which blows up exponentially.
 
@@ -142,9 +142,11 @@ end entity;
 
 This maps to `verif.contract` with `verif.require` and `verif.ensure`. When compiling the sub-module the tool proves the contract. When compiling the parent and instantiating Arbiter, it uses apply-mode — the `ensure` becomes an axiom without re-proving. Sub-module proof complexity does not grow with the top-level design.
 
+**Implemented:** Required refactoring the Tree-Sitter grammar's expression rules to a tiered precedence approach (`logical_expression` -> `relational_expression` -> `additive_expression` -> `multiplicative_expression`) to ensure complex conditions like `not (req0 = '1' and req1 = '1')` parse with the correct binding order.
+
 ---
 
-## Layer 5 — `verif.formal` Standalone Blocks
+## Layer 5 — `verif.formal` Standalone Blocks ✓ DONE
 
 Currently micro-vhdl always ties verification to a specific `hw.module`. A `verif.formal` block is an independent formal function that creates symbolic values, instantiates modules, and asserts properties without being part of any module.
 
@@ -152,6 +154,8 @@ This enables:
 - **Cross-module properties**: instantiate two modules, constrain interaction, prove a joint property
 - **Parameterized formal checks**: same property at different input widths
 - **LEC via `verif.lec`**: two implementations, same symbolic inputs, assert output equality
+
+**Implemented:** Added a `verification ... is ... end verification;` block to the grammar, supporting `symbolic a, b : type;` declarations. These are extracted into `PslFormalBlock` AST nodes and lowered into `verif.formal` MLIR functions, properly generating `verif.symbolic_value` operations.
 
 ---
 
@@ -180,10 +184,10 @@ This requires ABC's liveness mode and a different AIGER encoding convention — 
 | `psl cover` | **Done** | — | Checked via separate circt-bmc coverage pass; emitted to SV |
 | Reset-conditional (`after_reset`) | **Done** | — | Eliminates cycle-0 false positives in IC3 |
 | `next[N]` / delay | **Done** | — | Bounded response properties |
-| `|->` (overlapping implication) | Not started | Low | Full SVA vocabulary |
-| Sequence concat/repeat | Not started | Medium | Protocol verification |
-| `verif.contract` on entities | Not started | High | Compositional, scalable verification |
-| `verif.formal` blocks | Not started | High | Cross-module and LEC |
+| `\|->` (overlapping implication) | **Done** | Low | Full SVA vocabulary |
+| Sequence concat/repeat | **Done** | Medium | Protocol verification |
+| `verif.contract` on entities | **Done** | High | Compositional, scalable verification |
+| `verif.formal` blocks | **Done** | High | Cross-module and LEC |
 | Liveness via ABC fairness | Not started | High | Full temporal logic |
 
-**Highest remaining value**: Sequence concat/repeat and overlapping implication `|->` — for full SVA vocabulary and protocol verification.
+**Highest remaining value**: Liveness via ABC fairness — requires Buchi automaton encoding in AIGER.

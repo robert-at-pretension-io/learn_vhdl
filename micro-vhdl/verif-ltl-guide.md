@@ -174,11 +174,11 @@ LTL encodes time-indexed properties across clock cycles. Three types:
 #### `ltl.delay` — exact or bounded cycle gap
 
 ```mlir
-%s1 = ltl.delay %a, 2     : i1   // ##2 a  (exactly 2 cycles later)
-%s2 = ltl.delay %a, 1, 4  : i1   // ##[1:4] a  (1 to 4 cycles later)
+%s1 = ltl.delay %a, 2     : i1   // next[2](a)  (exactly 2 cycles later)
+%s2 = ltl.delay %a, 1, 4  : i1   // next_a[1 to 4](a)  (1 to 4 cycles later)
 ```
 
-**Note for Micro‑VHDL**: `circt-bmc` in this repo now registers the `ltl` dialect and lowers `ltl.delay`/`ltl.implication`/`ltl.clock` into core logic via a dedicated `lower-ltl-to-bmc` pass. LTL properties are still **BMC-only**; IC3/PDR skips them in the AIGER path.
+**Note for Micro‑VHDL**: `circt-bmc` in this repo now registers the `ltl` dialect and lowers `ltl.delay`/`ltl.implication`/`ltl.clock` into core logic via a dedicated `lower-ltl-to-bmc` pass. LTL properties are still **BMC-only**; IC3/PDR skips them in the AIGER path. Standalone temporal sequences like `next[N](a)` are automatically wrapped in an `ltl.clock` block during MLIR emission so they evaluate correctly.
 
 #### `ltl.concat` — consecutive sequences
 
@@ -190,6 +190,7 @@ LTL encodes time-indexed properties across clock cycles. Three types:
 %handshake = ltl.concat %req, %gap2, %ack
               : !ltl.sequence, !ltl.sequence, !ltl.sequence
 ```
+*(In Micro-VHDL, you can write this directly as `{req; ack}`)*
 
 #### `ltl.repeat` — repetition
 
@@ -197,24 +198,25 @@ LTL encodes time-indexed properties across clock cycles. Three types:
 %stable3 = ltl.repeat %bus_stable, 3    : !ltl.sequence  // [*3]
 %burst   = ltl.repeat %valid, 0, 5     : !ltl.sequence  // [*0:5]
 ```
+*(In Micro-VHDL, you can write this as `{bus_stable[*3]}` or `{valid[*0 to 5]}`)*
 
 ---
 
 ### Temporal Properties
 
-#### `ltl.implication` — trigger |-> response
+#### `ltl.implication` — trigger |-> and |=> response
 
 "Whenever the antecedent sequence matches, the consequent property must hold starting at the match endpoint."
 
 ```mlir
-// req |-> ##[1:3] ack
+// req |-> next_a[1 to 3](ack)  (Overlapping: response starts same cycle)
 %ack_within_3 = ltl.delay %ack, 1, 3 : i1
 %prop = ltl.implication %req, %ack_within_3 : i1, !ltl.sequence
 %clocked = ltl.clock %prop, posedge %clk_i1 : !ltl.property
 verif.assert %clocked : !ltl.property
 ```
 
-Direct equivalent of SVA: `assert property (@(posedge clk) req |-> ##[1:3] ack)`.
+*(In Micro-VHDL, `|=>` is non-overlapping (starts next cycle) and `|->` is overlapping (starts same cycle). Both are now fully supported for boolean and sequence operands.)*
 
 #### `ltl.eventually` — liveness
 

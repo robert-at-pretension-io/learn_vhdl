@@ -39,6 +39,7 @@ func (e *Extractor) ExtractAll(root *sitter.Node) ([]*Module, error) {
 	
 	entities := make(map[string]*sitter.Node)
 	arches := make(map[string]*sitter.Node)
+	formals := make(map[string][]*sitter.Node) // Map entity name to its formal blocks
 
 	cursor := root.Walk()
 	if cursor.GotoFirstChild() {
@@ -52,6 +53,12 @@ func (e *Extractor) ExtractAll(root *sitter.Node) ([]*Module, error) {
 				if entityNode := node.ChildByFieldName("entity"); entityNode != nil {
 					arches[e.text(entityNode)] = node
 				}
+			} else if node.Kind() == "psl_formal_verification" {
+				// Standalone verification blocks. For now, we'll associate them
+				// with the first entity found or create a dummy module.
+				// In a full implementation, we might want a separate "Verification" design unit.
+				// For now, let's just collect them globally.
+				formals["global"] = append(formals["global"], node)
 			}
 			if !cursor.GotoNextSibling() {
 				break
@@ -62,14 +69,94 @@ func (e *Extractor) ExtractAll(root *sitter.Node) ([]*Module, error) {
 	for name, entityNode := range entities {
 		e.module = NewModule(name)
 		e.extractInterface(entityNode)
+		
+		// If there's a port named 'clk', assume it's the module clock.
+		for _, p := range e.module.Ports {
+			if p.Name == "clk" {
+				e.module.ClockPort = "clk"
+				break
+			}
+		}
+
 		if archNode, ok := arches[name]; ok {
 			e.extractArchitecture(archNode)
 		}
+		
+		// Add global formal blocks to every module for now, or just the first one.
+		if len(formals["global"]) > 0 {
+			for _, fn := range formals["global"] {
+				e.module.Formals = append(e.module.Formals, e.extractPslFormalVerification(fn))
+			}
+			formals["global"] = nil // only add to the first module
+		}
+
 		modules = append(modules, e.module)
 	}
 
 	return modules, nil
 }
+
+func (e *Extractor) extractPslFormalVerification(node *sitter.Node) *PslFormalBlock {
+	fb := &PslFormalBlock{
+		Symbols: make(map[string]Type),
+	}
+	if nameNode := node.ChildByFieldName("name"); nameNode != nil {
+		fb.Name = e.text(nameNode)
+	}
+
+	cursor := node.Walk()
+	if cursor.GotoFirstChild() {
+		for {
+			n := cursor.Node()
+			if n.Kind() == "psl_assertion" {
+				fb.Statements = append(fb.Statements, e.extractPslAssertion(n))
+			} else if n.Kind() == "psl_assumption" {
+				fb.Statements = append(fb.Statements, e.extractPslAssumption(n))
+			} else if n.Kind() == "psl_cover" {
+				fb.Statements = append(fb.Statements, e.extractPslCover(n))
+			} else if n.Kind() == "psl_assert_never" {
+				fb.Statements = append(fb.Statements, e.extractPslAssertNever(n))
+			} else if n.Kind() == "symbolic_declaration" {
+				// Handle symbolic declaration
+				symNamesNode := n.ChildByFieldName("sym_names")
+				var typeNode *sitter.Node
+				for i := uint(0); i < n.ChildCount(); i++ {
+					if n.Child(i).Kind() == "type_mark" {
+						typeNode = n.Child(i)
+						break
+					}
+				}
+				typ := e.extractType(typeNode)
+				
+				symDecl := &SymbolicDeclaration{
+					Type:    typ,
+					LineNum: uint32(n.StartPosition().Row + 1),
+				}
+				
+				namesCursor := symNamesNode.Walk()
+				if namesCursor.GotoFirstChild() {
+					for {
+						idNode := namesCursor.Node()
+						if idNode.Kind() == "identifier" {
+							name := e.text(idNode)
+							symDecl.Names = append(symDecl.Names, name)
+							fb.Symbols[name] = typ
+						}
+						if !namesCursor.GotoNextSibling() {
+							break
+						}
+					}
+				}
+				fb.Statements = append(fb.Statements, symDecl)
+			}
+			if !cursor.GotoNextSibling() {
+				break
+			}
+		}
+	}
+	return fb
+}
+
 
 func (e *Extractor) extractInterface(entityNode *sitter.Node) {
 	cursor := entityNode.Walk()
@@ -202,14 +289,18 @@ func (e *Extractor) extractType(node *sitter.Node) Type {
 		return Type{Name: "unknown", Width: 0}
 	}
 	text := e.text(node)
-	if text == "std_logic" {
+	if strings.HasPrefix(text, "std_logic") && !strings.Contains(text, "(") {
 		return Type{Name: "std_logic", Width: 1}
 	} else if text == "integer" {
 		return Type{Name: "integer", Width: 32}
 	}
 
-	// Simple check for std_logic_vector
+	// Simple check for std_logic_vector/unsigned
 	if strings.Contains(text, "downto") {
+		// Because we use a tiered grammar, the indices are now nested logical_expressions.
+		// Instead of manual string parsing, let's find the numeric literals if possible,
+		// or just use e.extractExpression if we had a full evaluator.
+		// For now, let's try a more robust string extraction.
 		startIdx := strings.Index(text, "(")
 		downtoIdx := strings.Index(text, "downto")
 		endIdx := strings.Index(text, ")")
@@ -217,6 +308,10 @@ func (e *Extractor) extractType(node *sitter.Node) Type {
 			base := strings.TrimSpace(text[:startIdx])
 			leftStr := strings.TrimSpace(text[startIdx+1 : downtoIdx])
 			rightStr := strings.TrimSpace(text[downtoIdx+6 : endIdx])
+
+			// Clean up any remaining parentheses from nested expression nodes
+			leftStr = strings.Trim(leftStr, "() ")
+			rightStr = strings.Trim(rightStr, "() ")
 
 			left, err1 := strconv.Atoi(leftStr)
 			right, err2 := strconv.Atoi(rightStr)
@@ -229,6 +324,7 @@ func (e *Extractor) extractType(node *sitter.Node) Type {
 
 	return Type{Name: text, Width: 0}
 }
+
 
 func (e *Extractor) extractArchitecture(archNode *sitter.Node) {
 	cursor := archNode.Walk()
@@ -741,6 +837,24 @@ func (e *Extractor) extractExpression(node *sitter.Node) Expression {
 		return nil
 	}
 	kind := node.Kind()
+
+	// Handle tiered grammar nodes (e.g., logical_expression -> relational_expression)
+	// by unwrapping if there is only one named child.
+	if (kind == "logical_expression" || kind == "relational_expression" ||
+		kind == "additive_expression" || kind == "multiplicative_expression") &&
+		node.NamedChildCount() == 1 {
+		return e.extractExpression(node.NamedChild(0))
+	}
+
+	// Check for binary expression patterns in the tiered grammar
+	if node.ChildByFieldName("left") != nil && node.ChildByFieldName("operator") != nil && node.ChildByFieldName("right") != nil {
+		return BinaryExpr{
+			Op:    strings.TrimSpace(e.text(node.ChildByFieldName("operator"))),
+			Left:  e.extractExpression(node.ChildByFieldName("left")),
+			Right: e.extractExpression(node.ChildByFieldName("right")),
+		}
+	}
+
 	switch kind {
 	case "identifier":
 		return IdentifierExpr{Name: e.text(node)}
@@ -761,12 +875,6 @@ func (e *Extractor) extractExpression(node *sitter.Node) Expression {
 		return ParenExpr{
 			Expr: e.extractExpression(node.Child(1)),
 		}
-	case "binary_expression":
-		return BinaryExpr{
-			Op:    strings.TrimSpace(e.text(node.ChildByFieldName("operator"))),
-			Left:  e.extractExpression(node.ChildByFieldName("left")),
-			Right: e.extractExpression(node.ChildByFieldName("right")),
-		}
 	case "unary_expression":
 		return UnaryExpr{
 			Op:    strings.TrimSpace(e.text(node.ChildByFieldName("operator"))),
@@ -774,9 +882,25 @@ func (e *Extractor) extractExpression(node *sitter.Node) Expression {
 		}
 	case "psl_implication":
 		return PslImplicationExpr{
+			Op:    strings.TrimSpace(e.text(node.ChildByFieldName("operator"))),
 			Left:  e.extractExpression(node.ChildByFieldName("left")),
 			Right: e.extractExpression(node.ChildByFieldName("right")),
 		}
+	case "psl_sequence":
+		var elements []PslSequenceElement
+		cursor := node.Walk()
+		if cursor.GotoFirstChild() {
+			for {
+				n := cursor.Node()
+				if n.Kind() == "psl_sequence_element" {
+					elements = append(elements, e.extractPslSequenceElement(n))
+				}
+				if !cursor.GotoNextSibling() {
+					break
+				}
+			}
+		}
+		return PslSequenceExpr{Elements: elements}
 	case "psl_eventually":
 		return PslEventuallyExpr{
 			Left:  e.extractExpression(node.ChildByFieldName("left")),
@@ -801,3 +925,30 @@ func (e *Extractor) extractExpression(node *sitter.Node) Expression {
 
 	return LiteralExpr{Value: e.text(node)}
 }
+
+func (e *Extractor) extractPslSequenceElement(node *sitter.Node) PslSequenceElement {
+	element := PslSequenceElement{}
+	// The first child is the expression (_psl_expression)
+	element.Expr = e.extractExpression(node.Child(0))
+
+	// Check for optional repetition
+	// Tree-sitter includes named fields and anonymous children like ';' or '{'
+	// but psl_sequence_element rule is just seq($._psl_expression, optional($.psl_repetition))
+	// However, sometimes there might be extra hidden children.
+	// It's safer to iterate children.
+	for i := uint(0); i < node.ChildCount(); i++ {
+		child := node.Child(i)
+		if child.Kind() == "psl_repetition" {
+			rep := &PslRepetition{Count: -1}
+			if countNode := child.ChildByFieldName("count"); countNode != nil {
+				rep.Count = e.parseNumber(countNode)
+			} else {
+				rep.Start = e.parseNumber(child.ChildByFieldName("start"))
+				rep.End = e.parseNumber(child.ChildByFieldName("end"))
+			}
+			element.Repetition = rep
+		}
+	}
+	return element
+}
+

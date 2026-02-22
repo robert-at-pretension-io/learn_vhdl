@@ -57,11 +57,19 @@ func (c *SemanticChecker) checkVerificationCoverage(mod *Module) {
 			walkExpr(v.Right)
 		case PslStableExpr:
 			walkExpr(v.Signal)
+		case PslSequenceExpr:
+			for _, el := range v.Elements {
+				walkExpr(el.Expr)
+			}
 		}
 	}
 
 	for _, stmt := range mod.Statements {
 		switch s := stmt.(type) {
+		case *SymbolicDeclaration:
+			for _, name := range s.Names {
+				verifiedSignals[name] = true
+			}
 		case *PslAssertion:
 			walkExpr(s.Property)
 		case *PslAfterResetAssertion:
@@ -70,6 +78,25 @@ func (c *SemanticChecker) checkVerificationCoverage(mod *Module) {
 			walkExpr(s.Property)
 		case *PslCover:
 			walkExpr(s.Property)
+		}
+	}
+
+	for _, fb := range mod.Formals {
+		for _, stmt := range fb.Statements {
+			switch s := stmt.(type) {
+			case *SymbolicDeclaration:
+				for _, name := range s.Names {
+					verifiedSignals[name] = true
+				}
+			case *PslAssertion:
+				walkExpr(s.Property)
+			case *PslAfterResetAssertion:
+				walkExpr(s.Property)
+			case *PslAssertNever:
+				walkExpr(s.Property)
+			case *PslCover:
+				walkExpr(s.Property)
+			}
 		}
 	}
 
@@ -135,18 +162,12 @@ func (c *SemanticChecker) checkPslDelayBounds(mod *Module) {
 		switch v := expr.(type) {
 		case PslNextExpr:
 			foundNext = true
-			if !inImplicationRight {
-				c.errorf(line, "PSL next is only supported on the right side of |=>")
-			}
 			if v.Delay < 1 {
 				c.errorf(line, "PSL next delay must be >= 1")
 			}
 			walkExpr(v.Arg, line, false)
 		case PslNextRangeExpr:
 			foundNext = true
-			if !inImplicationRight {
-				c.errorf(line, "PSL next_a is only supported on the right side of |=>")
-			}
 			if v.Start < 1 {
 				c.errorf(line, "PSL next_a start must be >= 1")
 			}
@@ -162,6 +183,10 @@ func (c *SemanticChecker) checkPslDelayBounds(mod *Module) {
 			walkExpr(v.Right, line, false)
 		case PslStableExpr:
 			walkExpr(v.Signal, line, false)
+		case PslSequenceExpr:
+			for _, el := range v.Elements {
+				walkExpr(el.Expr, line, inImplicationRight)
+			}
 		case BinaryExpr:
 			walkExpr(v.Left, line, false)
 			walkExpr(v.Right, line, false)
@@ -191,6 +216,24 @@ func (c *SemanticChecker) checkPslDelayBounds(mod *Module) {
 		case *PslAfterResetAssertion:
 			walkExpr(s.Reset, s.Line(), false)
 			walkExpr(s.Property, s.Line(), false)
+		}
+	}
+
+	for _, fb := range mod.Formals {
+		for _, stmt := range fb.Statements {
+			switch s := stmt.(type) {
+			case *PslAssertion:
+				walkExpr(s.Property, s.Line(), false)
+			case *PslAssumption:
+				walkExpr(s.Property, s.Line(), false)
+			case *PslCover:
+				walkExpr(s.Property, s.Line(), false)
+			case *PslAssertNever:
+				walkExpr(s.Property, s.Line(), false)
+			case *PslAfterResetAssertion:
+				walkExpr(s.Reset, s.Line(), false)
+				walkExpr(s.Property, s.Line(), false)
+			}
 		}
 	}
 

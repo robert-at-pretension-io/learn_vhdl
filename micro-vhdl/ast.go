@@ -54,6 +54,7 @@ type Module struct {
 	Signals    []*Signal
 	Statements []Statement
 	Contract   *Contract
+	Formals    []*PslFormalBlock
 
 	// Symbol Table
 	Symbols map[string]Type
@@ -65,6 +66,23 @@ func NewModule(name string) *Module {
 		Symbols: make(map[string]Type),
 	}
 }
+
+// PslFormalBlock represents a verif.formal standalone verification block.
+type PslFormalBlock struct {
+	Name       string
+	Symbols    map[string]Type
+	Statements []Statement
+}
+
+type SymbolicDeclaration struct {
+	Names   []string
+	Type    Type
+	LineNum uint32
+}
+
+func (s *SymbolicDeclaration) isStatement()   {}
+func (s *SymbolicDeclaration) Line() uint32 { return s.LineNum }
+
 
 // Statement is the interface for all statements in the architecture body.
 type Statement interface {
@@ -285,11 +303,29 @@ type SelectedNameExpr struct {
 func (SelectedNameExpr) isExpression() {}
 
 type PslImplicationExpr struct {
+	Op    string // "|=>" or "|->"
 	Left  Expression
 	Right Expression
 }
 
 func (PslImplicationExpr) isExpression() {}
+
+type PslSequenceExpr struct {
+	Elements []PslSequenceElement
+}
+
+func (PslSequenceExpr) isExpression() {}
+
+type PslSequenceElement struct {
+	Expr       Expression
+	Repetition *PslRepetition
+}
+
+type PslRepetition struct {
+	Count int // if >= 0, it's [*count]
+	Start int // if Count < 0, it's [*start to end]
+	End   int
+}
 
 type PslEventuallyExpr struct {
 	Left  Expression

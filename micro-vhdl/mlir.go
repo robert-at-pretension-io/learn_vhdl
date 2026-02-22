@@ -110,6 +110,111 @@ func (e *MLIREmitter) emitCompReg(val string, clk string, typ string, name strin
 	return res
 }
 
+func (e *MLIREmitter) emitFormalStatementList(stmts []Statement, mod *Module, env map[string]string, extraSymbols map[string]Type) {
+	for _, stmt := range stmts {
+		switch s := stmt.(type) {
+		case *SymbolicDeclaration:
+			t := typeToMLIR(s.Type, mod)
+			for _, name := range s.Names {
+				e.p("%%%s = verif.symbolic_value : %s", name, t)
+				env[name] = fmt.Sprintf("%%%s", name)
+			}
+		case *PslAssertion:
+			val, typ := e.emitExpression(s.Property, mod, env, "", "", extraSymbols)
+			e.assertions = append(e.assertions, assertionEntry{val, typ})
+		case *PslAssumption:
+			val, typ := e.emitExpression(s.Property, mod, env, "", "", extraSymbols)
+			e.assumptions = append(e.assumptions, assertionEntry{val, typ})
+		case *PslCover:
+			val, typ := e.emitExpression(s.Property, mod, env, "", "", extraSymbols)
+			e.p("verif.cover %s : %s", val, typ)
+		case *PslAssertNever:
+			val, _ := e.emitExpression(s.Property, mod, env, "", "i1", extraSymbols)
+			trueVal := e.nextSSA()
+			notProp := e.nextSSA()
+			e.p("%s = hw.constant -1 : i1", trueVal)
+			e.p("%s = comb.xor %s, %s : i1", notProp, val, trueVal)
+			e.assertions = append(e.assertions, assertionEntry{notProp, "i1"})
+		}
+	}
+}
+
+func (e *MLIREmitter) emitPslFormalBlock(fb *PslFormalBlock, mod *Module) {
+	e.p("verif.formal @%s {} {", fb.Name)
+	e.indent++
+
+	// Reset per-module assertion tracking for the formal block.
+	oldAsserts := e.assertions
+	oldAssumes := e.assumptions
+	e.assertions = e.assertions[:0]
+	e.assumptions = e.assumptions[:0]
+
+	env := make(map[string]string)
+	e.emitFormalStatementList(fb.Statements, mod, env, fb.Symbols)
+	
+	// Boolean assertions are combined into a single verif.assert (circt-bmc requirements).
+	var boolAsserts []string
+	var temporalAsserts []assertionEntry
+	for _, a := range e.assertions {
+		if a.typ == "i1" {
+			boolAsserts = append(boolAsserts, a.val)
+		} else {
+			temporalAsserts = append(temporalAsserts, a)
+		}
+	}
+	
+	var combinedAssume string
+	for _, a := range e.assumptions {
+		if a.typ != "i1" { continue }
+		if combinedAssume == "" {
+			combinedAssume = a.val
+		} else {
+			res := e.nextSSA()
+			e.p("%s = comb.and %s, %s : i1", res, combinedAssume, a.val)
+			combinedAssume = res
+		}
+	}
+	if combinedAssume != "" {
+		e.p("verif.assume %s : i1", combinedAssume)
+	}
+
+	var combined string
+	if len(boolAsserts) == 1 {
+		combined = boolAsserts[0]
+	} else if len(boolAsserts) > 1 {
+		combined = boolAsserts[0]
+		for _, next := range boolAsserts[1:] {
+			res := e.nextSSA()
+			e.p("%s = comb.and %s, %s : i1", res, combined, next)
+			combined = res
+		}
+	}
+	if combined != "" {
+		e.p("verif.assert %s : i1", combined)
+	}
+	for _, ta := range temporalAsserts {
+		if ta.typ == "!ltl.sequence" {
+			clkI1 := e.clockI1(mod)
+			if clkI1 != "" {
+				clocked := e.nextSSA()
+				e.p("%s = ltl.clock %s, posedge %s : !ltl.property", clocked, ta.val, clkI1)
+				e.p("verif.assert %s : !ltl.property", clocked)
+			} else {
+				e.p("// ERROR: PSL temporal property requires a clock")
+			}
+		} else {
+			e.p("verif.assert %s : !ltl.property", ta.val)
+		}
+	}
+
+	e.indent--
+	e.p("}")
+	
+	// Restore parent module's assertion tracking.
+	e.assertions = oldAsserts
+	e.assumptions = oldAssumes
+}
+
 // emitDelay emits a chain of seq.compreg registers to delay a value by N cycles.
 func (e *MLIREmitter) emitDelay(val string, typ string, delay int, clk string) string {
 	res := val
@@ -170,7 +275,7 @@ func resolveType(mod *Module, typeName string) Type {
 	return t
 }
 
-func (e *MLIREmitter) emitExpression(expr Expression, mod *Module, env map[string]string, targetName string, expectedType string) (string, string) {
+func (e *MLIREmitter) emitExpression(expr Expression, mod *Module, env map[string]string, targetName string, expectedType string, extraSymbols map[string]Type) (string, string) {
 	var resVal string
 	if targetName != "" {
 		resVal = fmt.Sprintf("%%%s", targetName)
@@ -180,18 +285,25 @@ func (e *MLIREmitter) emitExpression(expr Expression, mod *Module, env map[strin
 
 	switch v := expr.(type) {
 	case ParenExpr:
-		return e.emitExpression(v.Expr, mod, env, targetName, expectedType)
+		return e.emitExpression(v.Expr, mod, env, targetName, expectedType, extraSymbols)
 	case IdentifierExpr:
-		t := mod.Symbols[v.Name]
+		t, ok := mod.Symbols[v.Name]
+		if !ok && extraSymbols != nil {
+			t = extraSymbols[v.Name]
+		}
 		if mapped, ok := env[v.Name]; ok {
 			return mapped, typeToMLIR(t, mod)
 		}
 		return fmt.Sprintf("%%%s", v.Name), typeToMLIR(t, mod)
 	case IndexedNameExpr:
-		prefixVal, prefixType := e.emitExpression(IdentifierExpr{Name: v.Prefix}, mod, env, "", "")
-		indexVal, _ := e.emitExpression(v.Index, mod, env, "", "i32")
+		prefixVal, prefixType := e.emitExpression(IdentifierExpr{Name: v.Prefix}, mod, env, "", "", extraSymbols)
+		indexVal, _ := e.emitExpression(v.Index, mod, env, "", "i32", extraSymbols)
 		
-		t := resolveType(mod, mod.Symbols[v.Prefix].Name)
+		sym, ok := mod.Symbols[v.Prefix]
+		if !ok && extraSymbols != nil {
+			sym = extraSymbols[v.Prefix]
+		}
+		t := resolveType(mod, sym.Name)
 		var elType string
 		if t.ElementType != nil {
 			elType = typeToMLIR(*t.ElementType, mod)
@@ -202,9 +314,13 @@ func (e *MLIREmitter) emitExpression(expr Expression, mod *Module, env map[strin
 		e.p("%s = hw.array_get %s[%s] : %s, i32", resVal, prefixVal, indexVal, prefixType)
 		return resVal, elType
 	case SelectedNameExpr:
-		prefixVal, prefixType := e.emitExpression(IdentifierExpr{Name: v.Prefix}, mod, env, "", "")
+		prefixVal, prefixType := e.emitExpression(IdentifierExpr{Name: v.Prefix}, mod, env, "", "", extraSymbols)
 		
-		t := resolveType(mod, mod.Symbols[v.Prefix].Name)
+		sym, ok := mod.Symbols[v.Prefix]
+		if !ok && extraSymbols != nil {
+			sym = extraSymbols[v.Prefix]
+		}
+		t := resolveType(mod, sym.Name)
 		var elType string
 		for _, f := range t.Fields {
 			if f.Name == v.Suffix {
@@ -244,13 +360,21 @@ func (e *MLIREmitter) emitExpression(expr Expression, mod *Module, env map[strin
 		// Attempt to peek left and right types
 		var inferredType string
 		if id, ok := v.Left.(IdentifierExpr); ok {
-			inferredType = typeToMLIR(mod.Symbols[id.Name], mod)
+			t, ok := mod.Symbols[id.Name]
+			if !ok && extraSymbols != nil {
+				t = extraSymbols[id.Name]
+			}
+			inferredType = typeToMLIR(t, mod)
 		} else if id, ok := v.Right.(IdentifierExpr); ok {
-			inferredType = typeToMLIR(mod.Symbols[id.Name], mod)
+			t, ok := mod.Symbols[id.Name]
+			if !ok && extraSymbols != nil {
+				t = extraSymbols[id.Name]
+			}
+			inferredType = typeToMLIR(t, mod)
 		}
 
-		leftVal, leftType := e.emitExpression(v.Left, mod, env, "", inferredType)
-		rightVal, rightType := e.emitExpression(v.Right, mod, env, "", inferredType)
+		leftVal, leftType := e.emitExpression(v.Left, mod, env, "", inferredType, extraSymbols)
+		rightVal, rightType := e.emitExpression(v.Right, mod, env, "", inferredType, extraSymbols)
 		
 		// Unify types
 		finalType := leftType
@@ -280,7 +404,7 @@ func (e *MLIREmitter) emitExpression(expr Expression, mod *Module, env map[strin
 		return resVal, finalType
 	case UnaryExpr:
 		if v.Op == "not" {
-			rightVal, rightType := e.emitExpression(v.Right, mod, env, "", expectedType)
+			rightVal, rightType := e.emitExpression(v.Right, mod, env, "", expectedType, extraSymbols)
 			trueVal := e.nextSSA()
 			e.p("%s = hw.constant -1 : %s", trueVal, rightType)
 			e.p("%s = comb.xor %s, %s : %s", resVal, rightVal, trueVal, rightType)
@@ -288,11 +412,15 @@ func (e *MLIREmitter) emitExpression(expr Expression, mod *Module, env map[strin
 		}
 	case PslImplicationExpr:
 		// PSL |=> is next-cycle: "if left holds at cycle N, right must hold at cycle N+1."
-		// Implement as: delay left by one clock cycle, then check boolean implication.
+		// PSL |-> is same-cycle: "if left holds at cycle N, right must hold at cycle N."
+		// Implement as: delay left by one clock cycle for |=>, or use |-> semantics.
 		// next[N] and next_a[M to N] are encoded with explicit shift-register monitors.
+
+		isNonOverlapping := v.Op == "|=>"
+
 		if rightNext, ok := v.Right.(PslNextExpr); ok {
-			leftVal, _ := e.emitExpression(v.Left, mod, env, "", "i1")
-			rightVal, _ := e.emitExpression(rightNext.Arg, mod, env, "", "i1")
+			leftVal, _ := e.emitExpression(v.Left, mod, env, "", "i1", extraSymbols)
+			rightVal, _ := e.emitExpression(rightNext.Arg, mod, env, "", "i1", extraSymbols)
 
 			clkI1 := e.clockI1(mod)
 			if clkI1 == "" {
@@ -304,9 +432,14 @@ func (e *MLIREmitter) emitExpression(expr Expression, mod *Module, env map[strin
 				delay = 1
 			}
 
-			// Encode |=> next[N] as ltl.implication with delay (N+1).
+			// Encode implication with delay.
+			actualDelay := delay
+			if isNonOverlapping {
+				actualDelay++
+			}
+
 			seqVal := e.nextSSA()
-			e.p("%s = ltl.delay %s, %d, 0 : i1", seqVal, rightVal, delay+1)
+			e.p("%s = ltl.delay %s, %d, 0 : i1", seqVal, rightVal, actualDelay)
 			impVal := e.nextSSA()
 			e.p("%s = ltl.implication %s, %s : i1, !ltl.sequence", impVal, leftVal, seqVal)
 			clocked := e.nextSSA()
@@ -314,8 +447,8 @@ func (e *MLIREmitter) emitExpression(expr Expression, mod *Module, env map[strin
 			return clocked, "!ltl.property"
 		}
 		if rightRange, ok := v.Right.(PslNextRangeExpr); ok {
-			leftVal, _ := e.emitExpression(v.Left, mod, env, "", "i1")
-			rightVal, _ := e.emitExpression(rightRange.Arg, mod, env, "", "i1")
+			leftVal, _ := e.emitExpression(v.Left, mod, env, "", "i1", extraSymbols)
+			rightVal, _ := e.emitExpression(rightRange.Arg, mod, env, "", "i1", extraSymbols)
 
 			clkI1 := e.clockI1(mod)
 			if clkI1 == "" {
@@ -332,9 +465,18 @@ func (e *MLIREmitter) emitExpression(expr Expression, mod *Module, env map[strin
 				end = start
 			}
 
-			// Encode |=> next_a[M to N] as ltl.implication with delay (M+1, N-M).
+			// Encode implication with range delay.
+			actualStart := start
+			if isNonOverlapping {
+				actualStart++
+			}
+			actualEnd := end
+			if isNonOverlapping {
+				actualEnd++
+			}
+
 			seqVal := e.nextSSA()
-			e.p("%s = ltl.delay %s, %d, %d : i1", seqVal, rightVal, start+1, end-start)
+			e.p("%s = ltl.delay %s, %d, %d : i1", seqVal, rightVal, actualStart, actualEnd-actualStart)
 			impVal := e.nextSSA()
 			e.p("%s = ltl.implication %s, %s : i1, !ltl.sequence", impVal, leftVal, seqVal)
 			clocked := e.nextSSA()
@@ -342,9 +484,28 @@ func (e *MLIREmitter) emitExpression(expr Expression, mod *Module, env map[strin
 			return clocked, "!ltl.property"
 		}
 
-		leftVal, _ := e.emitExpression(v.Left, mod, env, "", "i1")
-		rightVal, _ := e.emitExpression(v.Right, mod, env, "", "i1")
+		leftVal, _ := e.emitExpression(v.Left, mod, env, "", "i1", extraSymbols)
+		rightVal, rightType := e.emitExpression(v.Right, mod, env, "", "i1", extraSymbols)
 
+		if !isNonOverlapping && rightType == "i1" {
+			// Boolean implication for |->: !left || right
+			trueVal := e.nextSSA()
+			notLeft := e.nextSSA()
+			e.p("%s = hw.constant -1 : i1", trueVal)
+			e.p("%s = comb.xor %s, %s : i1", notLeft, leftVal, trueVal)
+			e.p("%s = comb.or %s, %s : i1", resVal, notLeft, rightVal)
+			return resVal, "i1"
+		} else if !isNonOverlapping && (rightType == "!ltl.sequence" || rightType == "!ltl.property") {
+			// Overlapping implication with LTL sequence/property
+			clkI1 := e.clockI1(mod)
+			impVal := e.nextSSA()
+			e.p("%s = ltl.implication %s, %s : i1, %s", impVal, leftVal, rightVal, rightType)
+			clocked := e.nextSSA()
+			e.p("%s = ltl.clock %s, posedge %s : !ltl.property", clocked, impVal, clkI1)
+			return clocked, "!ltl.property"
+		}
+
+		// Handle |=> for booleans or generic types by delaying the antecedent
 		clk := e.clockSSA(mod)
 		initSSA := e.emitSeqInitial("i1")
 		delayedVal := e.nextSSA()
@@ -354,13 +515,50 @@ func (e *MLIREmitter) emitExpression(expr Expression, mod *Module, env map[strin
 			e.p("%s = seq.compreg %s, %s : i1", delayedVal, leftVal, clk)
 		}
 
-		// Boolean implication: !left_d1 || right
-		trueVal := e.nextSSA()
-		notDelayed := e.nextSSA()
-		e.p("%s = hw.constant -1 : i1", trueVal)
-		e.p("%s = comb.xor %s, %s : i1", notDelayed, delayedVal, trueVal)
-		e.p("%s = comb.or %s, %s : i1", resVal, notDelayed, rightVal)
-		return resVal, "i1"
+		if rightType == "i1" {
+			// Boolean implication: !left_d1 || right
+			trueVal := e.nextSSA()
+			notDelayed := e.nextSSA()
+			e.p("%s = hw.constant -1 : i1", trueVal)
+			e.p("%s = comb.xor %s, %s : i1", notDelayed, delayedVal, trueVal)
+			e.p("%s = comb.or %s, %s : i1", resVal, notDelayed, rightVal)
+			return resVal, "i1"
+		} else {
+			// Non-overlapping implication with LTL sequence/property
+			clkI1 := e.clockI1(mod)
+			impVal := e.nextSSA()
+			e.p("%s = ltl.implication %s, %s : i1, %s", impVal, delayedVal, rightVal, rightType)
+			clocked := e.nextSSA()
+			e.p("%s = ltl.clock %s, posedge %s : !ltl.property", clocked, impVal, clkI1)
+			return clocked, "!ltl.property"
+		}
+
+	case PslSequenceExpr:
+		var seqVals []string
+		var seqTypes []string
+		for _, el := range v.Elements {
+			elVal, elType := e.emitExpression(el.Expr, mod, env, "", "i1", extraSymbols)
+			if el.Repetition != nil {
+				repVal := e.nextSSA()
+				if el.Repetition.Count >= 0 {
+					e.p("%s = ltl.repeat %s, %d : %s", repVal, elVal, el.Repetition.Count, elType)
+				} else {
+					e.p("%s = ltl.repeat %s, %d, %d : %s", repVal, elVal, el.Repetition.Start, el.Repetition.End, elType)
+				}
+				elVal = repVal
+				elType = "!ltl.sequence"
+			}
+			seqVals = append(seqVals, elVal)
+			seqTypes = append(seqTypes, elType)
+		}
+
+		if len(seqVals) == 1 {
+			return seqVals[0], seqTypes[0]
+		}
+
+		resVal := e.nextSSA()
+		e.p("%s = ltl.concat %s : %s", resVal, strings.Join(seqVals, ", "), strings.Join(seqTypes, ", "))
+		return resVal, "!ltl.sequence"
 
 	case PslEventuallyExpr:
 		// PSL "left -> eventually! right" is a liveness property: right must become
@@ -376,7 +574,7 @@ func (e *MLIREmitter) emitExpression(expr Expression, mod *Module, env map[strin
 	case PslStableExpr:
 		// PSL stable(x): x has not changed from the previous clock cycle.
 		// Implement by storing the previous value in a register and comparing.
-		sigVal, sigType := e.emitExpression(v.Signal, mod, env, "", "")
+		sigVal, sigType := e.emitExpression(v.Signal, mod, env, "", "", extraSymbols)
 
 		clk := e.clockSSA(mod)
 		initSSA := e.emitSeqInitial(sigType)
@@ -389,7 +587,7 @@ func (e *MLIREmitter) emitExpression(expr Expression, mod *Module, env map[strin
 		e.p("%s = comb.icmp eq %s, %s : %s", resVal, sigVal, prevVal, sigType)
 		return resVal, "i1"
 	case PslNextExpr:
-		argVal, _ := e.emitExpression(v.Arg, mod, env, "", "i1")
+		argVal, _ := e.emitExpression(v.Arg, mod, env, "", "i1", extraSymbols)
 		delay := v.Delay
 		if delay < 1 {
 			delay = 1
@@ -397,7 +595,7 @@ func (e *MLIREmitter) emitExpression(expr Expression, mod *Module, env map[strin
 		e.p("%s = ltl.delay %s, %d, 0 : i1", resVal, argVal, delay)
 		return resVal, "!ltl.sequence"
 	case PslNextRangeExpr:
-		argVal, _ := e.emitExpression(v.Arg, mod, env, "", "i1")
+		argVal, _ := e.emitExpression(v.Arg, mod, env, "", "i1", extraSymbols)
 		start := v.Start
 		end := v.End
 		if start < 1 {
@@ -411,6 +609,7 @@ func (e *MLIREmitter) emitExpression(expr Expression, mod *Module, env map[strin
 	}
 	return e.nextSSA(), "i1"
 }
+
 
 
 
@@ -463,18 +662,18 @@ func (e *MLIREmitter) buildSeqBlock(stmts []SequentialStatement, target string, 
 		switch s := stmt.(type) {
 		case *SequentialAssignment:
 			if s.Target == target {
-				val, _ := e.emitExpression(s.Value, mod, env, "", targetType)
+				val, _ := e.emitExpression(s.Value, mod, env, "", targetType, nil)
 				nextState = val
 			}
 		case *SequentialIf:
-			condVal, _ := e.emitExpression(s.Condition, mod, env, "", "i1")
+			condVal, _ := e.emitExpression(s.Condition, mod, env, "", "i1", nil)
 			
 			thenState := e.buildSeqBlock(s.Then, target, nextState, mod, env)
 			elseState := e.buildSeqBlock(s.Else, target, nextState, mod, env)
 			
 			for i := len(s.Elsifs) - 1; i >= 0; i-- {
 				el := s.Elsifs[i]
-				elCondVal, _ := e.emitExpression(el.Condition, mod, env, "", "i1")
+				elCondVal, _ := e.emitExpression(el.Condition, mod, env, "", "i1", nil)
 				elThenState := e.buildSeqBlock(el.Then, target, nextState, mod, env)
 				if elThenState != elseState {
 					res := e.nextSSA()
@@ -549,7 +748,7 @@ func (e *MLIREmitter) emitEntityInstantiation(inst *EntityInstantiation, parentM
 
 		if port.Direction == "in" {
 			if actualExpr != nil {
-				val, _ := e.emitExpression(actualExpr, parentMod, env, "", "")
+				val, _ := e.emitExpression(actualExpr, parentMod, env, "", "", nil)
 				inputs = append(inputs, fmt.Sprintf("%s: %s: %s", port.Name, val, t))
 			} else {
 				inputs = append(inputs, fmt.Sprintf("%s: %%missing: %s", port.Name, t))
@@ -671,12 +870,23 @@ func (e *MLIREmitter) emitCombinedAssertions(mod *Module) {
 		}
 	}
 
-	// Temporal (!ltl.property) assertions are emitted directly in BMC mode.
+	// Temporal (!ltl.property and !ltl.sequence) assertions are emitted directly in BMC mode.
 	for _, ta := range temporalAsserts {
 		if e.ic3Mode {
 			e.p("// temporal assertion skipped in IC3 path (type %s): %s", ta.typ, ta.val)
 		} else {
-			e.p("verif.assert %s : !ltl.property", ta.val)
+			if ta.typ == "!ltl.sequence" {
+				clkI1 := e.clockI1(mod)
+				if clkI1 != "" {
+					clocked := e.nextSSA()
+					e.p("%s = ltl.clock %s, posedge %s : !ltl.property", clocked, ta.val, clkI1)
+					e.p("verif.assert %s : !ltl.property", clocked)
+				} else {
+					e.p("// ERROR: PSL temporal property requires a clock")
+				}
+			} else {
+				e.p("verif.assert %s : !ltl.property", ta.val)
+			}
 		}
 	}
 }
@@ -749,6 +959,11 @@ func (e *MLIREmitter) EmitModule(mod *Module) {
 	// Combine all accumulated PSL assertions into a single verif.assert.
 	e.emitCombinedAssertions(mod)
 
+	// Emit any formal blocks associated with this module.
+	for _, fb := range mod.Formals {
+		e.emitPslFormalBlock(fb, mod)
+	}
+
 	// Emit hw.output using the tracked drivers.
 	// In IC3 mode, append the bad-state signal as the final output.
 	var outVals []string
@@ -784,7 +999,7 @@ func (e *MLIREmitter) EmitModule(mod *Module) {
 		e.indent++
 
 		for _, req := range mod.Contract.Requires {
-			val, _ := e.emitExpression(req, mod, env, "", "i1")
+			val, _ := e.emitExpression(req, mod, env, "", "i1", nil)
 			e.p("verif.require %s : i1", val)
 		}
 
@@ -801,7 +1016,7 @@ func (e *MLIREmitter) EmitModule(mod *Module) {
 		}
 
 		for _, ens := range mod.Contract.Ensures {
-			val, _ := e.emitExpression(ens, mod, ensureEnv, "", "i1")
+			val, _ := e.emitExpression(ens, mod, ensureEnv, "", "i1", nil)
 			e.p("verif.ensure %s : i1", val)
 		}
 
@@ -828,29 +1043,35 @@ func (e *MLIREmitter) EmitModule(mod *Module) {
 func (e *MLIREmitter) emitStatementList(stmts []Statement, mod *Module, env map[string]string) {
 	for _, stmt := range stmts {
 		switch s := stmt.(type) {
+		case *SymbolicDeclaration:
+			t := typeToMLIR(s.Type, mod)
+			for _, name := range s.Names {
+				e.p("%%%s = verif.symbolic_value : %s", name, t)
+				env[name] = fmt.Sprintf("%%%s", name)
+			}
 		case *EntityInstantiation:
 			e.emitEntityInstantiation(s, mod, env)
 		case *ConcurrentAssignment:
 			if s.Condition != nil {
 				t := typeToMLIR(mod.Symbols[s.Target], mod)
-				val, _ := e.emitExpression(s.Value, mod, env, "", t)
-				condVal, _ := e.emitExpression(s.Condition, mod, env, "", "i1")
-				altVal, _ := e.emitExpression(s.AltValue, mod, env, "", t)
+				val, _ := e.emitExpression(s.Value, mod, env, "", t, nil)
+				condVal, _ := e.emitExpression(s.Condition, mod, env, "", "i1", nil)
+				altVal, _ := e.emitExpression(s.AltValue, mod, env, "", t, nil)
 				e.p("%%%s = comb.mux %s, %s, %s : %s", s.Target, condVal, val, altVal, t)
 				env[s.Target] = fmt.Sprintf("%%%s", s.Target)
 			} else {
 				t := typeToMLIR(mod.Symbols[s.Target], mod)
-				val, _ := e.emitExpression(s.Value, mod, env, s.Target, t)
+				val, _ := e.emitExpression(s.Value, mod, env, s.Target, t, nil)
 				env[s.Target] = val
 			}
 		case *SelectedAssignment:
-			selVal, selType := e.emitExpression(s.Selector, mod, env, "", "")
+			selVal, selType := e.emitExpression(s.Selector, mod, env, "", "", nil)
 			t := typeToMLIR(mod.Symbols[s.Target], mod)
 
 			var currentState string
 			for _, choice := range s.Choices {
 				if choice.IsOthers {
-					currentState, _ = e.emitExpression(choice.Value, mod, env, "", t)
+					currentState, _ = e.emitExpression(choice.Value, mod, env, "", t, nil)
 					break
 				}
 			}
@@ -865,12 +1086,12 @@ func (e *MLIREmitter) emitStatementList(stmts []Statement, mod *Module, env map[
 				if choice.IsOthers {
 					continue
 				}
-				condExprVal, _ := e.emitExpression(choice.Condition, mod, env, "", selType)
+				condExprVal, _ := e.emitExpression(choice.Condition, mod, env, "", selType, nil)
 				
 				cmpVal := e.nextSSA()
 				e.p("%s = comb.icmp eq %s, %s : %s", cmpVal, selVal, condExprVal, selType)
 				
-				val, _ := e.emitExpression(choice.Value, mod, env, "", t)
+				val, _ := e.emitExpression(choice.Value, mod, env, "", t, nil)
 				
 				resName := e.nextSSA()[1:] // drop the %
 				if i == 0 {
@@ -903,20 +1124,20 @@ func (e *MLIREmitter) emitStatementList(stmts []Statement, mod *Module, env map[
 				}
 			}
 	case *PslAssertion:
-		propVal, propType := e.emitExpression(s.Property, mod, env, "", "")
+		propVal, propType := e.emitExpression(s.Property, mod, env, "", "", nil)
 		// Accumulate instead of emitting directly; EmitModule combines them.
 		e.assertions = append(e.assertions, assertionEntry{propVal, propType})
 	case *PslAssumption:
-		propVal, propType := e.emitExpression(s.Property, mod, env, "", "")
+		propVal, propType := e.emitExpression(s.Property, mod, env, "", "", nil)
 		// Accumulate assumptions; emitCombinedAssertions handles them.
 		e.assumptions = append(e.assumptions, assertionEntry{propVal, propType})
 	case *PslCover:
-		propVal, propType := e.emitExpression(s.Property, mod, env, "", "")
+		propVal, propType := e.emitExpression(s.Property, mod, env, "", "", nil)
 		if !e.ic3Mode {
 			e.p("verif.cover %s : %s", propVal, propType)
 		}
 	case *PslAssertNever:
-		propVal, _ := e.emitExpression(s.Property, mod, env, "", "i1")
+		propVal, _ := e.emitExpression(s.Property, mod, env, "", "i1", nil)
 		trueVal := e.nextSSA()
 		notProp := e.nextSSA()
 		e.p("%s = hw.constant -1 : i1", trueVal)
@@ -949,7 +1170,7 @@ func (e *MLIREmitter) emitAfterResetAssertion(s *PslAfterResetAssertion, mod *Mo
 	clk := e.clockSSA(mod)
 
 	// Evaluate the reset signal expression.
-	resetVal, _ := e.emitExpression(s.Reset, mod, env, "", "i1")
+	resetVal, _ := e.emitExpression(s.Reset, mod, env, "", "i1", nil)
 
 	// Pre-allocate the SSA name for rst_ever_high so next_rst_ever_high can
 	// reference it as a forward reference (CIRCT allows this for register outputs).
@@ -969,7 +1190,7 @@ func (e *MLIREmitter) emitAfterResetAssertion(s *PslAfterResetAssertion, mod *Mo
 	}
 
 	// Evaluate the guarded property.
-	propVal, _ := e.emitExpression(s.Property, mod, env, "", "i1")
+	propVal, _ := e.emitExpression(s.Property, mod, env, "", "i1", nil)
 
 	// effective = NOT(rst_ever_high) OR rst OR property
 	//   NOT(rst_ever_high): vacuous before any reset
