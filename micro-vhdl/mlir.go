@@ -809,12 +809,13 @@ func (e *MLIREmitter) emitEntityInstantiation(inst *EntityInstantiation, parentM
 }
 
 // EmitModules translates multiple Modules
-func (e *MLIREmitter) EmitModules(mods []*Module) {
+func (e *MLIREmitter) EmitModules(mods []*Module, topModuleName string) {
 	for _, mod := range mods {
 		e.modules[mod.Name] = mod
 	}
 	for _, mod := range mods {
-		e.EmitModule(mod)
+		isPrivate := mod.Name != topModuleName
+		e.EmitModule(mod, isPrivate)
 		e.p("")
 	}
 }
@@ -905,13 +906,19 @@ func (e *MLIREmitter) emitCombinedAssertions(mod *Module) {
 }
 
 // EmitModule translates the Module into a hw.module definition
-func (e *MLIREmitter) EmitModule(mod *Module) {
+func (e *MLIREmitter) EmitModule(mod *Module, isPrivate bool) {
 	e.assertions = e.assertions[:0]  // reset accumulator for this module
 	e.assumptions = e.assumptions[:0] // reset accumulator for this module
 	e.livenessAsserts = e.livenessAsserts[:0]
 	e.badStateSSA = ""
 	e.nameID = 0
 	e.clockI1SSA = ""
+
+	visibility := ""
+	if isPrivate {
+		visibility = " private"
+	}
+
 	// Construct signature
 	var ports []string
 	var outputs []string
@@ -954,7 +961,7 @@ func (e *MLIREmitter) EmitModule(mod *Module) {
 		genStr = fmt.Sprintf("<%s>", strings.Join(generics, ", "))
 	}
 
-	e.p("hw.module @%s%s(%s) {", mod.Name, genStr, sigPorts)
+	e.p("hw.module%s @%s%s(%s) {", visibility, mod.Name, genStr, sigPorts)
 	e.indent++
 
 	e.p("// --- Body ---")

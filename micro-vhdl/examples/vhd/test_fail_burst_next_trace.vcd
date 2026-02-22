@@ -1,0 +1,37 @@
+$date
+    2026-02-22 21:25:09
+$end
+$version
+    Micro-VHDL BTOR2VCD
+$end
+$timescale
+    1ns
+$end
+$scope module trace $end
+$var wire 1 + clk $end
+$var wire 1 ! active $end
+$var wire 2 " cnt $end
+$var wire 1 # valid_out $end
+$var wire 1 $ ltl_delay_0 $end
+$var wire 1 % ltl_delay_1 $end
+$var wire 1 & ltl_delay_2 $end
+$var wire 1 ' ltl_delay_3 $end
+$var wire 1 ( ltl_delay_4 $end
+$var wire 1 ) ltl_delay_5 $end
+$var wire 1 * req $end
+$upscope $end
+$enddefinitions $end
+#0
+1+
+1*
+0!
+b00 "
+0#
+0$
+0%
+0&
+0'
+0(
+0)
+#5
+0+

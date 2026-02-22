@@ -1,0 +1,23 @@
+1 sort bitvec 32
+2 input 1 a
+3 state 1 
+4 constd 1 1
+5 add 1 2 4
+6 constd 1 10
+7 sort bitvec 1
+8 neq 7 3 6
+9 not 7 8
+10 bad 9
+11 next 1 3 5
+module {
+  hw.module @test(in %clk : !seq.clock, in %a : i32, out z : i32) {
+    %c1_i32 = hw.constant 1 : i32
+    %0 = comb.add %a, %c1_i32 : i32
+    %1 = seq.compreg %0, %clk : i32  
+    %c10_i32 = hw.constant 10 : i32
+    %2 = comb.icmp ne %1, %c10_i32 : i32
+    verif.assert %2 : i1
+    hw.output %1 : i32
+  }
+}
+

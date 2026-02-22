@@ -1,0 +1,17 @@
+1 sort bitvec 1
+2 input 1 rst
+3 sort bitvec 32
+4 input 3 a
+5 state 3 
+6 constd 3 1
+7 add 3 4 6
+8 next 3 5 7
+module {
+  hw.module @test(in %clk : !seq.clock, in %rst : i1, in %a : i32, out z : i32) {
+    %c1_i32 = hw.constant 1 : i32
+    %0 = comb.add %a, %c1_i32 : i32
+    %1 = seq.compreg %0, %clk : i32  
+    hw.output %1 : i32
+  }
+}
+

@@ -15,6 +15,7 @@ func NewSemanticChecker(mods []*Module) *SemanticChecker {
 }
 
 func (c *SemanticChecker) Check() []string {
+	c.checkCrossModuleInstantiations() // <-- Run cross-module checks first
 	for _, mod := range c.modules {
 		c.checkUndeclaredWires(mod)
 		c.checkInputImmutability(mod)
@@ -398,5 +399,55 @@ func (c *SemanticChecker) walkSequentialStmtForDriven(stmts []SequentialStatemen
 			}
 			c.walkSequentialStmtForDriven(sa.Else, procDriven)
 		}
+	}
+}
+
+func (c *SemanticChecker) checkCrossModuleInstantiations() {
+	modMap := make(map[string]*Module)
+	for _, m := range c.modules {
+		modMap[m.Name] = m
+	}
+
+	for _, mod := range c.modules {
+		var walk func(stmts []Statement)
+		walk = func(stmts []Statement) {
+			for _, stmt := range stmts {
+				switch s := stmt.(type) {
+				case *EntityInstantiation:
+					child, exists := modMap[s.EntityName]
+					if !exists {
+						c.errorf(s.LineNum, "Instantiated entity '%s' not found. Missing .vhd file?", s.EntityName)
+						continue
+					}
+					
+					childPorts := make(map[string]*Port)
+					for _, p := range child.Ports {
+						childPorts[p.Name] = p
+					}
+					
+					mappedPorts := make(map[string]bool)
+					for _, pmap := range s.PortMap {
+						mappedPorts[pmap.Formal] = true
+						if portDef, ok := childPorts[pmap.Formal]; !ok {
+							c.errorf(s.LineNum, "Port '%s' does not exist on entity '%s'", pmap.Formal, s.EntityName)
+						} else if portDef.Direction == "out" {
+							// Output ports must map to a pure wire, not an expression
+							if _, isId := pmap.Actual.(IdentifierExpr); !isId {
+								c.errorf(s.LineNum, "Output port '%s' of instance '%s' must map to a pure wire identifier, not an expression", pmap.Formal, s.Label)
+							}
+						}
+					}
+
+					for _, p := range child.Ports {
+						if p.Direction == "in" && !mappedPorts[p.Name] {
+							c.errorf(s.LineNum, "Input port '%s' on entity '%s' is left unconnected", p.Name, s.EntityName)
+						}
+					}
+				case *GenerateStatement:
+					walk(s.Statements)
+				}
+			}
+		}
+		walk(mod.Statements)
 	}
 }

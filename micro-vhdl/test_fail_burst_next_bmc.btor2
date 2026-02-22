@@ -1,0 +1,73 @@
+1 sort bitvec 1
+2 input 1 req
+3 sort bitvec 2
+4 constd 3 0
+5 state 3 cnt
+6 init 3 5 4
+7 constd 1 0
+8 state 1 valid_out
+9 init 1 8 7
+10 constd 1 0
+11 state 1 active
+12 init 1 11 10
+13 constd 1 0
+14 state 1 ltl_delay_0
+15 init 1 14 13
+16 constd 1 0
+17 state 1 ltl_delay_1
+18 init 1 17 16
+19 constd 1 0
+20 state 1 ltl_delay_2
+21 init 1 20 19
+22 constd 1 0
+23 state 1 ltl_delay_3
+24 init 1 23 22
+25 constd 1 0
+26 state 1 ltl_delay_4
+27 init 1 26 25
+28 constd 1 0
+29 state 1 ltl_delay_5
+30 init 1 29 28
+31 constd 3 -1
+32 constd 3 0
+33 constd 3 -2
+34 constd 1 -1
+35 xor 1 11 34
+36 ite 3 2 33 5
+37 eq 1 5 32
+38 add 3 5 31
+39 ite 3 37 5 38
+40 ite 3 35 36 39
+41 xor 1 11 34
+42 neq 1 5 32
+43 ite 1 41 2 42
+44 xor 1 11 34
+45 or 1 2 11
+46 neq 1 5 32
+47 and 1 46 11
+48 ite 1 44 45 47
+49 xor 1 2 34
+50 or 1 49 8
+51 not 1 50
+52 bad 51
+53 xor 1 14 34
+54 or 1 53 8
+55 not 1 54
+56 bad 55
+57 xor 1 20 34
+58 or 1 57 8
+59 not 1 58
+60 bad 59
+61 xor 1 29 34
+62 or 1 61 8
+63 not 1 62
+64 bad 63
+65 next 3 5 40
+66 next 1 8 43
+67 next 1 11 48
+68 next 1 14 2
+69 next 1 17 2
+70 next 1 20 17
+71 next 1 23 2
+72 next 1 26 23
+73 next 1 29 26

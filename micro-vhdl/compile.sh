@@ -1,13 +1,16 @@
 #!/bin/bash
 set -e
-if [ "$#" -ne 1 ]; then
-  echo "Usage: ./compile.sh <file.vhd>"
+if [ "$#" -lt 1 ]; then
+  echo "Usage: ./compile.sh <top.vhd> [sub1.vhd sub2.vhd ...]"
+  echo "Example: ./compile.sh cpu_top.vhd alu.vhd decoder.vhd"
   exit 1
 fi
 
 CIRCT_BIN=../cirt/build/bin
 ABC=../yosys/yosys-abc
 BOUND=${BOUND:-15}
+
+# Use the first file passed as the base for output naming
 INPUT="$1"
 DIR="$(dirname "$INPUT")"
 BASE="$(basename "${INPUT%.*}")"
@@ -16,21 +19,32 @@ IC3_MLIR="${DIR}/${BASE}_ic3.mlir"
 IC3_AIG="${DIR}/${BASE}_ic3.aig"
 SV="${DIR}/${BASE}.sv"
 
-echo "[1/3] Parsing and Extracting Micro-VHDL..."
-go run . "$INPUT" "$MLIR" "$IC3_MLIR"
+echo "[1/3] Parsing and Linking Micro-VHDL Project..."
+# Notice we are now using the flags we added to main.go, and passing all files
+GO_OUT=$(go run . -o "$MLIR" -ic3 "$IC3_MLIR" "$@")
+echo "$GO_OUT"
 
-# Extract top-level module name from the generated MLIR (first hw.module @name)
-MODULE=$(grep -oP '(?<=hw\.module @)\w+' "$MLIR" | head -1)
+# Extract the automatically deduced Top Module from the Go output
+MODULE=$(echo "$GO_OUT" | grep -oP '(?<=TOP_MODULE=)\w+' | head -1)
+
+if [ -z "$MODULE" ]; then
+    echo "Error: Could not determine top module. Check semantic output."
+    exit 1
+fi
+
+echo "--> Detected Top-Level Entity: ${MODULE}"
 
 # Feature flags — computed once, used in multiple steps below.
 HAS_BAD=$(grep -c '__verif_bad' "$IC3_MLIR" 2>/dev/null || true)
 HAS_LIVENESS=$(grep -c 'assert_fair' "$IC3_MLIR" 2>/dev/null || true)
 HAS_ASSUME=$(grep -c 'verif.assume' "$MLIR" 2>/dev/null || true)
-HAS_AFTER_RESET=$(grep -c 'after_reset' "$INPUT" 2>/dev/null || true)
 HAS_LTL=$(grep -c 'ltl' "$MLIR" 2>/dev/null || true)
 HAS_CONTRACT=$(grep -c 'verif.contract' "$MLIR" 2>/dev/null || true)
 HAS_ASSERT=$(grep -c 'verif.assert' "$MLIR" 2>/dev/null || true)
 HAS_COVER=$(grep -c 'verif.cover' "$MLIR" 2>/dev/null || true)
+
+# Since there are multiple files, we cat them all to check for 'after_reset'
+HAS_AFTER_RESET=$(cat "$@" | grep -c 'after_reset' 2>/dev/null || true)
 
 echo "[2a/3] Bounded Model Checking via Z3 SMT Solver (module=${MODULE}, bound=${BOUND} cycles)..."
 # circt-bmc unrolls the circuit for BOUND clock cycles and hands the resulting
@@ -64,7 +78,7 @@ fi
 # The BMC step (Z3) handles constrained verification correctly via verif.assume.
 if [ "$HAS_LIVENESS" -gt 0 ]; then
   echo "[2b/3] Unbounded IC3/PDR Liveness proof via ABC (module=${MODULE})..."
-  "${CIRCT_BIN}/circt-synth" --until-before=all "$IC3_MLIR" | "${CIRCT_BIN}/circt-translate" --export-aiger -o "$IC3_AIG"
+  "${CIRCT_BIN}/circt-opt" --hw-flatten-modules --symbol-dce "$IC3_MLIR" | "${CIRCT_BIN}/circt-synth" --format=mlir --until-before=all | "${CIRCT_BIN}/circt-translate" --export-aiger -o "$IC3_AIG"
   "$ABC" -c "read_aiger ${IC3_AIG}; l2s; pdr; quit" 2>&1
 elif [ "$HAS_BAD" -gt 0 ] && [ "$HAS_LTL" -gt 0 ]; then
   echo "[2b/3] LTL temporal safety properties present — IC3/PDR skipped (BMC covers this)."
@@ -76,7 +90,7 @@ elif [ "$HAS_BAD" -gt 0 ] && [ "$HAS_CONTRACT" -gt 0 ]; then
   echo "[2b/3] Contracts present — IC3/PDR skipped (assumptions cannot be encoded as AIGER constraints; BMC covers this)."
 elif [ "$HAS_BAD" -gt 0 ]; then
   echo "[2b/3] Unbounded IC3/PDR Safety proof via ABC (module=${MODULE})..."
-  "${CIRCT_BIN}/circt-synth" --until-before=all "$IC3_MLIR" | "${CIRCT_BIN}/circt-translate" --export-aiger -o "$IC3_AIG"
+  "${CIRCT_BIN}/circt-opt" --hw-flatten-modules --symbol-dce "$IC3_MLIR" | "${CIRCT_BIN}/circt-synth" --format=mlir --until-before=all | "${CIRCT_BIN}/circt-translate" --export-aiger -o "$IC3_AIG"
   "$ABC" -c "read_aiger ${IC3_AIG}; pdr; quit" 2>&1
 else
   echo "[2b/3] No PSL assertions found — skipping IC3/PDR."
@@ -186,7 +200,7 @@ fi
 if [ "$HAS_ASSERT" -gt 0 ] || [ "$HAS_ASSUME" -gt 0 ] || [ "$HAS_LTL" -gt 0 ] || [ "$HAS_LIVENESS" -gt 0 ]; then
   echo "[2e/3] Word-Level BTOR2 Export (module=${MODULE})..."
   BTOR2="${DIR}/${BASE}.btor2"
-  "${CIRCT_BIN}/circt-opt" "$MLIR" --lower-ltl-to-bmc -canonicalize --convert-hw-to-btor2 2>/dev/null | awk '/^module \{/{exit} {print}' > "$BTOR2" || true
+  "${CIRCT_BIN}/circt-opt" "$MLIR" --hw-flatten-modules --symbol-dce --lower-ltl-to-bmc -canonicalize --convert-hw-to-btor2 2>/dev/null | awk '/^module \{/{exit} {print}' > "$BTOR2" || true
   if [ -s "$BTOR2" ]; then
     echo "  Successfully exported word-level transition system to ${BTOR2}"
     if command -v btormc &> /dev/null; then

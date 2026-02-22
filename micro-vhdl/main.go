@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"strings"
@@ -10,13 +11,13 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("Usage: main <file.vhd>")
-		os.Exit(1)
-	}
-	content, err := os.ReadFile(os.Args[1])
-	if err != nil {
-		fmt.Printf("Error reading file: %v\n", err)
+	outMlir := flag.String("o", "build.mlir", "Output MLIR file")
+	outIc3 := flag.String("ic3", "build_ic3.mlir", "Output IC3 MLIR file")
+	flag.Parse()
+
+	files := flag.Args()
+	if len(files) == 0 {
+		fmt.Println("Usage: go run . [-o build.mlir] [-ic3 build_ic3.mlir] <file1.vhd> [file2.vhd ...]")
 		os.Exit(1)
 	}
 
@@ -27,28 +28,58 @@ func main() {
 		os.Exit(1)
 	}
 
-	tree := parser.Parse(content, nil)
+	var allModules []*Module
 
-	fmt.Println("AST:", tree.RootNode().ToSexp())
+	// 1. Parse ALL files into a global project pool
+	for _, file := range files {
+		content, err := os.ReadFile(file)
+		if err != nil {
+			fmt.Printf("Error reading file %s: %v\n", file, err)
+			os.Exit(1)
+		}
 
-	// Step 1: Extraction
-	extractor := NewExtractor(content)
-	modules, err := extractor.ExtractAll(tree.RootNode())
-	if err != nil {
-		fmt.Printf("Extraction error: %v\n", err)
-		os.Exit(1)
+		tree := parser.Parse(content, nil)
+		extractor := NewExtractor(content)
+		modules, err := extractor.ExtractAll(tree.RootNode())
+		if err != nil {
+			fmt.Printf("Extraction error in %s: %v\n", file, err)
+			os.Exit(1)
+		}
+		allModules = append(allModules, modules...)
 	}
 
-	for _, module := range modules {
-		fmt.Printf("Extracted Module: %s\n", module.Name)
-		fmt.Printf("  Symbols (%d):\n", len(module.Symbols))
-		for name, typ := range module.Symbols {
-			fmt.Printf("    %s: %s (width %d)\n", name, typ.Name, typ.Width)
+	// 2. Auto-detect Top Module (the one never instantiated)
+	instantiated := make(map[string]bool)
+	for _, mod := range allModules {
+		var walk func(stmts []Statement)
+		walk = func(stmts []Statement) {
+			for _, stmt := range stmts {
+				if inst, ok := stmt.(*EntityInstantiation); ok {
+					instantiated[inst.EntityName] = true
+				} else if gen, ok := stmt.(*GenerateStatement); ok {
+					walk(gen.Statements)
+				}
+			}
+		}
+		walk(mod.Statements)
+	}
+
+	topModule := ""
+	for _, mod := range allModules {
+		if !instantiated[mod.Name] {
+			topModule = mod.Name
+			break
 		}
 	}
+	if topModule == "" && len(allModules) > 0 {
+		topModule = allModules[len(allModules)-1].Name // Fallback
+	}
+	
+	// Print it so the bash orchestrator can catch it
+	fmt.Printf("TOP_MODULE=%s\n", topModule)
 
-	// Step 2: Semantic Checking
-	checker := NewSemanticChecker(modules)
+	// 3. Cross-Module Semantic Checking
+	checker := NewSemanticChecker(allModules)
 	errors := checker.Check()
 
 	fatalErrors := false
@@ -69,36 +100,22 @@ func main() {
 		}
 	}
 
-	fmt.Println("\nSemantic Checks Passed. Ready for MLIR Emission.")
+	fmt.Printf("\nSemantic Checks Passed. Extracted %d modules. Ready for MLIR Emission.\n", len(allModules))
 
-	// Step 3: Lowering to MLIR
+	// 4. Lowering to MLIR
 	emitter := NewMLIREmitter()
-	emitter.EmitModules(modules)
-
-	outputFile := "build.mlir"
-	if len(os.Args) >= 3 {
-		outputFile = os.Args[2]
-	}
-	err = os.WriteFile(outputFile, []byte(emitter.String()), 0644)
-	if err != nil {
-		fmt.Printf("Error writing MLIR to file: %v\n", err)
+	emitter.EmitModules(allModules, topModule)
+	if err := os.WriteFile(*outMlir, []byte(emitter.String()), 0644); err != nil {
+		fmt.Printf("Error writing MLIR: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("\nMLIR written to %s\n", outputFile)
-
-	// Emit IC3 MLIR (bad-state output for ABC pdr) when a path is provided.
-	if len(os.Args) >= 4 {
-		ic3File := os.Args[3]
+	
+	if *outIc3 != "" {
 		ic3Emitter := NewMLIREmitterIC3()
-		ic3Emitter.EmitModules(modules)
-		err = os.WriteFile(ic3File, []byte(ic3Emitter.String()), 0644)
-		if err != nil {
-			fmt.Printf("Error writing IC3 MLIR to file: %v\n", err)
+		ic3Emitter.EmitModules(allModules, topModule)
+		if err := os.WriteFile(*outIc3, []byte(ic3Emitter.String()), 0644); err != nil {
+			fmt.Printf("Error writing IC3 MLIR: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("IC3 MLIR written to %s\n", ic3File)
 	}
-
-	fmt.Println("\n--- Generated MLIR ---")
-	fmt.Println(emitter.String())
 }
