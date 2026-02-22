@@ -847,7 +847,7 @@ func (e *Extractor) extractExpression(node *sitter.Node) Expression {
 	}
 
 	// Check for binary expression patterns in the tiered grammar
-	if node.ChildByFieldName("left") != nil && node.ChildByFieldName("operator") != nil && node.ChildByFieldName("right") != nil {
+	if kind != "psl_implication" && node.ChildByFieldName("left") != nil && node.ChildByFieldName("operator") != nil && node.ChildByFieldName("right") != nil {
 		return BinaryExpr{
 			Op:    strings.TrimSpace(e.text(node.ChildByFieldName("operator"))),
 			Left:  e.extractExpression(node.ChildByFieldName("left")),
