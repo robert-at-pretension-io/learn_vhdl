@@ -23,6 +23,7 @@ print_file() {
     print_file "verif-extensions.md"
     print_file "k-induction-ic3.md"
     print_file "examples/vhd/test_assume.vhd"
+    print_file "examples/vhd/test_after_reset.vhd"
 ) > .paste_buffer.txt
 
 # Try to copy to clipboard if a tool is available

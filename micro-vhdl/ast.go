@@ -180,6 +180,20 @@ type PslAssumption struct {
 func (p *PslAssumption) isStatement()   {}
 func (p *PslAssumption) Line() uint32 { return p.LineNum }
 
+// PslAfterResetAssertion represents `psl assert always after_reset(rst) property;`
+// The property is checked only after the reset signal has de-asserted at least once.
+// Before that, the assertion is vacuously true.
+// Implemented via a sticky `past_reset` register: once rst goes low it latches high,
+// and the effective assertion is `NOT(past_reset) OR property`.
+type PslAfterResetAssertion struct {
+	Reset    Expression // active-high reset signal
+	Property Expression
+	LineNum  uint32
+}
+
+func (p *PslAfterResetAssertion) isStatement()   {}
+func (p *PslAfterResetAssertion) Line() uint32 { return p.LineNum }
+
 type PortMapEntry struct {
 	Formal string
 	Actual Expression

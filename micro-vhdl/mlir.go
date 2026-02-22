@@ -38,10 +38,12 @@ func NewMLIREmitterIC3() *MLIREmitter {
 	return &MLIREmitter{modules: make(map[string]*Module), ic3Mode: true}
 }
 
-// hasPslAssertions reports whether mod contains any PSL assertion statements.
+// hasPslAssertions reports whether mod contains any PSL assertion statements
+// (including after_reset assertions, which also accumulate into e.assertions).
 func hasPslAssertions(mod *Module) bool {
 	for _, stmt := range mod.Statements {
-		if _, ok := stmt.(*PslAssertion); ok {
+		switch stmt.(type) {
+		case *PslAssertion, *PslAfterResetAssertion:
 			return true
 		}
 	}
@@ -739,6 +741,67 @@ func (e *MLIREmitter) emitStatementList(stmts []Statement, mod *Module, env map[
 			propVal, propType := e.emitExpression(s.Property, mod, env, "", "")
 			// Accumulate assumptions; emitCombinedAssertions handles them.
 			e.assumptions = append(e.assumptions, assertionEntry{propVal, propType})
+		case *PslAfterResetAssertion:
+			e.emitAfterResetAssertion(s, mod, env)
 		}
 	}
+}
+
+// emitAfterResetAssertion implements `psl assert always after_reset(rst) property`.
+//
+// A sticky `rst_ever_high` register latches permanently once rst is asserted:
+//
+//	next_rst_ever_high = rst_ever_high OR rst
+//	rst_ever_high      = seq.compreg next_rst_ever_high, clk  [initial 0 in BMC]
+//
+// The effective assertion is `NOT(rst_ever_high) OR rst OR property`:
+//   - vacuously true while rst has never been high (circuit not yet reset)
+//   - vacuously true while rst is currently active (don't check during reset itself)
+//   - checks property for real after rst has fired AND is now low
+//
+// This avoids IC3 false-positives from pre-reset unreachable states.
+//
+// The forward reference from next_rst_ever_high to rst_ever_high (which appears
+// later in the text) is valid: CIRCT allows seq.compreg outputs to be referenced
+// before their definition because the register boundary breaks the cycle.
+func (e *MLIREmitter) emitAfterResetAssertion(s *PslAfterResetAssertion, mod *Module, env map[string]string) {
+	clk := e.clockSSA(mod)
+
+	// Evaluate the reset signal expression.
+	resetVal, _ := e.emitExpression(s.Reset, mod, env, "", "i1")
+
+	// Pre-allocate the SSA name for rst_ever_high so next_rst_ever_high can
+	// reference it as a forward reference (CIRCT allows this for register outputs).
+	rstEverHighSSA := e.nextSSA()
+
+	// next_rst_ever_high = rst_ever_high OR rst — latches once rst goes high.
+	nextRstEverHighSSA := e.nextSSA()
+	e.p("%s = comb.or %s, %s : i1", nextRstEverHighSSA, rstEverHighSSA, resetVal)
+
+	// Register it. BMC initializes to 0 (rst has never fired); IC3 leaves it
+	// unconstrained (see compile.sh — IC3 is skipped when after_reset is present).
+	initSSA := e.emitSeqInitial("i1")
+	if initSSA != "" {
+		e.p("%s = seq.compreg %s, %s initial %s : i1", rstEverHighSSA, nextRstEverHighSSA, clk, initSSA)
+	} else {
+		e.p("%s = seq.compreg %s, %s : i1", rstEverHighSSA, nextRstEverHighSSA, clk)
+	}
+
+	// Evaluate the guarded property.
+	propVal, _ := e.emitExpression(s.Property, mod, env, "", "i1")
+
+	// effective = NOT(rst_ever_high) OR rst OR property
+	//   NOT(rst_ever_high): vacuous before any reset
+	//   rst:               vacuous during active reset
+	//   property:          the actual check post-reset
+	trueVal := e.nextSSA()
+	notRstEverHighSSA := e.nextSSA()
+	e.p("%s = hw.constant -1 : i1", trueVal)
+	e.p("%s = comb.xor %s, %s : i1", notRstEverHighSSA, rstEverHighSSA, trueVal)
+	partialSSA := e.nextSSA()
+	e.p("%s = comb.or %s, %s : i1", partialSSA, notRstEverHighSSA, resetVal)
+	effectiveSSA := e.nextSSA()
+	e.p("%s = comb.or %s, %s : i1", effectiveSSA, partialSSA, propVal)
+
+	e.assertions = append(e.assertions, assertionEntry{effectiveSSA, "i1"})
 }

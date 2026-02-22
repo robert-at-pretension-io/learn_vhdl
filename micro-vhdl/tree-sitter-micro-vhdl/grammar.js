@@ -168,7 +168,8 @@ module.exports = grammar({
       $.generate_statement,
       $.entity_instantiation,
       $.psl_assertion,
-      $.psl_assumption
+      $.psl_assumption,
+      $.psl_after_reset_assertion
     ),
 
     // JUSTIFICATION: Combinational math executes continuously. Conditionals here 
@@ -265,6 +266,12 @@ module.exports = grammar({
 
     psl_assumption: $ => seq(
       'psl', 'assume', 'always',
+      field('property', $._psl_expression), ';'
+    ),
+
+    psl_after_reset_assertion: $ => seq(
+      'psl', 'assert', 'always', 'after_reset',
+      '(', field('reset', $._name), ')',
       field('property', $._psl_expression), ';'
     ),
 

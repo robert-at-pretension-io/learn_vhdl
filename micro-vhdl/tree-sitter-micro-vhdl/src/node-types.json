@@ -45,6 +45,10 @@
           "named": true
         },
         {
+          "type": "psl_after_reset_assertion",
+          "named": true
+        },
+        {
           "type": "psl_assertion",
           "named": true
         },
@@ -738,6 +742,10 @@
           "named": true
         },
         {
+          "type": "psl_after_reset_assertion",
+          "named": true
+        },
+        {
           "type": "psl_assertion",
           "named": true
         },
@@ -938,6 +946,88 @@
         "types": [
           {
             "type": "type_mark",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "psl_after_reset_assertion",
+    "named": true,
+    "fields": {
+      "property": {
+        "multiple": true,
+        "required": true,
+        "types": [
+          {
+            "type": "(",
+            "named": false
+          },
+          {
+            "type": ")",
+            "named": false
+          },
+          {
+            "type": "binary_expression",
+            "named": true
+          },
+          {
+            "type": "char_literal",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "indexed_name",
+            "named": true
+          },
+          {
+            "type": "number",
+            "named": true
+          },
+          {
+            "type": "psl_eventually",
+            "named": true
+          },
+          {
+            "type": "psl_implication",
+            "named": true
+          },
+          {
+            "type": "psl_stable",
+            "named": true
+          },
+          {
+            "type": "selected_name",
+            "named": true
+          },
+          {
+            "type": "string_literal",
+            "named": true
+          },
+          {
+            "type": "unary_expression",
+            "named": true
+          }
+        ]
+      },
+      "reset": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "indexed_name",
+            "named": true
+          },
+          {
+            "type": "selected_name",
             "named": true
           }
         ]
@@ -1969,6 +2059,10 @@
   },
   {
     "type": ">=",
+    "named": false
+  },
+  {
+    "type": "after_reset",
     "named": false
   },
   {

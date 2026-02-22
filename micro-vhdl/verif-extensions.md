@@ -16,6 +16,7 @@
 - `|=>` (next-cycle implication): delay register + boolean implication → `verif.assert : i1`
 - `stable(x)`: delay register + `comb.icmp eq` → `verif.assert : i1`
 - `assume always`: emits `verif.assume` in BMC MLIR; IC3 step is skipped (see below)
+- `assert always after_reset(rst)`: sticky `rst_ever_high` register + guarded assertion; IC3 step skipped (see below)
 - `eventually!`: stubbed as `hw.constant true` + TODO comment (liveness, skipped in BMC)
 
 **MLIR emission modes**:
@@ -32,6 +33,7 @@
 - `circt-synth` cannot handle `seq.initial` — IC3 MLIR omits it by design
 - IC3 step is skipped automatically when no PSL assertions are present
 - IC3 step is skipped when `psl assume` is present — `verif.assume` cannot pass through `circt-translate --export-aiger` (verif dialect not supported in AIGER lowering); BMC handles the constrained verification correctly
+- IC3 step is skipped when `after_reset` is present — unconstrained initial states in IC3 would trivially violate reset-conditional properties; BMC correctly starts from zero-initialized registers and observes the reset sequence
 
 ---
 
@@ -86,25 +88,31 @@ Currently `|=>` always creates a 1-cycle delay register. PSL's `|->` means the c
 
 ---
 
-## Layer 3 — Reset-Conditional Properties
+## Layer 3 — Reset-Conditional Properties ✓ DONE
 
-One of the most common sources of false positives: the tool reports a violation in cycle 0 because the register starts in an unconstrained state (especially true for IC3, which explores from all initial states). CIRCT has explicit infrastructure: `verif.has_been_reset`.
+One of the most common sources of false positives: the tool reports a violation in cycle 0 because the register starts in an unconstrained state (especially true for IC3, which explores from all initial states).
 
-Adding a new PSL construct:
+**Implemented** using a sticky `rst_ever_high` register encoding (not `verif.has_been_reset` — the CIRCT verif dialect form had toolchain compatibility issues):
 
+```vhdl
+psl assert always after_reset(rst) s_sig;
 ```
-psl assert always after_reset(clk, rst) (invariant);
-```
 
-...would emit:
-
+Emits:
 ```mlir
-%has_reset = verif.has_been_reset %clk_i1, sync %rst
-%seq = ltl.clock %invariant, posedge %clk_i1 : i1
-verif.ensure %seq if %has_reset : !ltl.sequence
+%next_rst_ever_high = comb.or %rst_ever_high, %rst : i1
+%rst_ever_high = seq.compreg %next_rst_ever_high, %clk initial 0 : i1
+-- effective = NOT(rst_ever_high) OR rst OR property
+--   vacuous before any reset, vacuous during active reset, real check after
+%not_rst_ever_high = comb.xor %rst_ever_high, -1 : i1
+%partial = comb.or %not_rst_ever_high, %rst : i1
+%effective = comb.or %partial, %s_sig : i1
+verif.assert %effective : i1
 ```
 
-This is especially valuable for the IC3 path where initial states are truly unconstrained.
+IC3 step is skipped when `after_reset` is present (unconstrained initial states would trivially violate the property). BMC correctly starts from zero-initialized registers and observes the reset sequence.
+
+See `examples/vhd/test_after_reset.vhd` for a demonstration.
 
 ---
 
@@ -161,7 +169,7 @@ This requires ABC's liveness mode and a different AIGER encoding convention — 
 | `psl assume` | **Done** | — | BMC-constrained verification; IC3 skips when assumes present |
 | `psl never` | Not started | Very low | Readability |
 | `psl cover` | Not started | Very low | Coverage completeness |
-| Reset-conditional (`after_reset`) | Not started | Low | Eliminates cycle-0 false positives in IC3 |
+| Reset-conditional (`after_reset`) | **Done** | — | Eliminates cycle-0 false positives in IC3 |
 | `next[N]` / delay | Not started | Low | Bounded response properties |
 | `|->` (overlapping implication) | Not started | Low | Full SVA vocabulary |
 | Sequence concat/repeat | Not started | Medium | Protocol verification |
@@ -169,4 +177,4 @@ This requires ABC's liveness mode and a different AIGER encoding convention — 
 | `verif.formal` blocks | Not started | High | Cross-module and LEC |
 | Liveness via ABC fairness | Not started | High | Full temporal logic |
 
-**Highest remaining value**: reset-conditional (`after_reset`) — the next most common source of false positives after unconstrained inputs. Particularly important for IC3, which starts from arbitrary initial register states.
+**Highest remaining value**: `next[N]` delay operators — unlock bounded response properties (e.g. "ack arrives within 8 cycles of req"). Maps cleanly to `ltl.delay` in CIRCT.

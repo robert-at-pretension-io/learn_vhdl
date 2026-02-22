@@ -41,7 +41,8 @@ echo "[2a/3] Bounded Model Checking via Z3 SMT Solver (module=${MODULE}, bound=$
 # The BMC step (Z3) handles constrained verification correctly via verif.assume.
 HAS_BAD=$(grep -c '__verif_bad' "$IC3_MLIR" 2>/dev/null || true)
 HAS_ASSUME=$(grep -c 'verif.assume' "$MLIR" 2>/dev/null || true)
-if [ "$HAS_BAD" -gt 0 ] && [ "$HAS_ASSUME" -eq 0 ]; then
+HAS_AFTER_RESET=$(grep -c 'after_reset' "$INPUT" 2>/dev/null || true)
+if [ "$HAS_BAD" -gt 0 ] && [ "$HAS_ASSUME" -eq 0 ] && [ "$HAS_AFTER_RESET" -eq 0 ]; then
   echo "[2b/3] Unbounded IC3/PDR proof via ABC (module=${MODULE})..."
   # Lower to AIG, export to binary AIGER, run ABC pdr.
   # ABC treats each hw.output as a bad-state signal: pdr proves it unreachable.
@@ -53,6 +54,8 @@ if [ "$HAS_BAD" -gt 0 ] && [ "$HAS_ASSUME" -eq 0 ]; then
   "$ABC" -c "read_aiger ${IC3_AIG}; pdr; quit" 2>&1
 elif [ "$HAS_BAD" -gt 0 ] && [ "$HAS_ASSUME" -gt 0 ]; then
   echo "[2b/3] PSL assumes present — IC3/PDR skipped (assumptions cannot be encoded as AIGER constraints; BMC covers this)."
+elif [ "$HAS_BAD" -gt 0 ] && [ "$HAS_AFTER_RESET" -gt 0 ]; then
+  echo "[2b/3] after_reset assertions present — IC3/PDR skipped (unconstrained initial states cause spurious CEX; BMC covers this)."
 else
   echo "[2b/3] No PSL assertions found — skipping IC3/PDR."
 fi
