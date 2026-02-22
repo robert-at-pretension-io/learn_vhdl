@@ -1,21 +1,12 @@
-library IEEE;
-use IEEE.std_logic_1164.all;
-
--- Simple pass-through with contract:
--- require: a = '0' (input is always 0)
--- ensure:  z = '0' (output mirrors input, so also always 0)
-entity pass_through is
-  port (
-    clk : in std_logic;
-    a   : in std_logic;
-    z   : out std_logic
-  );
+entity Arbiter is
+  port (req0, req1 : in std_logic; grant0, grant1 : out std_logic; clk : in std_logic);
   contract
-    require: a = '0';
-    ensure:  z = '0';
-end entity pass_through;
+    require: not (req0 = '1' and req1 = '1');
+    ensure:  not (grant0 = '1' and grant1 = '1');
+end entity;
 
-architecture behavior of pass_through is
+architecture rtl of Arbiter is
 begin
-  z <= a;
-end architecture behavior;
+  grant0 <= req0;
+  grant1 <= req1;
+end architecture;
