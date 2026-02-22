@@ -29,6 +29,7 @@ print_file() {
     print_file "examples/vhd/test_formal.vhd"
     print_file "examples/vhd/test_liveness.vhd"
     print_file "liveness-plan.md"
+    print_file "next-level-verification-ideas.md"
 ) > .paste_buffer.txt
 
 # Try to copy to clipboard if a tool is available
