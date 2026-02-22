@@ -194,6 +194,15 @@ if [ "$HAS_ASSERT" -gt 0 ] || [ "$HAS_ASSUME" -gt 0 ] || [ "$HAS_LTL" -gt 0 ] ||
       if echo "$BTOR_OUT" | grep -q "^sat"; then
         BOUND_FOUND=$(echo "$BTOR_OUT" | grep -oP "^b\d+" | head -1 | tr -d 'b')
         echo "  Assertion can be violated! (Counterexample found at bound $BOUND_FOUND)"
+        
+        # Generate VCD Trace
+        TRACE_TXT="${DIR}/${BASE}_trace.txt"
+        TRACE_VCD="${DIR}/${BASE}_trace.vcd"
+        btormc --trace-gen-full "$BTOR2" > "$TRACE_TXT" 2>/dev/null || true
+        if [ -f "btor2vcd.py" ]; then
+          python3 btor2vcd.py "$TRACE_TXT" "$TRACE_VCD" >/dev/null 2>&1
+          echo "  VCD trace generated: $TRACE_VCD"
+        fi
       elif echo "$BTOR_OUT" | grep -q "^unsat"; then
         echo "  Property proved! (No counterexample found)"
       else
