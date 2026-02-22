@@ -121,12 +121,45 @@ func (e *MLIREmitter) emitFormalStatementList(stmts []Statement, mod *Module, en
 			}
 		case *PslAssertion:
 			val, typ := e.emitExpression(s.Property, mod, env, "", "", extraSymbols)
+			if typ == "!ltl.sequence" {
+				clkI1 := e.clockI1(mod)
+				if clkI1 != "" {
+					clocked := e.nextSSA()
+					e.p("%s = ltl.clock %s, posedge %s : !ltl.property", clocked, val, clkI1)
+					val = clocked
+					typ = "!ltl.property"
+				} else {
+					e.p("// ERROR: PSL temporal property requires a clock")
+				}
+			}
 			e.assertions = append(e.assertions, assertionEntry{val, typ})
 		case *PslAssumption:
 			val, typ := e.emitExpression(s.Property, mod, env, "", "", extraSymbols)
+			if typ == "!ltl.sequence" {
+				clkI1 := e.clockI1(mod)
+				if clkI1 != "" {
+					clocked := e.nextSSA()
+					e.p("%s = ltl.clock %s, posedge %s : !ltl.property", clocked, val, clkI1)
+					val = clocked
+					typ = "!ltl.property"
+				} else {
+					e.p("// ERROR: PSL temporal property requires a clock")
+				}
+			}
 			e.assumptions = append(e.assumptions, assertionEntry{val, typ})
 		case *PslCover:
 			val, typ := e.emitExpression(s.Property, mod, env, "", "", extraSymbols)
+			if typ == "!ltl.sequence" {
+				clkI1 := e.clockI1(mod)
+				if clkI1 != "" {
+					clocked := e.nextSSA()
+					e.p("%s = ltl.clock %s, posedge %s : !ltl.property", clocked, val, clkI1)
+					val = clocked
+					typ = "!ltl.property"
+				} else {
+					e.p("// ERROR: PSL temporal property requires a clock")
+				}
+			}
 			e.p("verif.cover %s : %s", val, typ)
 		case *PslAssertNever:
 			val, _ := e.emitExpression(s.Property, mod, env, "", "i1", extraSymbols)
@@ -411,127 +444,67 @@ func (e *MLIREmitter) emitExpression(expr Expression, mod *Module, env map[strin
 			return resVal, rightType
 		}
 	case PslImplicationExpr:
-		// PSL |=> is next-cycle: "if left holds at cycle N, right must hold at cycle N+1."
-		// PSL |-> is same-cycle: "if left holds at cycle N, right must hold at cycle N."
-		// Implement as: delay left by one clock cycle for |=>, or use |-> semantics.
-		// next[N] and next_a[M to N] are encoded with explicit shift-register monitors.
+		isOverlapping := (v.Op == "|->")
 
-		isNonOverlapping := v.Op == "|=>"
-
-		if rightNext, ok := v.Right.(PslNextExpr); ok {
-			leftVal, _ := e.emitExpression(v.Left, mod, env, "", "i1", extraSymbols)
-			rightVal, _ := e.emitExpression(rightNext.Arg, mod, env, "", "i1", extraSymbols)
-
-			clkI1 := e.clockI1(mod)
-			if clkI1 == "" {
-				e.p("// ERROR: PSL next requires a clocked module")
-				return resVal, "i1"
-			}
-			delay := rightNext.Delay
-			if delay < 1 {
-				delay = 1
-			}
-
-			// Encode implication with delay.
-			actualDelay := delay
-			if isNonOverlapping {
-				actualDelay++
-			}
-
-			seqVal := e.nextSSA()
-			e.p("%s = ltl.delay %s, %d, 0 : i1", seqVal, rightVal, actualDelay)
-			impVal := e.nextSSA()
-			e.p("%s = ltl.implication %s, %s : i1, !ltl.sequence", impVal, leftVal, seqVal)
-			clocked := e.nextSSA()
-			e.p("%s = ltl.clock %s, posedge %s : !ltl.property", clocked, impVal, clkI1)
-			return clocked, "!ltl.property"
-		}
-		if rightRange, ok := v.Right.(PslNextRangeExpr); ok {
-			leftVal, _ := e.emitExpression(v.Left, mod, env, "", "i1", extraSymbols)
-			rightVal, _ := e.emitExpression(rightRange.Arg, mod, env, "", "i1", extraSymbols)
-
-			clkI1 := e.clockI1(mod)
-			if clkI1 == "" {
-				e.p("// ERROR: PSL next_a requires a clocked module")
-				return resVal, "i1"
-			}
-
-			start := rightRange.Start
-			end := rightRange.End
-			if start < 1 {
-				start = 1
-			}
-			if end < start {
-				end = start
-			}
-
-			// Encode implication with range delay.
-			actualStart := start
-			if isNonOverlapping {
-				actualStart++
-			}
-			actualEnd := end
-			if isNonOverlapping {
-				actualEnd++
-			}
-
-			seqVal := e.nextSSA()
-			e.p("%s = ltl.delay %s, %d, %d : i1", seqVal, rightVal, actualStart, actualEnd-actualStart)
-			impVal := e.nextSSA()
-			e.p("%s = ltl.implication %s, %s : i1, !ltl.sequence", impVal, leftVal, seqVal)
-			clocked := e.nextSSA()
-			e.p("%s = ltl.clock %s, posedge %s : !ltl.property", clocked, impVal, clkI1)
-			return clocked, "!ltl.property"
-		}
-
-		leftVal, _ := e.emitExpression(v.Left, mod, env, "", "i1", extraSymbols)
+		leftVal, leftType := e.emitExpression(v.Left, mod, env, "", "i1", extraSymbols)
 		rightVal, rightType := e.emitExpression(v.Right, mod, env, "", "i1", extraSymbols)
 
-		if !isNonOverlapping && rightType == "i1" {
-			// Boolean implication for |->: !left || right
-			trueVal := e.nextSSA()
-			notLeft := e.nextSSA()
-			e.p("%s = hw.constant -1 : i1", trueVal)
-			e.p("%s = comb.xor %s, %s : i1", notLeft, leftVal, trueVal)
-			e.p("%s = comb.or %s, %s : i1", resVal, notLeft, rightVal)
-			return resVal, "i1"
-		} else if !isNonOverlapping && (rightType == "!ltl.sequence" || rightType == "!ltl.property") {
-			// Overlapping implication with LTL sequence/property
+		isLtl := (leftType == "!ltl.sequence" || rightType == "!ltl.sequence" ||
+			leftType == "!ltl.property" || rightType == "!ltl.property")
+
+		if isLtl {
 			clkI1 := e.clockI1(mod)
+			if clkI1 == "" {
+				e.p("// ERROR: PSL implication requires a clocked module")
+				return resVal, "i1"
+			}
+
+			effLeftVal := leftVal
+			effLeftType := leftType
+
+			if !isOverlapping {
+				// Convert LHS |=> RHS into {LHS; true} |-> RHS
+				trueVal := e.nextSSA()
+				e.p("%s = hw.constant -1 : i1", trueVal)
+				delayedLeft := e.nextSSA()
+				e.p("%s = ltl.concat %s, %s : %s, i1", delayedLeft, leftVal, trueVal, leftType)
+				effLeftVal = delayedLeft
+				effLeftType = "!ltl.sequence"
+			}
+
 			impVal := e.nextSSA()
-			e.p("%s = ltl.implication %s, %s : i1, %s", impVal, leftVal, rightVal, rightType)
+			e.p("%s = ltl.implication %s, %s : %s, %s", impVal, effLeftVal, rightVal, effLeftType, rightType)
+			
+			if effLeftType == "!ltl.property" || rightType == "!ltl.property" {
+				return impVal, "!ltl.property"
+			}
+			
 			clocked := e.nextSSA()
 			e.p("%s = ltl.clock %s, posedge %s : !ltl.property", clocked, impVal, clkI1)
 			return clocked, "!ltl.property"
 		}
 
-		// Handle |=> for booleans or generic types by delaying the antecedent
-		clk := e.clockSSA(mod)
-		initSSA := e.emitSeqInitial("i1")
-		delayedVal := e.nextSSA()
-		if initSSA != "" {
-			e.p("%s = seq.compreg %s, %s initial %s : i1", delayedVal, leftVal, clk, initSSA)
+		// Non-temporal fallback logic (Boolean evaluation, safe for IC3/AIGER)
+		var effLeftVal string
+		if isOverlapping {
+			effLeftVal = leftVal
 		} else {
-			e.p("%s = seq.compreg %s, %s : i1", delayedVal, leftVal, clk)
+			clk := e.clockSSA(mod)
+			initSSA := e.emitSeqInitial("i1")
+			effLeftVal = e.nextSSA()
+			if initSSA != "" {
+				e.p("%s = seq.compreg %s, %s initial %s : i1", effLeftVal, leftVal, clk, initSSA)
+			} else {
+				e.p("%s = seq.compreg %s, %s : i1", effLeftVal, leftVal, clk)
+			}
 		}
 
-		if rightType == "i1" {
-			// Boolean implication: !left_d1 || right
-			trueVal := e.nextSSA()
-			notDelayed := e.nextSSA()
-			e.p("%s = hw.constant -1 : i1", trueVal)
-			e.p("%s = comb.xor %s, %s : i1", notDelayed, delayedVal, trueVal)
-			e.p("%s = comb.or %s, %s : i1", resVal, notDelayed, rightVal)
-			return resVal, "i1"
-		} else {
-			// Non-overlapping implication with LTL sequence/property
-			clkI1 := e.clockI1(mod)
-			impVal := e.nextSSA()
-			e.p("%s = ltl.implication %s, %s : i1, %s", impVal, delayedVal, rightVal, rightType)
-			clocked := e.nextSSA()
-			e.p("%s = ltl.clock %s, posedge %s : !ltl.property", clocked, impVal, clkI1)
-			return clocked, "!ltl.property"
-		}
+		trueVal := e.nextSSA()
+		notLeft := e.nextSSA()
+		e.p("%s = hw.constant -1 : i1", trueVal)
+		e.p("%s = comb.xor %s, %s : i1", notLeft, effLeftVal, trueVal)
+		e.p("%s = comb.or %s, %s : i1", resVal, notLeft, rightVal)
+		return resVal, "i1"
 
 	case PslSequenceExpr:
 		var seqVals []string
@@ -870,23 +843,12 @@ func (e *MLIREmitter) emitCombinedAssertions(mod *Module) {
 		}
 	}
 
-	// Temporal (!ltl.property and !ltl.sequence) assertions are emitted directly in BMC mode.
+	// Temporal (!ltl.property) assertions are emitted directly in BMC mode.
 	for _, ta := range temporalAsserts {
 		if e.ic3Mode {
 			e.p("// temporal assertion skipped in IC3 path (type %s): %s", ta.typ, ta.val)
 		} else {
-			if ta.typ == "!ltl.sequence" {
-				clkI1 := e.clockI1(mod)
-				if clkI1 != "" {
-					clocked := e.nextSSA()
-					e.p("%s = ltl.clock %s, posedge %s : !ltl.property", clocked, ta.val, clkI1)
-					e.p("verif.assert %s : !ltl.property", clocked)
-				} else {
-					e.p("// ERROR: PSL temporal property requires a clock")
-				}
-			} else {
-				e.p("verif.assert %s : !ltl.property", ta.val)
-			}
+			e.p("verif.assert %s : !ltl.property", ta.val)
 		}
 	}
 }
@@ -1125,14 +1087,47 @@ func (e *MLIREmitter) emitStatementList(stmts []Statement, mod *Module, env map[
 			}
 	case *PslAssertion:
 		propVal, propType := e.emitExpression(s.Property, mod, env, "", "", nil)
+		if propType == "!ltl.sequence" {
+			clkI1 := e.clockI1(mod)
+			if clkI1 != "" {
+				clocked := e.nextSSA()
+				e.p("%s = ltl.clock %s, posedge %s : !ltl.property", clocked, propVal, clkI1)
+				propVal = clocked
+				propType = "!ltl.property"
+			} else {
+				e.p("// ERROR: PSL temporal property requires a clock")
+			}
+		}
 		// Accumulate instead of emitting directly; EmitModule combines them.
 		e.assertions = append(e.assertions, assertionEntry{propVal, propType})
 	case *PslAssumption:
 		propVal, propType := e.emitExpression(s.Property, mod, env, "", "", nil)
+		if propType == "!ltl.sequence" {
+			clkI1 := e.clockI1(mod)
+			if clkI1 != "" {
+				clocked := e.nextSSA()
+				e.p("%s = ltl.clock %s, posedge %s : !ltl.property", clocked, propVal, clkI1)
+				propVal = clocked
+				propType = "!ltl.property"
+			} else {
+				e.p("// ERROR: PSL temporal property requires a clock")
+			}
+		}
 		// Accumulate assumptions; emitCombinedAssertions handles them.
 		e.assumptions = append(e.assumptions, assertionEntry{propVal, propType})
 	case *PslCover:
 		propVal, propType := e.emitExpression(s.Property, mod, env, "", "", nil)
+		if propType == "!ltl.sequence" {
+			clkI1 := e.clockI1(mod)
+			if clkI1 != "" {
+				clocked := e.nextSSA()
+				e.p("%s = ltl.clock %s, posedge %s : !ltl.property", clocked, propVal, clkI1)
+				propVal = clocked
+				propType = "!ltl.property"
+			} else {
+				e.p("// ERROR: PSL temporal property requires a clock")
+			}
+		}
 		if !e.ic3Mode {
 			e.p("verif.cover %s : %s", propVal, propType)
 		}
@@ -1190,20 +1185,46 @@ func (e *MLIREmitter) emitAfterResetAssertion(s *PslAfterResetAssertion, mod *Mo
 	}
 
 	// Evaluate the guarded property.
-	propVal, _ := e.emitExpression(s.Property, mod, env, "", "i1", nil)
+	propVal, propType := e.emitExpression(s.Property, mod, env, "", "i1", nil)
 
-	// effective = NOT(rst_ever_high) OR rst OR property
-	//   NOT(rst_ever_high): vacuous before any reset
-	//   rst:               vacuous during active reset
-	//   property:          the actual check post-reset
-	trueVal := e.nextSSA()
-	notRstEverHighSSA := e.nextSSA()
-	e.p("%s = hw.constant -1 : i1", trueVal)
-	e.p("%s = comb.xor %s, %s : i1", notRstEverHighSSA, rstEverHighSSA, trueVal)
-	partialSSA := e.nextSSA()
-	e.p("%s = comb.or %s, %s : i1", partialSSA, notRstEverHighSSA, resetVal)
-	effectiveSSA := e.nextSSA()
-	e.p("%s = comb.or %s, %s : i1", effectiveSSA, partialSSA, propVal)
+	if propType == "!ltl.sequence" {
+		clkI1 := e.clockI1(mod)
+		if clkI1 != "" {
+			clocked := e.nextSSA()
+			e.p("%s = ltl.clock %s, posedge %s : !ltl.property", clocked, propVal, clkI1)
+			propVal = clocked
+			propType = "!ltl.property"
+		} else {
+			e.p("// ERROR: PSL temporal property requires a clock")
+		}
+	}
 
-	e.assertions = append(e.assertions, assertionEntry{effectiveSSA, "i1"})
+	if propType == "!ltl.property" {
+		// effective = (rst_ever_high AND NOT rst) |-> propVal
+		triggerSSA := e.nextSSA()
+		notResetSSA := e.nextSSA()
+		trueVal := e.nextSSA()
+		e.p("%s = hw.constant -1 : i1", trueVal)
+		e.p("%s = comb.xor %s, %s : i1", notResetSSA, resetVal, trueVal)
+		e.p("%s = comb.and %s, %s : i1", triggerSSA, rstEverHighSSA, notResetSSA)
+		
+		impVal := e.nextSSA()
+		e.p("%s = ltl.implication %s, %s : i1, !ltl.property", impVal, triggerSSA, propVal)
+		e.assertions = append(e.assertions, assertionEntry{impVal, "!ltl.property"})
+	} else {
+		// effective = NOT(rst_ever_high) OR rst OR property
+		//   NOT(rst_ever_high): vacuous before any reset
+		//   rst:               vacuous during active reset
+		//   property:          the actual check post-reset
+		trueVal := e.nextSSA()
+		notRstEverHighSSA := e.nextSSA()
+		e.p("%s = hw.constant -1 : i1", trueVal)
+		e.p("%s = comb.xor %s, %s : i1", notRstEverHighSSA, rstEverHighSSA, trueVal)
+		partialSSA := e.nextSSA()
+		e.p("%s = comb.or %s, %s : i1", partialSSA, notRstEverHighSSA, resetVal)
+		effectiveSSA := e.nextSSA()
+		e.p("%s = comb.or %s, %s : i1", effectiveSSA, partialSSA, propVal)
+
+		e.assertions = append(e.assertions, assertionEntry{effectiveSSA, "i1"})
+	}
 }
