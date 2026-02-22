@@ -183,6 +183,32 @@ EOF
   python3 "$COVER_PY" "$MLIR" "$MODULE" "$BOUND" "${CIRCT_BIN}/circt-bmc"
 fi
 
+if [ "$HAS_ASSERT" -gt 0 ] || [ "$HAS_ASSUME" -gt 0 ] || [ "$HAS_LTL" -gt 0 ] || [ "$HAS_LIVENESS" -gt 0 ]; then
+  echo "[2e/3] Word-Level BTOR2 Export (module=${MODULE})..."
+  BTOR2="${DIR}/${BASE}.btor2"
+  "${CIRCT_BIN}/circt-opt" "$MLIR" --lower-ltl-to-bmc -canonicalize --convert-hw-to-btor2 2>/dev/null | awk '/^module \{/{exit} {print}' > "$BTOR2" || true
+  if [ -s "$BTOR2" ]; then
+    echo "  Successfully exported word-level transition system to ${BTOR2}"
+    if command -v btormc &> /dev/null; then
+      BTOR_OUT=$(btormc "$BTOR2" 2>&1)
+      if echo "$BTOR_OUT" | grep -q "^sat"; then
+        BOUND_FOUND=$(echo "$BTOR_OUT" | grep -oP "^b\d+" | head -1 | tr -d 'b')
+        echo "  Assertion can be violated! (Counterexample found at bound $BOUND_FOUND)"
+      elif echo "$BTOR_OUT" | grep -q "^unsat"; then
+        echo "  Property proved! (No counterexample found)"
+      else
+        echo "  btormc output: $BTOR_OUT"
+      fi
+    elif command -v pono &> /dev/null; then
+      pono "$BTOR2"
+    else
+      echo "  (Install 'btormc' or 'pono' to run word-level IC3/PDR on this file)"
+    fi
+  else
+    echo "  (BTOR2 export failed or resulted in empty file)"
+  fi
+fi
+
 echo "[3/3] Lowering to SystemVerilog..."
 "${CIRCT_BIN}/circt-opt" "$MLIR" --lower-seq-to-sv \
   | "${CIRCT_BIN}/firtool" --format=mlir --verilog \
