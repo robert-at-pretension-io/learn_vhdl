@@ -25,6 +25,8 @@ type MLIREmitter struct {
 	assumptions []assertionEntry // accumulated per-module, reset in EmitModule
 	ic3Mode     bool             // emit __verif_bad hw.output instead of verif.assert
 	badStateSSA string           // set by emitCombinedAssertions in ic3Mode
+	nameID      int              // unique naming for generated regs
+	clockI1SSA  string           // cached per-module i1 clock (seq.from_clock)
 }
 
 func NewMLIREmitter() *MLIREmitter {
@@ -43,7 +45,7 @@ func NewMLIREmitterIC3() *MLIREmitter {
 func hasPslAssertions(mod *Module) bool {
 	for _, stmt := range mod.Statements {
 		switch stmt.(type) {
-		case *PslAssertion, *PslAfterResetAssertion:
+		case *PslAssertion, *PslAfterResetAssertion, *PslAssertNever:
 			return true
 		}
 	}
@@ -68,12 +70,54 @@ func (e *MLIREmitter) nextSSA() string {
 	return val
 }
 
+func (e *MLIREmitter) nextName(prefix string) string {
+	name := fmt.Sprintf("%s_%d", prefix, e.nameID)
+	e.nameID++
+	return name
+}
+
 // clockSSA returns the SSA name of the module's clock port (e.g. "%clk").
 func (e *MLIREmitter) clockSSA(mod *Module) string {
 	if mod.ClockPort == "" {
 		return ""
 	}
 	return fmt.Sprintf("%%%s", mod.ClockPort)
+}
+
+// clockI1 returns an i1 clock SSA (seq.from_clock) for LTL properties.
+func (e *MLIREmitter) clockI1(mod *Module) string {
+	if e.clockI1SSA != "" {
+		return e.clockI1SSA
+	}
+	clk := e.clockSSA(mod)
+	if clk == "" {
+		return ""
+	}
+	clkI1 := e.nextSSA()
+	e.p("%s = seq.from_clock %s", clkI1, clk)
+	e.clockI1SSA = clkI1
+	return clkI1
+}
+
+func (e *MLIREmitter) emitCompReg(val string, clk string, typ string, name string) string {
+	res := e.nextSSA()
+	initSSA := e.emitSeqInitial(typ)
+	if initSSA != "" {
+		e.p("%s = seq.compreg name \"%s\" %s, %s initial %s : %s", res, name, val, clk, initSSA, typ)
+	} else {
+		e.p("%s = seq.compreg name \"%s\" %s, %s : %s", res, name, val, clk, typ)
+	}
+	return res
+}
+
+// emitDelay emits a chain of seq.compreg registers to delay a value by N cycles.
+func (e *MLIREmitter) emitDelay(val string, typ string, delay int, clk string) string {
+	res := val
+	for i := 0; i < delay; i++ {
+		next := e.emitCompReg(res, clk, typ, e.nextName("psl_delay"))
+		res = next
+	}
+	return res
 }
 
 // emitSeqInitial emits a seq.initial block that yields a zero value of the
@@ -135,6 +179,8 @@ func (e *MLIREmitter) emitExpression(expr Expression, mod *Module, env map[strin
 	}
 
 	switch v := expr.(type) {
+	case ParenExpr:
+		return e.emitExpression(v.Expr, mod, env, targetName, expectedType)
 	case IdentifierExpr:
 		t := mod.Symbols[v.Name]
 		if mapped, ok := env[v.Name]; ok {
@@ -243,7 +289,59 @@ func (e *MLIREmitter) emitExpression(expr Expression, mod *Module, env map[strin
 	case PslImplicationExpr:
 		// PSL |=> is next-cycle: "if left holds at cycle N, right must hold at cycle N+1."
 		// Implement as: delay left by one clock cycle, then check boolean implication.
-		// This produces a plain i1 assertion that circt-bmc can consume directly.
+		// next[N] and next_a[M to N] are encoded with explicit shift-register monitors.
+		if rightNext, ok := v.Right.(PslNextExpr); ok {
+			leftVal, _ := e.emitExpression(v.Left, mod, env, "", "i1")
+			rightVal, _ := e.emitExpression(rightNext.Arg, mod, env, "", "i1")
+
+			clkI1 := e.clockI1(mod)
+			if clkI1 == "" {
+				e.p("// ERROR: PSL next requires a clocked module")
+				return resVal, "i1"
+			}
+			delay := rightNext.Delay
+			if delay < 1 {
+				delay = 1
+			}
+
+			// Encode |=> next[N] as ltl.implication with delay (N+1).
+			seqVal := e.nextSSA()
+			e.p("%s = ltl.delay %s, %d, 0 : i1", seqVal, rightVal, delay+1)
+			impVal := e.nextSSA()
+			e.p("%s = ltl.implication %s, %s : i1, !ltl.sequence", impVal, leftVal, seqVal)
+			clocked := e.nextSSA()
+			e.p("%s = ltl.clock %s, posedge %s : !ltl.property", clocked, impVal, clkI1)
+			return clocked, "!ltl.property"
+		}
+		if rightRange, ok := v.Right.(PslNextRangeExpr); ok {
+			leftVal, _ := e.emitExpression(v.Left, mod, env, "", "i1")
+			rightVal, _ := e.emitExpression(rightRange.Arg, mod, env, "", "i1")
+
+			clkI1 := e.clockI1(mod)
+			if clkI1 == "" {
+				e.p("// ERROR: PSL next_a requires a clocked module")
+				return resVal, "i1"
+			}
+
+			start := rightRange.Start
+			end := rightRange.End
+			if start < 1 {
+				start = 1
+			}
+			if end < start {
+				end = start
+			}
+
+			// Encode |=> next_a[M to N] as ltl.implication with delay (M+1, N-M).
+			seqVal := e.nextSSA()
+			e.p("%s = ltl.delay %s, %d, %d : i1", seqVal, rightVal, start+1, end-start)
+			impVal := e.nextSSA()
+			e.p("%s = ltl.implication %s, %s : i1, !ltl.sequence", impVal, leftVal, seqVal)
+			clocked := e.nextSSA()
+			e.p("%s = ltl.clock %s, posedge %s : !ltl.property", clocked, impVal, clkI1)
+			return clocked, "!ltl.property"
+		}
+
 		leftVal, _ := e.emitExpression(v.Left, mod, env, "", "i1")
 		rightVal, _ := e.emitExpression(v.Right, mod, env, "", "i1")
 
@@ -290,6 +388,26 @@ func (e *MLIREmitter) emitExpression(expr Expression, mod *Module, env map[strin
 		}
 		e.p("%s = comb.icmp eq %s, %s : %s", resVal, sigVal, prevVal, sigType)
 		return resVal, "i1"
+	case PslNextExpr:
+		argVal, _ := e.emitExpression(v.Arg, mod, env, "", "i1")
+		delay := v.Delay
+		if delay < 1 {
+			delay = 1
+		}
+		e.p("%s = ltl.delay %s, %d, 0 : i1", resVal, argVal, delay)
+		return resVal, "!ltl.sequence"
+	case PslNextRangeExpr:
+		argVal, _ := e.emitExpression(v.Arg, mod, env, "", "i1")
+		start := v.Start
+		end := v.End
+		if start < 1 {
+			start = 1
+		}
+		if end < start {
+			end = start
+		}
+		e.p("%s = ltl.delay %s, %d, %d : i1", resVal, argVal, start, end-start)
+		return resVal, "!ltl.sequence"
 	}
 	return e.nextSSA(), "i1"
 }
@@ -553,9 +671,13 @@ func (e *MLIREmitter) emitCombinedAssertions(mod *Module) {
 		}
 	}
 
-	// Temporal (!ltl.property) assertions are not handled in either path here.
+	// Temporal (!ltl.property) assertions are emitted directly in BMC mode.
 	for _, ta := range temporalAsserts {
-		e.p("// temporal assertion skipped in BMC conjunction (type %s): %s", ta.typ, ta.val)
+		if e.ic3Mode {
+			e.p("// temporal assertion skipped in IC3 path (type %s): %s", ta.typ, ta.val)
+		} else {
+			e.p("verif.assert %s : !ltl.property", ta.val)
+		}
 	}
 }
 
@@ -564,6 +686,8 @@ func (e *MLIREmitter) EmitModule(mod *Module) {
 	e.assertions = e.assertions[:0]  // reset accumulator for this module
 	e.assumptions = e.assumptions[:0] // reset accumulator for this module
 	e.badStateSSA = ""
+	e.nameID = 0
+	e.clockI1SSA = ""
 	// Construct signature
 	var ports []string
 	var outputs []string
@@ -629,6 +753,13 @@ func (e *MLIREmitter) EmitModule(mod *Module) {
 	// In IC3 mode, append the bad-state signal as the final output.
 	var outVals []string
 	var outTypes []string
+	if e.ic3Mode && hasPslAssertions(mod) && e.badStateSSA == "" {
+		// If only temporal assertions exist, provide a dummy bad-state signal so
+		// the output signature remains consistent. IC3 is skipped in this case.
+		zero := e.nextSSA()
+		e.p("%s = hw.constant 0 : i1", zero)
+		e.badStateSSA = zero
+	}
 	for i, p := range mod.Ports {
 		if p.Direction == "out" {
 			t := typeToMLIR(p.Type, mod)
@@ -642,6 +773,44 @@ func (e *MLIREmitter) EmitModule(mod *Module) {
 			outTypes = append(outTypes, t)
 		}
 	}
+
+	if mod.Contract != nil && !e.ic3Mode && len(outVals) > 0 {
+		var contractResults []string
+		for range outVals {
+			contractResults = append(contractResults, e.nextSSA())
+		}
+
+		e.p("%s = verif.contract %s : %s {", strings.Join(contractResults, ", "), strings.Join(outVals, ", "), strings.Join(outTypes, ", "))
+		e.indent++
+
+		for _, req := range mod.Contract.Requires {
+			val, _ := e.emitExpression(req, mod, env, "", "i1")
+			e.p("verif.require %s : i1", val)
+		}
+
+		ensureEnv := make(map[string]string)
+		for k, v := range env {
+			ensureEnv[k] = v
+		}
+		outIdx := 0
+		for _, p := range mod.Ports {
+			if p.Direction == "out" {
+				ensureEnv[p.Name] = contractResults[outIdx]
+				outIdx++
+			}
+		}
+
+		for _, ens := range mod.Contract.Ensures {
+			val, _ := e.emitExpression(ens, mod, ensureEnv, "", "i1")
+			e.p("verif.ensure %s : i1", val)
+		}
+
+		e.indent--
+		e.p("}")
+
+		outVals = contractResults
+	}
+
 	if e.badStateSSA != "" {
 		outVals = append(outVals, e.badStateSSA)
 		outTypes = append(outTypes, "i1")
@@ -733,14 +902,26 @@ func (e *MLIREmitter) emitStatementList(stmts []Statement, mod *Module, env map[
 					}
 				}
 			}
-		case *PslAssertion:
-			propVal, propType := e.emitExpression(s.Property, mod, env, "", "")
-			// Accumulate instead of emitting directly; EmitModule combines them.
-			e.assertions = append(e.assertions, assertionEntry{propVal, propType})
-		case *PslAssumption:
-			propVal, propType := e.emitExpression(s.Property, mod, env, "", "")
-			// Accumulate assumptions; emitCombinedAssertions handles them.
-			e.assumptions = append(e.assumptions, assertionEntry{propVal, propType})
+	case *PslAssertion:
+		propVal, propType := e.emitExpression(s.Property, mod, env, "", "")
+		// Accumulate instead of emitting directly; EmitModule combines them.
+		e.assertions = append(e.assertions, assertionEntry{propVal, propType})
+	case *PslAssumption:
+		propVal, propType := e.emitExpression(s.Property, mod, env, "", "")
+		// Accumulate assumptions; emitCombinedAssertions handles them.
+		e.assumptions = append(e.assumptions, assertionEntry{propVal, propType})
+	case *PslCover:
+		propVal, propType := e.emitExpression(s.Property, mod, env, "", "")
+		if !e.ic3Mode {
+			e.p("verif.cover %s : %s", propVal, propType)
+		}
+	case *PslAssertNever:
+		propVal, _ := e.emitExpression(s.Property, mod, env, "", "i1")
+		trueVal := e.nextSSA()
+		notProp := e.nextSSA()
+		e.p("%s = hw.constant -1 : i1", trueVal)
+		e.p("%s = comb.xor %s, %s : i1", notProp, propVal, trueVal)
+		e.assertions = append(e.assertions, assertionEntry{notProp, "i1"})
 		case *PslAfterResetAssertion:
 			e.emitAfterResetAssertion(s, mod, env)
 		}

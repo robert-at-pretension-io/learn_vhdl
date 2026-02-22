@@ -178,6 +178,8 @@ LTL encodes time-indexed properties across clock cycles. Three types:
 %s2 = ltl.delay %a, 1, 4  : i1   // ##[1:4] a  (1 to 4 cycles later)
 ```
 
+**Note for Micro‑VHDL**: `circt-bmc` in this repo now registers the `ltl` dialect and lowers `ltl.delay`/`ltl.implication`/`ltl.clock` into core logic via a dedicated `lower-ltl-to-bmc` pass. LTL properties are still **BMC-only**; IC3/PDR skips them in the AIGER path.
+
 #### `ltl.concat` — consecutive sequences
 
 ```mlir

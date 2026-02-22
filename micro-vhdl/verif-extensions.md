@@ -8,7 +8,12 @@
 ```
 [1/3]  VHDL → build.mlir + build_ic3.mlir   (Go compiler, two MLIR variants)
 [2a/3] BMC via Z3 (circt-bmc, bound=15)      — finds shallow bugs, concrete traces
+                                               strips verif.contract first (--strip-contracts);
+                                               skipped for contract-only designs
 [2b/3] IC3/PDR via ABC pdr (unbounded)        — proves safety or finds deep bugs
+[2c/3] Contract verification via circt-bmc    — present only when contract block exists;
+                                               pipeline: --lower-contracts → extract verif.formal
+                                               → circt-bmc (LowerTestsPass handles the rest)
 [3/3]  MLIR → SystemVerilog (firtool)
 ```
 
@@ -17,6 +22,7 @@
 - `stable(x)`: delay register + `comb.icmp eq` → `verif.assert : i1`
 - `assume always`: emits `verif.assume` in BMC MLIR; IC3 step is skipped (see below)
 - `assert always after_reset(rst)`: sticky `rst_ever_high` register + guarded assertion; IC3 step skipped (see below)
+- `next[N]` and `next_a[M to N]` on the RHS of `|=>`: emitted as `ltl.delay` + `ltl.implication` + `ltl.clock` and lowered for BMC via a dedicated `lower-ltl-to-bmc` pass
 - `eventually!`: stubbed as `hw.constant true` + TODO comment (liveness, skipped in BMC)
 
 **MLIR emission modes**:
@@ -34,6 +40,9 @@
 - IC3 step is skipped automatically when no PSL assertions are present
 - IC3 step is skipped when `psl assume` is present — `verif.assume` cannot pass through `circt-translate --export-aiger` (verif dialect not supported in AIGER lowering); BMC handles the constrained verification correctly
 - IC3 step is skipped when `after_reset` is present — unconstrained initial states in IC3 would trivially violate reset-conditional properties; BMC correctly starts from zero-initialized registers and observes the reset sequence
+- `circt-bmc` cannot process `verif.contract` directly — its `ConvertHWToSMT` pass converts all `hw.module` ops to `func.func`; the apply-mode `hw.module` emitted by `--lower-contracts` contains `verif.symbolic_value`, which is no longer inside a valid parent after conversion and fails dialect validation. The fix: strip contracts before BMC (`--strip-contracts`) and verify contracts separately via the `verif.formal` extraction pipeline (see step [2c/3])
+- `--lower-contracts` emits two things: a `verif.formal @Mod_CheckContract_N` (the actual check) and an apply-mode `hw.module @Mod` (for use-site callers with symbolic outputs). Passing the full lowered file to `circt-bmc` fails because `ConvertHWToSMT` processes all modules. Only the `verif.formal` blocks should be passed to `circt-bmc` — it handles them via its internal `LowerTestsPass`
+- The "operand does not dominate this use" error from `circt-bmc` on `verif.contract` MLIR is a toolchain pipeline issue, not an MLIR validity problem. `verif.contract` has `RegionKindInterface` (graph region) and no `IsolatedFromAbove` trait; results are legitimately referenceable inside the region. `circt-opt --lower-contracts` processes this correctly. `circt-bmc` fails only because it lacks `LowerContractsPass` in its pipeline
 
 ---
 
@@ -70,9 +79,9 @@ psl assert never (state = ERROR_STATE);
 
 Right now all PSL temporal expressions are single-level. There is no way to express patterns across multiple cycles except via `|=>`, hardcoded as exactly one cycle.
 
-### `next[N]` / `next_a[M to N]`
+### `next[N]` / `next_a[M to N]` ✓ DONE (LTL lowering for BMC)
 
-`next[3](ack)` means "ack holds exactly 3 cycles from now." Maps to `ltl.delay %ack, 3`. `next_a[1 to 8](ack)` maps to `ltl.delay %ack, 1, 8`. Unlocks bounded response: "if req fires, ack must arrive within 8 cycles."
+`next[3](ack)` means "ack holds exactly 3 cycles from now." `next_a[1 to 8](ack)` means "ack must hold at least once between 1 and 8 cycles from now." These are emitted as `ltl.delay` plus `ltl.implication` and then lowered into core logic in the `circt-bmc` pipeline. IC3 still skips LTL properties.
 
 ### Sequence concatenation `{a; b; c}`
 
@@ -167,14 +176,14 @@ This requires ABC's liveness mode and a different AIGER encoding convention — 
 |---|---|---|---|
 | IC3/PDR via ABC pdr | **Done** | — | Unbounded safety proofs |
 | `psl assume` | **Done** | — | BMC-constrained verification; IC3 skips when assumes present |
-| `psl never` | Not started | Very low | Readability |
-| `psl cover` | Not started | Very low | Coverage completeness |
+| `psl never` | **Done** | — | Syntactic sugar for always (not P) |
+| `psl cover` | **Done** | — | Checked via separate circt-bmc coverage pass; emitted to SV |
 | Reset-conditional (`after_reset`) | **Done** | — | Eliminates cycle-0 false positives in IC3 |
-| `next[N]` / delay | Not started | Low | Bounded response properties |
+| `next[N]` / delay | **Done** | — | Bounded response properties |
 | `|->` (overlapping implication) | Not started | Low | Full SVA vocabulary |
 | Sequence concat/repeat | Not started | Medium | Protocol verification |
 | `verif.contract` on entities | Not started | High | Compositional, scalable verification |
 | `verif.formal` blocks | Not started | High | Cross-module and LEC |
 | Liveness via ABC fairness | Not started | High | Full temporal logic |
 
-**Highest remaining value**: `next[N]` delay operators — unlock bounded response properties (e.g. "ack arrives within 8 cycles of req"). Maps cleanly to `ltl.delay` in CIRCT.
+**Highest remaining value**: Sequence concat/repeat and overlapping implication `|->` — for full SVA vocabulary and protocol verification.

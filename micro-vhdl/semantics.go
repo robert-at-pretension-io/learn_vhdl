@@ -20,6 +20,7 @@ func (c *SemanticChecker) Check() []string {
 		c.checkInputImmutability(mod)
 		c.checkMultiDrivenWires(mod)
 		c.checkVerificationCoverage(mod)
+		c.checkPslDelayBounds(mod)
 	}
 	return c.errors
 }
@@ -60,8 +61,15 @@ func (c *SemanticChecker) checkVerificationCoverage(mod *Module) {
 	}
 
 	for _, stmt := range mod.Statements {
-		if psl, ok := stmt.(*PslAssertion); ok {
-			walkExpr(psl.Property)
+		switch s := stmt.(type) {
+		case *PslAssertion:
+			walkExpr(s.Property)
+		case *PslAfterResetAssertion:
+			walkExpr(s.Property)
+		case *PslAssertNever:
+			walkExpr(s.Property)
+		case *PslCover:
+			walkExpr(s.Property)
 		}
 	}
 
@@ -114,6 +122,81 @@ func (c *SemanticChecker) checkVerificationCoverage(mod *Module) {
 	}
 	
 	// 3. MUX Completeness (Optional/Future: Ensuring 'others' clause logic isn't sweeping invalid states)
+}
+
+func (c *SemanticChecker) checkPslDelayBounds(mod *Module) {
+	foundNext := false
+
+	var walkExpr func(expr Expression, line uint32, inImplicationRight bool)
+	walkExpr = func(expr Expression, line uint32, inImplicationRight bool) {
+		if expr == nil {
+			return
+		}
+		switch v := expr.(type) {
+		case PslNextExpr:
+			foundNext = true
+			if !inImplicationRight {
+				c.errorf(line, "PSL next is only supported on the right side of |=>")
+			}
+			if v.Delay < 1 {
+				c.errorf(line, "PSL next delay must be >= 1")
+			}
+			walkExpr(v.Arg, line, false)
+		case PslNextRangeExpr:
+			foundNext = true
+			if !inImplicationRight {
+				c.errorf(line, "PSL next_a is only supported on the right side of |=>")
+			}
+			if v.Start < 1 {
+				c.errorf(line, "PSL next_a start must be >= 1")
+			}
+			if v.End < v.Start {
+				c.errorf(line, "PSL next_a end must be >= start")
+			}
+			walkExpr(v.Arg, line, false)
+		case PslImplicationExpr:
+			walkExpr(v.Left, line, false)
+			walkExpr(v.Right, line, true)
+		case PslEventuallyExpr:
+			walkExpr(v.Left, line, false)
+			walkExpr(v.Right, line, false)
+		case PslStableExpr:
+			walkExpr(v.Signal, line, false)
+		case BinaryExpr:
+			walkExpr(v.Left, line, false)
+			walkExpr(v.Right, line, false)
+		case UnaryExpr:
+			walkExpr(v.Right, line, false)
+		case ParenExpr:
+			walkExpr(v.Expr, line, false)
+		case IndexedNameExpr:
+			walkExpr(v.Index, line, false)
+		case SelectedNameExpr:
+			// no-op
+		case IdentifierExpr, LiteralExpr:
+			// no-op
+		}
+	}
+
+	for _, stmt := range mod.Statements {
+		switch s := stmt.(type) {
+		case *PslAssertion:
+			walkExpr(s.Property, s.Line(), false)
+		case *PslAssumption:
+			walkExpr(s.Property, s.Line(), false)
+		case *PslCover:
+			walkExpr(s.Property, s.Line(), false)
+		case *PslAssertNever:
+			walkExpr(s.Property, s.Line(), false)
+		case *PslAfterResetAssertion:
+			walkExpr(s.Reset, s.Line(), false)
+			walkExpr(s.Property, s.Line(), false)
+		}
+	}
+
+	if foundNext && mod.ClockPort == "" {
+		c.errorf(1, "PSL next/next_a requires a clocked module (missing clock port)")
+	}
 }
 
 func (c *SemanticChecker) errorf(line uint32, format string, args ...interface{}) {
@@ -274,4 +357,3 @@ func (c *SemanticChecker) walkSequentialStmtForDriven(stmts []SequentialStatemen
 		}
 	}
 }
-

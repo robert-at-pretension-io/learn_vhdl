@@ -23,6 +23,17 @@ func (e *Extractor) text(n *sitter.Node) string {
 	return string(e.source[n.StartByte():n.EndByte()])
 }
 
+func (e *Extractor) parseNumber(n *sitter.Node) int {
+	if n == nil {
+		return -1
+	}
+	val, err := strconv.Atoi(e.text(n))
+	if err != nil {
+		return -1
+	}
+	return val
+}
+
 func (e *Extractor) ExtractAll(root *sitter.Node) ([]*Module, error) {
 	var modules []*Module
 	
@@ -91,12 +102,44 @@ func (e *Extractor) extractInterface(entityNode *sitter.Node) {
 						}
 					}
 				}
+			} else if node.Kind() == "contract_declaration" {
+				e.extractContractDeclaration(node)
 			}
 			if !cursor.GotoNextSibling() {
 				break
 			}
 		}
 	}
+}
+
+func (e *Extractor) extractContractDeclaration(node *sitter.Node) {
+	contract := &Contract{
+		LineNum: uint32(node.StartPosition().Row + 1),
+	}
+	
+	cursor := node.Walk()
+	if cursor.GotoFirstChild() {
+		for {
+			n := cursor.Node()
+			fieldName := cursor.FieldName()
+			if fieldName == "require_expr" {
+				expr := e.extractExpression(n)
+				if expr != nil {
+					contract.Requires = append(contract.Requires, expr)
+				}
+			} else if fieldName == "ensure_expr" {
+				expr := e.extractExpression(n)
+				if expr != nil {
+					contract.Ensures = append(contract.Ensures, expr)
+				}
+			}
+			if !cursor.GotoNextSibling() {
+				break
+			}
+		}
+	}
+	
+	e.module.Contract = contract
 }
 
 func (e *Extractor) extractGenericDeclaration(node *sitter.Node) {
@@ -210,6 +253,10 @@ func (e *Extractor) extractArchitecture(archNode *sitter.Node) {
 				e.module.Statements = append(e.module.Statements, e.extractPslAssertion(node))
 			} else if node.Kind() == "psl_assumption" {
 				e.module.Statements = append(e.module.Statements, e.extractPslAssumption(node))
+			} else if node.Kind() == "psl_cover" {
+				e.module.Statements = append(e.module.Statements, e.extractPslCover(node))
+			} else if node.Kind() == "psl_assert_never" {
+				e.module.Statements = append(e.module.Statements, e.extractPslAssertNever(node))
 			} else if node.Kind() == "psl_after_reset_assertion" {
 				e.module.Statements = append(e.module.Statements, e.extractPslAfterResetAssertion(node))
 			}
@@ -595,6 +642,30 @@ func (e *Extractor) extractPslAssumption(node *sitter.Node) *PslAssumption {
 	return stmt
 }
 
+func (e *Extractor) extractPslCover(node *sitter.Node) *PslCover {
+	stmt := &PslCover{
+		LineNum: uint32(node.StartPosition().Row + 1),
+	}
+
+	if propNode := node.ChildByFieldName("property"); propNode != nil {
+		stmt.Property = e.extractExpression(propNode)
+	}
+
+	return stmt
+}
+
+func (e *Extractor) extractPslAssertNever(node *sitter.Node) *PslAssertNever {
+	stmt := &PslAssertNever{
+		LineNum: uint32(node.StartPosition().Row + 1),
+	}
+
+	if propNode := node.ChildByFieldName("property"); propNode != nil {
+		stmt.Property = e.extractExpression(propNode)
+	}
+
+	return stmt
+}
+
 func (e *Extractor) extractPslAfterResetAssertion(node *sitter.Node) *PslAfterResetAssertion {
 	stmt := &PslAfterResetAssertion{
 		LineNum: uint32(node.StartPosition().Row + 1),
@@ -685,6 +756,11 @@ func (e *Extractor) extractExpression(node *sitter.Node) Expression {
 			Prefix: e.text(node.ChildByFieldName("prefix")),
 			Suffix: e.text(node.ChildByFieldName("suffix")),
 		}
+	case "paren_expression":
+		// The expression is the middle child (index 1), between '(' and ')'
+		return ParenExpr{
+			Expr: e.extractExpression(node.Child(1)),
+		}
 	case "binary_expression":
 		return BinaryExpr{
 			Op:    strings.TrimSpace(e.text(node.ChildByFieldName("operator"))),
@@ -709,6 +785,17 @@ func (e *Extractor) extractExpression(node *sitter.Node) Expression {
 	case "psl_stable":
 		return PslStableExpr{
 			Signal: e.extractExpression(node.ChildByFieldName("signal")),
+		}
+	case "psl_next":
+		return PslNextExpr{
+			Delay: e.parseNumber(node.ChildByFieldName("delay")),
+			Arg:   e.extractExpression(node.ChildByFieldName("arg")),
+		}
+	case "psl_next_range":
+		return PslNextRangeExpr{
+			Start: e.parseNumber(node.ChildByFieldName("start")),
+			End:   e.parseNumber(node.ChildByFieldName("end")),
+			Arg:   e.extractExpression(node.ChildByFieldName("arg")),
 		}
 	}
 

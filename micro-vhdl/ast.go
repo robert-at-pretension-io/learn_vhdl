@@ -38,14 +38,22 @@ type Generic struct {
 	Default string
 }
 
+// Contract represents the verif.contract attached to an entity.
+type Contract struct {
+	Requires []Expression
+	Ensures  []Expression
+	LineNum  uint32
+}
+
 // Module represents the complete Micro-VHDL design unit (Entity + Architecture).
 type Module struct {
-	Name      string
-	ClockPort string // name of the clock input port; empty for purely combinational modules
-	Generics  []*Generic
-	Ports     []*Port
-	Signals   []*Signal
+	Name       string
+	ClockPort  string // name of the clock input port; empty for purely combinational modules
+	Generics   []*Generic
+	Ports      []*Port
+	Signals    []*Signal
 	Statements []Statement
+	Contract   *Contract
 
 	// Symbol Table
 	Symbols map[string]Type
@@ -180,6 +188,24 @@ type PslAssumption struct {
 func (p *PslAssumption) isStatement()   {}
 func (p *PslAssumption) Line() uint32 { return p.LineNum }
 
+// PslCover represents `psl cover property;`
+type PslCover struct {
+	Property Expression
+	LineNum  uint32
+}
+
+func (p *PslCover) isStatement()   {}
+func (p *PslCover) Line() uint32 { return p.LineNum }
+
+// PslAssertNever represents `psl assert never property;`
+type PslAssertNever struct {
+	Property Expression
+	LineNum  uint32
+}
+
+func (p *PslAssertNever) isStatement()   {}
+func (p *PslAssertNever) Line() uint32 { return p.LineNum }
+
 // PslAfterResetAssertion represents `psl assert always after_reset(rst) property;`
 // The property is checked only after the reset signal has de-asserted at least once.
 // Before that, the assertion is vacuously true.
@@ -277,3 +303,20 @@ type PslStableExpr struct {
 }
 
 func (PslStableExpr) isExpression() {}
+
+// PslNextExpr represents next[N](expr)
+type PslNextExpr struct {
+	Delay int
+	Arg   Expression
+}
+
+func (PslNextExpr) isExpression() {}
+
+// PslNextRangeExpr represents next_a[M to N](expr)
+type PslNextRangeExpr struct {
+	Start int
+	End   int
+	Arg   Expression
+}
+
+func (PslNextRangeExpr) isExpression() {}

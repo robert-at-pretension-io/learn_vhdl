@@ -146,5 +146,5 @@ The Go compiler emits two MLIR files from the same VHDL:
 
 - IC3 counterexamples come back as generic `input_0`/`output_0` names, not the original VHDL signal names
 - Liveness properties (`psl eventually!`) are still stubbed as `hw.constant true`
-- `psl assume` is not yet implemented — inputs remain unconstrained for both solvers
 - Hierarchical designs are not yet flattened before AIGER export
+- LTL properties (`ltl.delay` / `ltl.clock`) are BMC-only; IC3/PDR skips them in the AIGER path

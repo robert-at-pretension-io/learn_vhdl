@@ -68,7 +68,16 @@ module.exports = grammar({
       'entity', field('name', $.identifier), 'is',
       optional($.generic_clause),
       optional($.port_clause),
+      optional($.contract_declaration),
       'end', optional('entity'), optional($.identifier), ';'
+    ),
+
+    contract_declaration: $ => seq(
+      'contract',
+      repeat1(choice(
+        seq('require', ':', field('require_expr', $._psl_expression), ';'),
+        seq('ensure', ':', field('ensure_expr', $._psl_expression), ';')
+      ))
     ),
 
     // JUSTIFICATION: Complex metaprogramming (generic types/functions) requires a 
@@ -169,7 +178,9 @@ module.exports = grammar({
       $.entity_instantiation,
       $.psl_assertion,
       $.psl_assumption,
-      $.psl_after_reset_assertion
+      $.psl_after_reset_assertion,
+      $.psl_cover,
+      $.psl_assert_never
     ),
 
     // JUSTIFICATION: Combinational math executes continuously. Conditionals here 
@@ -269,6 +280,16 @@ module.exports = grammar({
       field('property', $._psl_expression), ';'
     ),
 
+    psl_cover: $ => seq(
+      'psl', 'cover',
+      field('property', $._psl_expression), ';'
+    ),
+
+    psl_assert_never: $ => seq(
+      'psl', 'assert', 'never',
+      field('property', $._psl_expression), ';'
+    ),
+
     psl_after_reset_assertion: $ => seq(
       'psl', 'assert', 'always', 'after_reset',
       '(', field('reset', $._name), ')',
@@ -276,15 +297,19 @@ module.exports = grammar({
     ),
 
     _psl_expression: $ => choice(
-      $._expression,
       $.psl_implication,
       $.psl_eventually,
-      $.psl_stable
+      $.psl_stable,
+      $.psl_next,
+      $.psl_next_range,
+      $._expression
     ),
 
     psl_implication: $ => prec.left(1, seq(field('left', $._psl_expression), '|=>', field('right', $._psl_expression))),
     psl_eventually: $ => prec.left(2, seq(field('left', $._psl_expression), '->', 'eventually!', field('right', $._psl_expression))),
     psl_stable: $ => seq('stable', '(', field('signal', $._name), ')'),
+    psl_next: $ => seq('next', '[', field('delay', $.number), ']', '(', field('arg', $._psl_expression), ')'),
+    psl_next_range: $ => seq('next_a', '[', field('start', $.number), 'to', field('end', $.number), ']', '(', field('arg', $._psl_expression), ')'),
 
     // -------------------------------------------------------------------------
     // EXPRESSIONS & NAMES
@@ -298,12 +323,14 @@ module.exports = grammar({
     indexed_name: $ => seq(field('prefix', $.identifier), '(', field('index', $._expression), ')'),
     selected_name: $ => seq(field('prefix', $.identifier), '.', field('suffix', $.identifier)),
 
+    paren_expression: $ => seq('(', $._expression, ')'),
+
     _expression: $ => choice(
       $._name,
       $.number,
       $.string_literal, 
       $.char_literal,   
-      seq('(', $._expression, ')'),
+      $.paren_expression,
       $.binary_expression,
       $.unary_expression
     ),
