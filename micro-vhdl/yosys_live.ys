@@ -1,0 +1,5 @@
+read_verilog -sv test_live.sv
+prep -top test_live
+clk2fflogic
+chformal -live
+write_aiger -symbols test_live_yosys.aig

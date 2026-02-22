@@ -2211,7 +2211,7 @@
         },
         {
           "type": "SYMBOL",
-          "name": "_expression"
+          "name": "_psl_expression"
         },
         {
           "type": "STRING",

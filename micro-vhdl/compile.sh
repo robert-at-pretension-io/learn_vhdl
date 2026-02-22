@@ -24,6 +24,7 @@ MODULE=$(grep -oP '(?<=hw\.module @)\w+' "$MLIR" | head -1)
 
 # Feature flags — computed once, used in multiple steps below.
 HAS_BAD=$(grep -c '__verif_bad' "$IC3_MLIR" 2>/dev/null || true)
+HAS_LIVENESS=$(grep -c 'assert_fair' "$IC3_MLIR" 2>/dev/null || true)
 HAS_ASSUME=$(grep -c 'verif.assume' "$MLIR" 2>/dev/null || true)
 HAS_AFTER_RESET=$(grep -c 'after_reset' "$INPUT" 2>/dev/null || true)
 HAS_LTL=$(grep -c 'ltl' "$MLIR" 2>/dev/null || true)
@@ -56,13 +57,17 @@ else
     --shared-libs=/usr/lib/x86_64-linux-gnu/libz3.so
 fi
 
-# Only run IC3 when the IC3 MLIR contains a __verif_bad output
+# Only run IC3 when the IC3 MLIR contains a __verif_bad or assert_fair output
 # (i.e. the design has PSL assertions worth proving unboundedly).
 # Skip IC3 when psl assume is present: circt-translate --export-aiger does not
 # support the verif dialect, so assumptions cannot be encoded as AIGER constraints.
 # The BMC step (Z3) handles constrained verification correctly via verif.assume.
-if [ "$HAS_BAD" -gt 0 ] && [ "$HAS_LTL" -gt 0 ]; then
-  echo "[2b/3] LTL properties present — IC3/PDR skipped (ltl lowering not supported in AIGER path; BMC covers this)."
+if [ "$HAS_LIVENESS" -gt 0 ]; then
+  echo "[2b/3] Unbounded IC3/PDR Liveness proof via ABC (module=${MODULE})..."
+  "${CIRCT_BIN}/circt-synth" --until-before=all "$IC3_MLIR" | "${CIRCT_BIN}/circt-translate" --export-aiger -o "$IC3_AIG"
+  "$ABC" -c "read_aiger ${IC3_AIG}; l2s; pdr; quit" 2>&1
+elif [ "$HAS_BAD" -gt 0 ] && [ "$HAS_LTL" -gt 0 ]; then
+  echo "[2b/3] LTL temporal safety properties present — IC3/PDR skipped (BMC covers this)."
 elif [ "$HAS_BAD" -gt 0 ] && [ "$HAS_ASSUME" -gt 0 ]; then
   echo "[2b/3] PSL assumes present — IC3/PDR skipped (assumptions cannot be encoded as AIGER constraints; BMC covers this)."
 elif [ "$HAS_BAD" -gt 0 ] && [ "$HAS_AFTER_RESET" -gt 0 ]; then
@@ -70,14 +75,8 @@ elif [ "$HAS_BAD" -gt 0 ] && [ "$HAS_AFTER_RESET" -gt 0 ]; then
 elif [ "$HAS_BAD" -gt 0 ] && [ "$HAS_CONTRACT" -gt 0 ]; then
   echo "[2b/3] Contracts present — IC3/PDR skipped (assumptions cannot be encoded as AIGER constraints; BMC covers this)."
 elif [ "$HAS_BAD" -gt 0 ]; then
-  echo "[2b/3] Unbounded IC3/PDR proof via ABC (module=${MODULE})..."
-  # Lower to AIG, export to binary AIGER, run ABC pdr.
-  # ABC treats each hw.output as a bad-state signal: pdr proves it unreachable.
-  "${CIRCT_BIN}/circt-synth" \
-    --until-before=all \
-    "$IC3_MLIR" \
-    | "${CIRCT_BIN}/circt-translate" \
-        --export-aiger -o "$IC3_AIG"
+  echo "[2b/3] Unbounded IC3/PDR Safety proof via ABC (module=${MODULE})..."
+  "${CIRCT_BIN}/circt-synth" --until-before=all "$IC3_MLIR" | "${CIRCT_BIN}/circt-translate" --export-aiger -o "$IC3_AIG"
   "$ABC" -c "read_aiger ${IC3_AIG}; pdr; quit" 2>&1
 else
   echo "[2b/3] No PSL assertions found — skipping IC3/PDR."

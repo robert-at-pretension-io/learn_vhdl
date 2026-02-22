@@ -17,16 +17,17 @@ type assertionEntry struct {
 
 // MLIREmitter handles translating populated Wires, Statements, and Modules into CIRCT HW/Comb MLIR text.
 type MLIREmitter struct {
-	builder     strings.Builder
-	indent      int
-	ssaID       int
-	modules     map[string]*Module
-	assertions  []assertionEntry // accumulated per-module, reset in EmitModule
-	assumptions []assertionEntry // accumulated per-module, reset in EmitModule
-	ic3Mode     bool             // emit __verif_bad hw.output instead of verif.assert
-	badStateSSA string           // set by emitCombinedAssertions in ic3Mode
-	nameID      int              // unique naming for generated regs
-	clockI1SSA  string           // cached per-module i1 clock (seq.from_clock)
+	builder         strings.Builder
+	indent          int
+	ssaID           int
+	modules         map[string]*Module
+	assertions      []assertionEntry // accumulated per-module, reset in EmitModule
+	assumptions     []assertionEntry // accumulated per-module, reset in EmitModule
+	livenessAsserts []string         // accumulated liveness conditions for IC3
+	ic3Mode         bool             // emit __verif_bad hw.output instead of verif.assert
+	badStateSSA     string           // set by emitCombinedAssertions in ic3Mode
+	nameID          int              // unique naming for generated regs
+	clockI1SSA      string           // cached per-module i1 clock (seq.from_clock)
 }
 
 func NewMLIREmitter() *MLIREmitter {
@@ -47,6 +48,38 @@ func hasPslAssertions(mod *Module) bool {
 		switch stmt.(type) {
 		case *PslAssertion, *PslAfterResetAssertion, *PslAssertNever:
 			return true
+		}
+	}
+	return false
+}
+
+func hasPslLiveness(mod *Module) bool {
+	var walk func(expr Expression) bool
+	walk = func(expr Expression) bool {
+		if expr == nil {
+			return false
+		}
+		switch v := expr.(type) {
+		case PslEventuallyExpr:
+			return true
+		case ParenExpr:
+			return walk(v.Expr)
+		case PslImplicationExpr:
+			return walk(v.Left) || walk(v.Right)
+		case PslSequenceExpr:
+			for _, el := range v.Elements {
+				if walk(el.Expr) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	for _, stmt := range mod.Statements {
+		if a, ok := stmt.(*PslAssertion); ok {
+			if walk(a.Property) {
+				return true
+			}
 		}
 	}
 	return false
@@ -534,15 +567,33 @@ func (e *MLIREmitter) emitExpression(expr Expression, mod *Module, env map[strin
 		return resVal, "!ltl.sequence"
 
 	case PslEventuallyExpr:
-		// PSL "left -> eventually! right" is a liveness property: right must become
-		// true at some unbounded future cycle whenever left holds.  Bounded model
-		// checking (circt-bmc) cannot directly encode liveness without an automaton
-		// translation.  We emit a hw.constant true so the assertion always passes in
-		// the BMC conjunction (not checked), and add a comment that flags the property
-		// for review.  A full liveness proof requires an unbounded solver or k-liveness.
-		e.p("// TODO liveness: psl assert always %s -> eventually! %s (skipped in BMC)", v.Left, v.Right)
-		e.p("%s = hw.constant true", resVal)
-		return resVal, "i1"
+		leftVal, _ := e.emitExpression(v.Left, mod, env, "", "i1", extraSymbols)
+		rightVal, _ := e.emitExpression(v.Right, mod, env, "", "i1", extraSymbols)
+		
+		clkI1 := e.clockI1(mod)
+		if clkI1 == "" {
+			e.p("// ERROR: PSL eventually requires a clocked module")
+			return resVal, "i1"
+		}
+
+		if e.ic3Mode {
+			trueVal := e.nextSSA()
+			e.p("%s = hw.constant -1 : i1", trueVal)
+			notLeft := e.nextSSA()
+			e.p("%s = comb.xor %s, %s : i1", notLeft, leftVal, trueVal)
+			liveCond := e.nextSSA()
+			e.p("%s = comb.or %s, %s : i1", liveCond, notLeft, rightVal)
+			e.livenessAsserts = append(e.livenessAsserts, liveCond)
+			
+			// Return as !ltl.property so it skips __verif_bad conjunction in IC3 mode
+			return liveCond, "!ltl.property"
+		}
+		
+		// BMC mode fallback: emit a constant true and a warning.
+		e.p("// TODO liveness: skipped in BMC (requires IC3 with fairness)")
+		trueVal := e.nextSSA()
+		e.p("%s = hw.constant -1 : i1", trueVal)
+		return trueVal, "i1"
 
 	case PslStableExpr:
 		// PSL stable(x): x has not changed from the previous clock cycle.
@@ -857,6 +908,7 @@ func (e *MLIREmitter) emitCombinedAssertions(mod *Module) {
 func (e *MLIREmitter) EmitModule(mod *Module) {
 	e.assertions = e.assertions[:0]  // reset accumulator for this module
 	e.assumptions = e.assumptions[:0] // reset accumulator for this module
+	e.livenessAsserts = e.livenessAsserts[:0]
 	e.badStateSSA = ""
 	e.nameID = 0
 	e.clockI1SSA = ""
@@ -880,6 +932,9 @@ func (e *MLIREmitter) EmitModule(mod *Module) {
 	// In IC3 mode, add a bad-state output port when the module has PSL assertions.
 	if e.ic3Mode && hasPslAssertions(mod) {
 		ports = append(ports, "out __verif_bad: i1")
+	}
+	if e.ic3Mode && hasPslLiveness(mod) {
+		ports = append(ports, "out assert_fair: i1")
 	}
 
 	sigPorts := strings.Join(ports, ", ")
@@ -990,6 +1045,24 @@ func (e *MLIREmitter) EmitModule(mod *Module) {
 
 	if e.badStateSSA != "" {
 		outVals = append(outVals, e.badStateSSA)
+		outTypes = append(outTypes, "i1")
+	}
+	if e.ic3Mode && hasPslLiveness(mod) {
+		var livenessSSA string
+		if len(e.livenessAsserts) == 0 {
+			livenessSSA = e.nextSSA()
+			e.p("%s = hw.constant 1 : i1", livenessSSA)
+		} else if len(e.livenessAsserts) == 1 {
+			livenessSSA = e.livenessAsserts[0]
+		} else {
+			livenessSSA = e.livenessAsserts[0]
+			for _, next := range e.livenessAsserts[1:] {
+				res := e.nextSSA()
+				e.p("%s = comb.and %s, %s : i1", res, livenessSSA, next)
+				livenessSSA = res
+			}
+		}
+		outVals = append(outVals, livenessSSA)
 		outTypes = append(outTypes, "i1")
 	}
 	if len(outVals) > 0 {

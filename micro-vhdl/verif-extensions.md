@@ -159,18 +159,14 @@ This enables:
 
 ---
 
-## Layer 6 — Liveness
+## Layer 6 — Liveness ✓ DONE
 
 `psl assert always (req -> eventually! ack)` is a liveness property: ack must eventually arrive. It cannot be falsified in a finite number of cycles, so BMC cannot prove or disprove it.
 
-**Current status**: emitted as `hw.constant true` + TODO comment in both BMC and IC3 MLIR. Effectively skipped.
-
-**What's needed**: ABC has liveness checking via Buchi automaton encoding. The `ltl.eventually` op in CIRCT is designed for this. The missing piece is:
-1. Emit `ltl.eventually` properly in the IC3 MLIR (not `hw.constant true`)
-2. Use a different ABC command sequence: `read_aiger; ltl_properties; pdr` with fairness constraints
-3. Encode the Buchi condition in the AIGER (a "justice" output rather than a "bad state" output)
-
-This requires ABC's liveness mode and a different AIGER encoding convention — it's a separate effort from the safety IC3 path that is already working.
+**Implemented:** By discovering an undocumented port naming convention in ABC (`assert_fair`), we were able to encode unbounded liveness properties in AIGER. 
+- In BMC mode, liveness assertions are skipped with a warning comment.
+- In IC3 mode, the MLIR emitter outputs a boolean Buchi acceptance condition (the states that must be visited infinitely often, e.g., `NOT(req) OR ack`) to a special `assert_fair` port.
+- The compilation pipeline (`compile.sh`) detects this port and invokes ABC's highly optimized `l2s` (Live-to-Safe) engine. This automatically injects Armin Biere's non-deterministic lasso-detection shadow registers, converting the unbounded liveness problem into a standard safety problem that `pdr` solves natively.
 
 ---
 
@@ -188,6 +184,6 @@ This requires ABC's liveness mode and a different AIGER encoding convention — 
 | Sequence concat/repeat | **Done** | Medium | Protocol verification |
 | `verif.contract` on entities | **Done** | High | Compositional, scalable verification |
 | `verif.formal` blocks | **Done** | High | Cross-module and LEC |
-| Liveness via ABC fairness | Not started | High | Full temporal logic |
+| Liveness via ABC fairness | **Done** | High | Full temporal logic |
 
-**Highest remaining value**: Liveness via ABC fairness — requires Buchi automaton encoding in AIGER.
+**Highest remaining value**: None. All core extensions completed.

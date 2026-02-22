@@ -363,7 +363,7 @@ module.exports = grammar({
     indexed_name: $ => seq(field('prefix', $.identifier), '(', field('index', $._expression), ')'),
     selected_name: $ => seq(field('prefix', $.identifier), '.', field('suffix', $.identifier)),
 
-    paren_expression: $ => seq('(', $._expression, ')'),
+    paren_expression: $ => seq('(', $._psl_expression, ')'),
 
     _expression: $ => $.logical_expression,
 

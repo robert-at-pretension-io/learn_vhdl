@@ -27,6 +27,8 @@ print_file() {
     print_file "examples/vhd/test_seq.vhd"
     print_file "examples/vhd/test_contract.vhd"
     print_file "examples/vhd/test_formal.vhd"
+    print_file "examples/vhd/test_liveness.vhd"
+    print_file "liveness-plan.md"
 ) > .paste_buffer.txt
 
 # Try to copy to clipboard if a tool is available
