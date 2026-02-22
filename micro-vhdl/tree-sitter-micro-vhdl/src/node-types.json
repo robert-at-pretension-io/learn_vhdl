@@ -1922,7 +1922,28 @@
   {
     "type": "synchronous_process",
     "named": true,
-    "fields": {},
+    "fields": {
+      "clock": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      },
+      "clock_edge": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      }
+    },
     "children": {
       "multiple": true,
       "required": false,
@@ -2179,10 +2200,6 @@
   {
     "type": "char_literal",
     "named": true
-  },
-  {
-    "type": "clk",
-    "named": false
   },
   {
     "type": "comment",

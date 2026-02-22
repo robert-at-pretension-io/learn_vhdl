@@ -1313,8 +1313,12 @@
           "value": "("
         },
         {
-          "type": "STRING",
-          "value": "clk"
+          "type": "FIELD",
+          "name": "clock",
+          "content": {
+            "type": "SYMBOL",
+            "name": "identifier"
+          }
         },
         {
           "type": "STRING",
@@ -1337,8 +1341,12 @@
           "value": "("
         },
         {
-          "type": "STRING",
-          "value": "clk"
+          "type": "FIELD",
+          "name": "clock_edge",
+          "content": {
+            "type": "SYMBOL",
+            "name": "identifier"
+          }
         },
         {
           "type": "STRING",

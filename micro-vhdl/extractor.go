@@ -69,17 +69,25 @@ func (e *Extractor) ExtractAll(root *sitter.Node) ([]*Module, error) {
 	for name, entityNode := range entities {
 		e.module = NewModule(name)
 		e.extractInterface(entityNode)
-		
-		// If there's a port named 'clk', assume it's the module clock.
-		for _, p := range e.module.Ports {
-			if p.Name == "clk" {
-				e.module.ClockPort = "clk"
-				break
-			}
-		}
 
 		if archNode, ok := arches[name]; ok {
 			e.extractArchitecture(archNode)
+		}
+
+		// Fallback: if no synchronous process registered a clock (e.g. pure-PSL
+		// modules), scan ports for conventional clock names (clk, clock, clk_*).
+		// This preserves behavior for existing single-clock designs that have PSL
+		// assertions but no process, without hardcoding a single name.
+		if e.module.ClockPort == "" {
+			for _, p := range e.module.Ports {
+				if p.Name == "clk" || p.Name == "clock" || strings.HasPrefix(p.Name, "clk_") {
+					e.module.ClockPort = p.Name
+					if !containsString(e.module.ClockPorts, p.Name) {
+						e.module.ClockPorts = append(e.module.ClockPorts, p.Name)
+					}
+					break
+				}
+			}
 		}
 		
 		// Add global formal blocks to every module for now, or just the first one.
@@ -558,10 +566,22 @@ func (e *Extractor) extractSynchronousProcess(node *sitter.Node) *SynchronousPro
 	proc := &SynchronousProcess{
 		LineNum: uint32(node.StartPosition().Row + 1),
 	}
-	// The micro-vhdl grammar hardcodes 'clk' as the clock signal in every
-	// synchronous_process.  Record it on the module so the MLIR emitter can
-	// emit the port as !seq.clock instead of i1.
-	e.module.ClockPort = "clk"
+
+	// Read the clock name from the 'clock' field (any identifier, e.g. clk, clk_fast).
+	clockName := ""
+	if clockNode := node.ChildByFieldName("clock"); clockNode != nil {
+		clockName = e.text(clockNode)
+	}
+	proc.Clock = clockName
+
+	// Register this clock on the module.
+	if clockName != "" && !containsString(e.module.ClockPorts, clockName) {
+		e.module.ClockPorts = append(e.module.ClockPorts, clockName)
+	}
+	// Keep ClockPort as the primary (first seen) for backward compatibility.
+	if e.module.ClockPort == "" {
+		e.module.ClockPort = clockName
+	}
 
 	cursor := node.Walk()
 	if cursor.GotoFirstChild() {
@@ -579,6 +599,15 @@ func (e *Extractor) extractSynchronousProcess(node *sitter.Node) *SynchronousPro
 	}
 
 	return proc
+}
+
+func containsString(slice []string, s string) bool {
+	for _, v := range slice {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *Extractor) extractSequentialAssignment(node *sitter.Node) *SequentialAssignment {

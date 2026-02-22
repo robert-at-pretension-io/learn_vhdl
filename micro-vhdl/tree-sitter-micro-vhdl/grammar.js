@@ -235,13 +235,15 @@ module.exports = grammar({
       field('formal', $.identifier), '=>', field('actual', $._expression)
     ),
 
-    // JUSTIFICATION: The Time Machine. This is the ONLY place time exists in Micro-VHDL. 
-    // By enforcing the `rising_edge(clk)` template, we guarantee that all state 
+    // JUSTIFICATION: The Time Machine. This is the ONLY place time exists in Micro-VHDL.
+    // By enforcing the `rising_edge(clk)` template, we guarantee that all state
     // maps directly to a synchronous D-Flip-Flop register. Unclocked processes are banned.
+    // The clock signal name is now parameterized (any identifier) to support multi-clock
+    // designs. CDC safety is enforced at the semantic layer, not the grammar layer.
     synchronous_process: $ => seq(
-      'process', '(', 'clk', ')', 'begin',
-      'if', 'rising_edge', '(', 'clk', ')', 'then',
-      repeat($._sequential_statement), 
+      'process', '(', field('clock', $.identifier), ')', 'begin',
+      'if', 'rising_edge', '(', field('clock_edge', $.identifier), ')', 'then',
+      repeat($._sequential_statement),
       'end', 'if', ';',
       'end', 'process', ';'
     ),

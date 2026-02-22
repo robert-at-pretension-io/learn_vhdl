@@ -48,7 +48,8 @@ type Contract struct {
 // Module represents the complete Micro-VHDL design unit (Entity + Architecture).
 type Module struct {
 	Name       string
-	ClockPort  string // name of the clock input port; empty for purely combinational modules
+	ClockPort  string   // primary clock (first detected; backward compat)
+	ClockPorts []string // all clock ports (populated when multi-clock detected)
 	Generics   []*Generic
 	Ports      []*Port
 	Signals    []*Signal
@@ -134,6 +135,7 @@ func (g *GenerateStatement) Line() uint32 { return g.LineNum }
 
 // SynchronousProcess represents the strictly clocked process.
 type SynchronousProcess struct {
+	Clock      string             // name of the clock port this process uses
 	Statements []SequentialStatement
 	LineNum    uint32
 }

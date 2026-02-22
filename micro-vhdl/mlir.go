@@ -27,18 +27,28 @@ type MLIREmitter struct {
 	ic3Mode         bool             // emit __verif_bad hw.output instead of verif.assert
 	badStateSSA     string           // set by emitCombinedAssertions in ic3Mode
 	nameID          int              // unique naming for generated regs
-	clockI1SSA      string           // cached per-module i1 clock (seq.from_clock)
+	clockSSAs       map[string]string // clock port name → "!seq.clock" SSA (e.g. "%clk_fast")
+	clockI1SSAs     map[string]string // clock port name → i1 SSA (seq.from_clock result)
 }
 
 func NewMLIREmitter() *MLIREmitter {
-	return &MLIREmitter{modules: make(map[string]*Module)}
+	return &MLIREmitter{
+		modules:     make(map[string]*Module),
+		clockSSAs:   make(map[string]string),
+		clockI1SSAs: make(map[string]string),
+	}
 }
 
 // NewMLIREmitterIC3 returns an emitter that targets the IC3/PDR path: PSL
 // assertions are emitted as a negated hw.output (__verif_bad) rather than
 // verif.assert, so the module can be exported to AIGER and checked by ABC pdr.
 func NewMLIREmitterIC3() *MLIREmitter {
-	return &MLIREmitter{modules: make(map[string]*Module), ic3Mode: true}
+	return &MLIREmitter{
+		modules:     make(map[string]*Module),
+		ic3Mode:     true,
+		clockSSAs:   make(map[string]string),
+		clockI1SSAs: make(map[string]string),
+	}
 }
 
 // hasPslAssertions reports whether mod contains any PSL assertion statements
@@ -109,7 +119,8 @@ func (e *MLIREmitter) nextName(prefix string) string {
 	return name
 }
 
-// clockSSA returns the SSA name of the module's clock port (e.g. "%clk").
+// clockSSA returns the SSA name of the module's primary clock port (e.g. "%clk").
+// Kept for backward compatibility; prefer e.clockSSAs[clkName] in new code.
 func (e *MLIREmitter) clockSSA(mod *Module) string {
 	if mod.ClockPort == "" {
 		return ""
@@ -117,19 +128,26 @@ func (e *MLIREmitter) clockSSA(mod *Module) string {
 	return fmt.Sprintf("%%%s", mod.ClockPort)
 }
 
-// clockI1 returns an i1 clock SSA (seq.from_clock) for LTL properties.
-func (e *MLIREmitter) clockI1(mod *Module) string {
-	if e.clockI1SSA != "" {
-		return e.clockI1SSA
+// clockI1ForClock returns an i1 SSA (seq.from_clock) for the named clock port.
+// Results are cached per clock name to avoid duplicate emissions.
+func (e *MLIREmitter) clockI1ForClock(clkName string) string {
+	if v, ok := e.clockI1SSAs[clkName]; ok {
+		return v
 	}
-	clk := e.clockSSA(mod)
-	if clk == "" {
+	clkSSA := e.clockSSAs[clkName]
+	if clkSSA == "" {
 		return ""
 	}
-	clkI1 := e.nextSSA()
-	e.p("%s = seq.from_clock %s", clkI1, clk)
-	e.clockI1SSA = clkI1
-	return clkI1
+	i1SSA := e.nextSSA()
+	e.p("%s = seq.from_clock %s", i1SSA, clkSSA)
+	e.clockI1SSAs[clkName] = i1SSA
+	return i1SSA
+}
+
+// clockI1 returns an i1 clock SSA for the module's primary clock.
+// Used by PSL temporal assertions that always reference the primary clock.
+func (e *MLIREmitter) clockI1(mod *Module) string {
+	return e.clockI1ForClock(mod.ClockPort)
 }
 
 func (e *MLIREmitter) emitCompReg(val string, clk string, typ string, name string) string {
@@ -665,7 +683,11 @@ func (e *MLIREmitter) emitSynchronousProcess(sp *SynchronousProcess, mod *Module
 
 		t := mod.Symbols[target]
 		mlirType := typeToMLIR(t, mod)
-		clk := e.clockSSA(mod)
+		// Use the process-specific clock; fall back to the module primary clock.
+		clk := e.clockSSAs[sp.Clock]
+		if clk == "" {
+			clk = e.clockSSA(mod)
+		}
 
 		// Emit seq.initial so BMC tools know the register starts at zero rather
 		// than at an arbitrary unconstrained value.
@@ -912,11 +934,22 @@ func (e *MLIREmitter) EmitModule(mod *Module, isPrivate bool) {
 	e.livenessAsserts = e.livenessAsserts[:0]
 	e.badStateSSA = ""
 	e.nameID = 0
-	e.clockI1SSA = ""
+	e.clockSSAs = make(map[string]string)
+	e.clockI1SSAs = make(map[string]string)
 
 	visibility := ""
 	if isPrivate {
 		visibility = " private"
+	}
+
+	// Build a set of all clock port names for O(1) lookup.
+	clockPortSet := make(map[string]bool)
+	for _, cp := range mod.ClockPorts {
+		clockPortSet[cp] = true
+	}
+	// Backward compat: single ClockPort not yet in ClockPorts slice.
+	if mod.ClockPort != "" {
+		clockPortSet[mod.ClockPort] = true
 	}
 
 	// Construct signature
@@ -924,8 +957,9 @@ func (e *MLIREmitter) EmitModule(mod *Module, isPrivate bool) {
 	var outputs []string
 	for _, p := range mod.Ports {
 		var t string
-		if p.Name == mod.ClockPort {
+		if clockPortSet[p.Name] {
 			t = "!seq.clock" // clock ports are !seq.clock, not i1
+			e.clockSSAs[p.Name] = fmt.Sprintf("%%%s", p.Name)
 		} else {
 			t = typeToMLIR(p.Type, mod)
 		}

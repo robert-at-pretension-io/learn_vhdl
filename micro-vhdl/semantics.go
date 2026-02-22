@@ -22,6 +22,7 @@ func (c *SemanticChecker) Check() []string {
 		c.checkMultiDrivenWires(mod)
 		c.checkVerificationCoverage(mod)
 		c.checkPslDelayBounds(mod)
+		c.checkCDCViolations(mod)
 	}
 	return c.errors
 }
@@ -398,6 +399,182 @@ func (c *SemanticChecker) walkSequentialStmtForDriven(stmts []SequentialStatemen
 				c.walkSequentialStmtForDriven(e.Then, procDriven)
 			}
 			c.walkSequentialStmtForDriven(sa.Else, procDriven)
+		}
+	}
+}
+
+// cdcPrimitives are entity names recognized as safe CDC crossing boundaries.
+var cdcPrimitives = map[string]bool{
+	"sync_2ff":         true,
+	"async_fifo_gray":  true,
+}
+
+func (c *SemanticChecker) checkCDCViolations(mod *Module) {
+	// Only meaningful in multi-clock designs.
+	if len(mod.ClockPorts) < 2 {
+		return
+	}
+
+	// Step 1: Build signalDomain — signal name → clock domain that drives it.
+	signalDomain := make(map[string]string)
+
+	var collectTargets func(stmts []SequentialStatement, clk string)
+	collectTargets = func(stmts []SequentialStatement, clk string) {
+		for _, stmt := range stmts {
+			switch s := stmt.(type) {
+			case *SequentialAssignment:
+				signalDomain[s.Target] = clk
+			case *SequentialIf:
+				collectTargets(s.Then, clk)
+				for _, el := range s.Elsifs {
+					collectTargets(el.Then, clk)
+				}
+				collectTargets(s.Else, clk)
+			}
+		}
+	}
+
+	for _, stmt := range mod.Statements {
+		if sp, ok := stmt.(*SynchronousProcess); ok && sp.Clock != "" {
+			collectTargets(sp.Statements, sp.Clock)
+		}
+	}
+
+	// Step 2: Build cdcSafeOutputs — wires that are outputs of recognized CDC primitives.
+	cdcSafeOutputs := make(map[string]bool)
+	for _, stmt := range mod.Statements {
+		inst, ok := stmt.(*EntityInstantiation)
+		if !ok || !cdcPrimitives[inst.EntityName] {
+			continue
+		}
+		// Mark any actual wire connected to an output port of the CDC primitive as safe.
+		for _, pm := range inst.PortMap {
+			// Find if this port is an output on the child entity; we infer by
+			// convention: for sync_2ff the output port is "d_out".
+			// For any recognized CDC primitive, all actual identifiers on output
+			// ports are considered safe. We look at the associated module to
+			// determine port directions.
+			modMap := make(map[string]*Module)
+			for _, m := range c.modules {
+				modMap[m.Name] = m
+			}
+			if child, exists := modMap[inst.EntityName]; exists {
+				for _, cp := range child.Ports {
+					if cp.Name == pm.Formal && cp.Direction == "out" {
+						if id, isId := pm.Actual.(IdentifierExpr); isId {
+							cdcSafeOutputs[id.Name] = true
+						}
+					}
+				}
+			} else {
+				// If the child module isn't in this compilation unit (e.g. a library
+				// primitive), conservatively mark all actuals as safe.
+				if id, isId := pm.Actual.(IdentifierExpr); isId {
+					cdcSafeOutputs[id.Name] = true
+				}
+			}
+		}
+	}
+
+	// cdcRead pairs an identifier read with the source line that reads it.
+	type cdcRead struct {
+		name string
+		line uint32
+	}
+
+	// Step 3: For each process, walk expressions and flag cross-domain reads.
+	// Line numbers are carried per-statement so the error points at the specific
+	// assignment or condition, not the process header.
+	var collectReads func(expr Expression, line uint32) []cdcRead
+	collectReads = func(expr Expression, line uint32) []cdcRead {
+		if expr == nil {
+			return nil
+		}
+		var ids []cdcRead
+		switch v := expr.(type) {
+		case IdentifierExpr:
+			ids = append(ids, cdcRead{v.Name, line})
+		case IndexedNameExpr:
+			ids = append(ids, cdcRead{v.Prefix, line})
+			ids = append(ids, collectReads(v.Index, line)...)
+		case SelectedNameExpr:
+			ids = append(ids, cdcRead{v.Prefix, line})
+		case BinaryExpr:
+			ids = append(ids, collectReads(v.Left, line)...)
+			ids = append(ids, collectReads(v.Right, line)...)
+		case UnaryExpr:
+			ids = append(ids, collectReads(v.Right, line)...)
+		case ParenExpr:
+			ids = append(ids, collectReads(v.Expr, line)...)
+		case FunctionCallExpr:
+			for _, arg := range v.Args {
+				ids = append(ids, collectReads(arg, line)...)
+			}
+		}
+		return ids
+	}
+
+	var collectReadsSeq func(stmts []SequentialStatement) []cdcRead
+	collectReadsSeq = func(stmts []SequentialStatement) []cdcRead {
+		var ids []cdcRead
+		for _, stmt := range stmts {
+			switch s := stmt.(type) {
+			case *SequentialAssignment:
+				ids = append(ids, collectReads(s.Value, s.LineNum)...)
+			case *SequentialIf:
+				ids = append(ids, collectReads(s.Condition, s.LineNum)...)
+				ids = append(ids, collectReadsSeq(s.Then)...)
+				for _, el := range s.Elsifs {
+					ids = append(ids, collectReads(el.Condition, s.LineNum)...)
+					ids = append(ids, collectReadsSeq(el.Then)...)
+				}
+				ids = append(ids, collectReadsSeq(s.Else)...)
+			}
+		}
+		return ids
+	}
+
+	// Track which violations we've already reported to avoid duplicate messages
+	// for the same signal pair (one per unique signal, not one per read site).
+	reported := make(map[string]bool)
+
+	for _, stmt := range mod.Statements {
+		sp, ok := stmt.(*SynchronousProcess)
+		if !ok || sp.Clock == "" {
+			continue
+		}
+		reads := collectReadsSeq(sp.Statements)
+		for _, r := range reads {
+			srcDomain, driven := signalDomain[r.name]
+			if !driven || srcDomain == sp.Clock {
+				continue
+			}
+			if cdcSafeOutputs[r.name] {
+				continue
+			}
+			key := r.name + ":" + sp.Clock
+			if reported[key] {
+				continue
+			}
+			reported[key] = true
+
+			// Suggest a concrete sync wire name and instantiation the LLM can
+			// copy-paste verbatim.
+			syncWire := r.name + "_sync"
+			c.errors = append(c.errors, fmt.Sprintf(
+				"Line %d: Semantic Error - Signal '%s' (domain '%s') is read inside the '%s' process without a CDC synchronizer.\n"+
+					"  Fix: declare a synchronized wire and add a sync_2ff instance in the architecture declarative region and concurrent body:\n"+
+					"    signal %s : std_logic;\n"+
+					"    u_sync_%s : entity work.sync_2ff port map (\n"+
+					"      clk_dst => %s, d_in => %s, d_out => %s\n"+
+					"    );\n"+
+					"  Then replace '%s' with '%s' inside the %s process.",
+				r.line, r.name, srcDomain, sp.Clock,
+				syncWire,
+				r.name,
+				sp.Clock, r.name, syncWire,
+				r.name, syncWire, sp.Clock,
+			))
 		}
 	}
 }
