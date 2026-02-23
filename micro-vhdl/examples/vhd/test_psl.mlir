@@ -13,17 +13,18 @@ hw.module @my_module(in %clk: !seq.clock, in %req: i1, out ack: i1) {
   %9 = hw.constant -1 : i1
   %10 = comb.xor %8, %9 : i1
   %3 = comb.or %10, %ack : i1
-  // TODO liveness: psl assert always {req} -> eventually! {ack} (skipped in BMC)
-  %11 = hw.constant true
-  %14 = seq.initial () {
-    %15 = hw.constant 0 : i1
-    seq.yield %15 : i1
+  %14 = seq.from_clock %clk
+  // TODO liveness: skipped in BMC (requires IC3 with fairness)
+  %15 = hw.constant -1 : i1
+  %18 = seq.initial () {
+    %19 = hw.constant 0 : i1
+    seq.yield %19 : i1
   } : () -> !seq.immutable<i1>
-  %16 = seq.compreg %req, %clk initial %14 : i1
-  %12 = comb.icmp eq %req, %16 : i1
-  %17 = comb.and %3, %11 : i1
-  %18 = comb.and %17, %12 : i1
-  verif.assert %18 : i1
+  %20 = seq.compreg %req, %clk initial %18 : i1
+  %16 = comb.icmp eq %req, %20 : i1
+  %21 = comb.and %3, %15 : i1
+  %22 = comb.and %21, %16 : i1
+  verif.assert %22 : i1
   hw.output %ack : i1
 }
 

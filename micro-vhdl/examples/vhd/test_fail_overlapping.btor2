@@ -1,0 +1,11 @@
+1 sort bitvec 1
+2 input 1 req
+3 constd 1 0
+4 state 1 ack
+5 init 1 4 3
+6 constd 1 -1
+7 xor 1 2 6
+8 or 1 7 4
+9 not 1 8
+10 bad 9
+11 next 1 4 2

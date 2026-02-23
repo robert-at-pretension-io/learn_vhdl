@@ -1,0 +1,18 @@
+1 sort bitvec 1
+2 input 1 rst
+3 constd 1 0
+4 state 1 s_sig
+5 init 1 4 3
+6 constd 1 0
+7 state 1 
+8 init 1 7 6
+9 constd 1 -1
+10 or 1 2 4
+11 or 1 7 2
+12 xor 1 7 9
+13 or 1 12 2
+14 or 1 13 4
+15 not 1 14
+16 bad 15
+17 next 1 4 10
+18 next 1 7 11

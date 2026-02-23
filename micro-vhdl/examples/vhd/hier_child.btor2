@@ -1,0 +1,4 @@
+1 sort bitvec 1
+2 input 1 top_in
+3 constd 1 -1
+4 xor 1 2 3

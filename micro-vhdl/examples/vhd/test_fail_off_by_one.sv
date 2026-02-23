@@ -6,15 +6,15 @@ module test_fail_off_by_one(	// <stdin>:2:3
   output done	// <stdin>:2:83
 );
 
-  reg delay2 = 1'h0;	// <stdin>:13:14, :21:15
-  reg done_0 = 1'h0;	// <stdin>:13:14, :37:13
-  reg delay1 = 1'h0;	// <stdin>:13:14, :52:15
+  reg done_0 = 1'h0;	// <stdin>:13:14, :22:13
+  reg delay1 = 1'h0;	// <stdin>:13:14, :37:15
+  reg delay2 = 1'h0;	// <stdin>:13:14, :52:15
   always @(posedge clk) begin	// <stdin>:54:5
-    delay2 <= ~rst & delay1;	// <stdin>:19:10, :24:7, :53:11
-    done_0 <= ~rst & (start & delay1 ? delay1 : delay2);	// <stdin>:19:10, :22:10, :33:11, :34:11, :35:11, :40:7, :53:11
-    delay1 <= ~rst & start;	// <stdin>:19:10, :50:11, :55:7
+    done_0 <= ~rst & (start & delay1 ? delay1 : delay2);	// <stdin>:18:10, :19:10, :20:10, :25:7, :38:11, :53:11
+    delay1 <= ~rst & start;	// <stdin>:20:10, :35:11, :40:7
+    delay2 <= ~rst & delay1;	// <stdin>:20:10, :38:11, :50:11, :55:7
   end // always @(posedge)
-  assert property (@(posedge clk) start |-> ##3 done_0);	// <stdin>:38:11, :61:11, :62:11, :64:5
-  assign done = done_0;	// <stdin>:38:11, :65:5
+  assert property (@(posedge clk) start |-> ##3 done_0);	// <stdin>:23:10, :61:11, :62:11, :64:5
+  assign done = done_0;	// <stdin>:23:10, :65:5
 endmodule
 

@@ -1,14 +1,14 @@
 aig 6 2 2 4 2
-2
 10
-6
+2
 8
+6
 0
 13
-i0 req0
+i0 req0
 i1 req1
-l0 grant0
-l1 grant1
+l0 grant1
+l1 grant0
 o0 grant0
 o1 grant1
 o2 __verif_bad

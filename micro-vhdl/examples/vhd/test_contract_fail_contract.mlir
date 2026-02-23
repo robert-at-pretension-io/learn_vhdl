@@ -1,5 +1,5 @@
 module {
-  hw.module @invert_wrong_contract(in %clk : i1, in %a : i1, out z : i1) {
+  hw.module @invert_wrong_contract(in %clk : !seq.clock, in %a : i1, out z : i1) {
     %true = hw.constant true
     %0 = comb.xor %a, %true : i1
     %1 = verif.symbolic_value : i1
